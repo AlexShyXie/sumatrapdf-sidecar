@@ -1,7 +1,7 @@
 Project         Version    Date
 ----------------------------------
-mupdf           1.28.2     2026-08-03
-  https://github.com/ArtifexSoftware/mupdf/releases/tag/1.28.2
+mupdf           1.28.5     2026-09-24
+  https://github.com/ArtifexSoftware/mupdf/releases/tag/1.28.5
   our changes to the vendored tree are recorded in ext/patches/ (see its README)
 
 libarchive     3.8.8      2026-06-23
@@ -9,16 +9,16 @@ libarchive     3.8.8      2026-06-23
   https://github.com/libarchive/libarchive/releases/tag/v3.8.8
   amalgamated into ext/a-libarchive by cmd/amalgam.ts -libarchive, see ext/a-libarchive/version.txt
 
-mujs           1.3.9
+mujs           1.3.10
   https://mujs.com/
-  https://github.com/ArtifexSoftware/mujs/commit/e892c9fdbbddba94e52f656ccb378ed4885e30cc
+  https://github.com/ArtifexSoftware/mujs/commit/2c61a7bed7e7625c03c6e82e644a711ac4471c1e
 
 bzip2           1.0.8      2019-07-21
   https://www.sourceware.org/bzip2/
 
-chmdec          dist       2026-07-28
+chmdec          dist       2026-10-02
   https://github.com/kjk/chmdec
-  commit dbf9c5a899709543724dca344ecfb0b6a21d45a4
+  commit 19d91e5c1b362fa8be6f6e30a02b49b1167e7823
   amalgamated dist/chm.c + dist/chm.h only (was ext/libchm)
 
 freetype        2.14.3

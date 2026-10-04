@@ -374,18 +374,34 @@ T limitValue(T val, T min, T max) {
     return val < min ? min : (val > max ? max : val);
 }
 
-inline float clampf(float v, float min, float max) {
-    return v < min ? min : (v > max ? max : v);
+inline int ClampI(int x, int min, int max) {
+    if (x < min) {
+        x = min;
+    }
+    if (x > max) {
+        x = max;
+    }
+    return x;
 }
 
-inline int clampi(int v, int vmin, int vmax) {
-    if (v > vmax) {
-        return vmax;
+inline float ClampF(float x, float min, float max) {
+    if (x < min) {
+        x = min;
     }
-    if (v < vmin) {
-        return vmin;
+    if (x > max) {
+        x = max;
     }
-    return v;
+    return x;
+}
+
+inline double ClampD(double x, double min, double max) {
+    if (x < min) {
+        x = min;
+    }
+    if (x > max) {
+        x = max;
+    }
+    return x;
 }
 
 // return true if adding n to val overflows. Only valid for n > 0
@@ -882,7 +898,7 @@ int NormalizeRotation(int rotation);
 using ThreadId = DWORD;
 using ThreadHandle = HANDLE;
 
-struct Mutex {
+struct Mutex : NonCopyable {
     SRWLOCK lock = SRWLOCK_INIT;
 
     Mutex() = default;
@@ -893,7 +909,7 @@ struct Mutex {
     bool TryLock() { return TryAcquireSRWLockExclusive(&lock); }
 };
 
-struct ConditionVariable {
+struct ConditionVariable : NonCopyable {
     CONDITION_VARIABLE cond = CONDITION_VARIABLE_INIT;
 
     ConditionVariable() = default;
@@ -904,7 +920,7 @@ struct ConditionVariable {
     void WakeAll() { WakeAllConditionVariable(&cond); }
 };
 
-struct RecursiveMutex {
+struct RecursiveMutex : NonCopyable {
     CRITICAL_SECTION lock;
 
     RecursiveMutex() { InitializeCriticalSection(&lock); }
@@ -915,14 +931,14 @@ struct RecursiveMutex {
     bool TryLock() { return TryEnterCriticalSection(&lock); }
 };
 
-struct AutoUnlockMutex {
+struct AutoUnlockMutex : NonCopyable {
     Mutex* mutex;
 
     explicit AutoUnlockMutex(Mutex* mutex) : mutex(mutex) { mutex->Lock(); }
     ~AutoUnlockMutex() { mutex->Unlock(); }
 };
 
-struct AutoUnlockRecursiveMutex {
+struct AutoUnlockRecursiveMutex : NonCopyable {
     RecursiveMutex* mutex;
 
     explicit AutoUnlockRecursiveMutex(RecursiveMutex* mutex) : mutex(mutex) { mutex->Lock(); }

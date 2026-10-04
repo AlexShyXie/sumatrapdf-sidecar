@@ -66,6 +66,7 @@ import { testit as findMatchSelect } from "./issue-find-match-select.ts";
 import { testit as findResultsSorted } from "./find-results-sorted.ts";
 import { testit as findWindowLayout } from "./find-window-layout.ts";
 import { testit as findUiState } from "./find-ui-state.ts";
+import { testit as gotoPageWordAfterFind } from "./goto-page-word-after-find.ts";
 import { testit as issue5874 } from "./issue-5874.ts";
 import { testit as issue6055 } from "./issue-6055.ts";
 import { testit as sessionRestoreSearch } from "./session-restore-search.ts";
@@ -145,6 +146,8 @@ import { testit as issue6030 } from "./issue-6030.ts";
 import { testit as issue6050 } from "./issue-6050.ts";
 import { testit as issue6265 } from "./issue-6265.ts";
 import { testit as issue6266 } from "./issue-6266.ts";
+import { testit as issue6269 } from "./issue-6269.ts";
+import { testit as issue6270 } from "./issue-6270.ts";
 import { testit as issue5911 } from "./issue-5911.ts";
 import { testit as issue6088 } from "./issue-6088.ts";
 import { testit as annotContentsClickAway } from "./annot-contents-click-away.ts";
@@ -384,7 +387,9 @@ export const tests: NamedTest[] = [
   // first: it drives the home page, whose thumbnail selection follows the
   // mouse, so it is the one test that cares what the machine was doing before
   ["issue-5978", issue5978],
+  ["issue-6269", issue6269],
   ["polyline-annotation-placement", polylineAnnotationPlacement],
+  ["toolbar-hover-dropdown", toolbarHoverDropdown],
   ["session-restore-tab-state", sessionRestoreTabState],
   ["exit-edit-pdf-deselects", exitEditPdfDeselects],
   ["annotation clipboard tests", annotationClipboardTests],
@@ -394,7 +399,6 @@ export const tests: NamedTest[] = [
   ["custom-zoom-dialog", customZoomDialog],
   ["annot-color-dropdown", annotColorDropdown],
   ["annot-contents-click-away", annotContentsClickAway],
-  ["toolbar-hover-dropdown", toolbarHoverDropdown],
   ["lint-mingw-sources", lintMingwSources],
   ["issue-2799", issue2799],
   ["ink-thickness", inkThickness],
@@ -542,6 +546,7 @@ export const tests: NamedTest[] = [
   ["find-results-sorted", findResultsSorted],
   ["find-window-layout", findWindowLayout],
   ["find-ui-state", findUiState],
+  ["goto-page-word-after-find", gotoPageWordAfterFind],
   ["issue-5874", issue5874],
   ["issue-6055", issue6055],
   ["session-restore-search", sessionRestoreSearch],
@@ -607,6 +612,7 @@ export const tests: NamedTest[] = [
   ["issue-6050", issue6050],
   ["issue-6265", issue6265],
   ["issue-6266", issue6266],
+  ["issue-6270", issue6270],
   ["issue-5911", issue5911],
   ["issue-6088", issue6088],
   ["issue-6137-contents", issue6137Contents],

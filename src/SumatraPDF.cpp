@@ -10177,14 +10177,8 @@ static void AdjustFrameForSidebar(MainWindow* win, bool show) {
         if (DisplayModel* dm = win->AsFixed()) {
             unused = dm->UnusedCanvasDx();
         }
-        int grow = extra - unused;
-        if (grow < 0) {
-            grow = 0;
-        }
         int spare = work.dx - wr.dx;
-        if (grow > spare) {
-            grow = spare;
-        }
+        int grow = ClampI(extra - unused, 0, spare);
         if (grow <= 0) {
             win->sidebarGrewFrameDx = 0;
             return;
@@ -17654,7 +17648,7 @@ int fz_redirect_io_to_existing_console();
 #define FZ_ENABLE_JS 1
 #define FZ_ENABLE_PDF 1
 #define FZ_ENABLE_BARCODE 0
-#define FZ_VERSION "1.28.2"
+#define FZ_VERSION "1.28.5"
 
 using MutoolFunc = int (*)(int argc, char* argv[]);
 

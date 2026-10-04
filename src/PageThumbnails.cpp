@@ -267,7 +267,7 @@ void PageThumbnailsCtrl::SetTab(WindowTab* newTab) {
 
     dm = tab ? tab->AsFixed() : nullptr;
     pageCount = dm ? dm->PageCount() : 0;
-    selectedPage = dm ? clampi(dm->CurrentPageNo(), 1, std::max(pageCount, 1)) : 1;
+    selectedPage = dm ? ClampI(dm->CurrentPageNo(), 1, std::max(pageCount, 1)) : 1;
 
     rowsModel->rows = (pageCount + cols - 1) / cols;
     SetModel(rowsModel);
@@ -316,7 +316,7 @@ void PageThumbnailsCtrl::SetBounds(Rect r) {
     int reservedScrollbarDx = DpiScaleByDpi(dpi, 10);
     int availableDx = r.dx - padding.left - padding.right - reservedScrollbarDx;
     int newCols = (availableDx + gap) / (thumbDx + gap);
-    newCols = clampi(newCols, 1, kThumbnailMaxCols);
+    newCols = ClampI(newCols, 1, kThumbnailMaxCols);
     if (newCols != cols) {
         cols = newCols;
         rowsModel->rows = (pageCount + cols - 1) / cols;
@@ -441,7 +441,7 @@ void PageThumbnailsCtrl::SelectPage(int pageNo) {
     if (pageCount <= 0) {
         return;
     }
-    pageNo = clampi(pageNo, 1, pageCount);
+    pageNo = ClampI(pageNo, 1, pageCount);
     if (pageNo == selectedPage) {
         return;
     }
@@ -464,7 +464,10 @@ void PageThumbnailsCtrl::OpenSelectedPage() {
     if (!dm) {
         return;
     }
-    dm->GoToPage(selectedPage, 0, true);
+    // Facing and book view report the row's first page, which clears this highlight.
+    int pageNo = selectedPage;
+    dm->GoToPage(pageNo, 0, true);
+    SelectPage(pageNo);
     onPageOpened.Call();
 }
 
@@ -567,7 +570,7 @@ static int PageForKey(PageThumbnailsCtrl* c, int vkey) {
         default:
             return 0;
     }
-    return clampi(pageNo, 1, c->pageCount);
+    return ClampI(pageNo, 1, c->pageCount);
 }
 
 void PageThumbnailsCtrl::HandleKey(int vkey) {

@@ -127,6 +127,11 @@ static LRESULT CALLBACK WndProcVirtHost(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             break;
         }
         case WM_MOUSELEAVE:
+            // SetCursorPos inside the window still posts leave. Re-arming from
+            // this message posts leave again and starves timers; the next move re-arms.
+            if (HwndWindowRect(hwnd).Contains(GetCursorPosition())) {
+                break;
+            }
             host->onMouseLeave.Call();
             break;
     }
