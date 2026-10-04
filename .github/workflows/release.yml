@@ -18,6 +18,31 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Extract changelog section for this tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $ver = $env:TAG.TrimStart("v")
+          $lines = (Get-Content CHANGELOG.md -Raw) -split "`n" | ForEach-Object { $_.TrimEnd("`r") }
+          # a section starts at "## [ver]" (or "## ver") and ends at the next "## "
+          $pat = '^##\s+\[?v?' + [regex]::Escape($ver) + '\]?(\s|$)'
+          $start = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match $pat) { $start = $i + 1; break }
+          }
+          if ($start -lt 0) {
+            Write-Host "::error::CHANGELOG.md has no [$ver] section. Add '## [$ver] - <date>' before tagging."
+            exit 1
+          }
+          $body = @()
+          for ($i = $start; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^##\s') { break }
+            $body += $lines[$i]
+          }
+          $section = ($body -join "`n").TrimEnd() + "`n`n"
+          $tmp = Join-Path $env:RUNNER_TEMP "changelog-section.md"
+          [IO.File]::WriteAllText($tmp, $section, [Text.UTF8Encoding]::new($false))
+
       - name: Install bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
@@ -37,6 +62,18 @@ jobs:
           $tmpl = Join-Path $env:GITHUB_WORKSPACE ".github/release-notes-template.md"
           $notes = [IO.File]::ReadAllText($tmpl)
           $notes = $notes.Replace('$VERSION', $ver).Replace('$REPO_SLUG', $env:GITHUB_REPOSITORY).Replace('$SHA256', $sha256)
+          # changelog section, extracted in the previous step
+          $section = [IO.File]::ReadAllText((Join-Path $env:RUNNER_TEMP "changelog-section.md"))
+          # previous tag, for the compare link e.g. v3.7-sidecar.2...v3.7-sidecar.3
+          $tags = @(git tag --sort=-v:refname) | Where-Object { $_.Trim() }
+          $idx = [Array]::IndexOf($tags, $env:TAG)
+          $prev = ""
+          if ($idx -ge 0 -and $idx -lt $tags.Count - 1) { $prev = $tags[$idx + 1] }
+          elseif ($idx -lt 0 -and $tags.Count -gt 0 -and $tags[0] -ne $env:TAG) { $prev = $tags[0] }
+          $notes = $section + $notes
+          if ($prev) {
+            $notes += "`n**Full Changelog**: https://github.com/$env:GITHUB_REPOSITORY/compare/$prev...$env:TAG`n"
+          }
           $tmp = Join-Path $env:RUNNER_TEMP "release-notes.md"
           [IO.File]::WriteAllText($tmp, $notes, [Text.UTF8Encoding]::new($false))
-          gh release create $env:TAG $asset --title "SumatraPDF $env:TAG" --notes-file $tmp --generate-notes
+          gh release create $env:TAG $asset --title "SumatraPDF $env:TAG" --notes-file $tmp

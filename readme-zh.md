@@ -20,7 +20,8 @@ PDF 批注的 Sidecar（边车文件）是指批注数据不写进 PDF 本体，
 
 - **导入**：打开 PDF 时，如果同目录存在同名 `.json`（例如 `book.pdf` → `book.json`），批注自动载入，PDF 本体不动。
 - **自动保存**：批注变更后 2 秒防抖写盘，只写 JSON。
-- **Ctrl+S**：启用 sidecar 后，Ctrl+S 保存的是 JSON，不再弹出"另存副本"。
+- **Ctrl+S**：启用 sidecar 后，Ctrl+S 保存的是 JSON，不再弹出"另存副本"。保存前若检测到外部变更，先重载合并再写盘（提示 "External changes detected before saving, reloading first"）。
+- **外部变更检测**：文档开着时 sidecar 被外部修改（Typora、另一台设备同步过来），2 秒轮询发现后自动重载并提示。
 - **中央文件夹模式**（可选）：设置 `Annotations.centralFolder` 后，所有 sidecar 集中到一处，按 `父文件夹名/文件名.json` 存放。适合书库分布在多个文件夹、或想单独同步批注库的场景。
 
 设置项（AdvancedSettings）：
@@ -34,8 +35,8 @@ PDF 批注的 Sidecar（边车文件）是指批注数据不写进 PDF 本体，
 ```ini
 Annotations [
     ....
-	SeparateSave = true
-	CentralFolder = E:\Downloads\Claw
+    SeparateSave = true
+    CentralFolder = E:\Downloads\Claw
     SeparateSaveAsMd = true
 ]
 ```
@@ -50,11 +51,12 @@ FreeText 支持字体、字号、文字颜色、对齐方式、加粗、斜体�
 
 图章和附件带有二进制载荷（图片、嵌入文件），JSON 不放二进制：载荷写入 JSON 旁边的 `assets/` 目录，按内容哈希命名（`assets/<hash>.<ext>`）并以相对路径引用。相同内容自动去重，保存时会清理不再被任何 sidecar 引用的资产文件。旧格式（无 asset 字段）的 sidecar 仍可正常导入。
 
-## 已知限制
+## 导出批注到 PDF
 
-- **没有冲突合并。** 两台机器同时改同一个 sidecar，后保存的覆盖先保存的。单人使用没问题。
-- 大批注有防御性上限：多边形/折线 512 个顶点，墨迹 64 笔、每笔最多 2048 个点。超出的部分截断。
-- 别的阅读器打开这个 PDF 看不到批注——数据在 JSON 里，不在 PDF 里。这是设计使然。
+别的阅读器看不到批注，但留了出口：**Ctrl+K 打开命令面板 → "Save Annotations to a new PDF..."**。
+
+当前会话的全部批注（sidecar 导入的加上本次新建的）注入一份独立 PDF 副本，任何阅读器可开。原 PDF 和 sidecar 分毫不动，导出后原文档照常用。
+
 
 ## Markdown sidecar（实验性 🧪）
 
@@ -82,12 +84,20 @@ file: 教材.pdf
 
 - **callout 外的一切都是你的**。标题、散文、普通引用块——SumatraPDF 读写时逐字保留，只动 callout 里 `key: value` 形式的机器行。批注数据和批注笔记从此住同一个文件。
 - **contents 行恒存在**。没有批注文字时用高亮原文填充；两者都空时是 `contents: ""`，在 Obsidian 里手填，重开文档生效。
-- **双向同步，以重开为界**。关闭文档后删掉一个 callout，重开时该批注消失；手写一个合法 callout（不推荐，难以精确计算坐标），重开时变成真批注。文档开着时改 md，保存会被会话数据覆盖——外部编辑请关掉文档再动。
+- **双向同步，实时生效**。文档开着时改 md 是预期工作流：保存后 2 秒内自动重载，弹提示告知变化——外部新增 "Loaded N annotation(s)"、外部删除 "Removed N annotation(s) deleted externally"、修改或混合 "Reloaded N annotation(s)"。防抖窗口内新建、还没落盘的批注会保留（提示尾部 ", N local unsaved kept"），随后写回。手写一个合法 callout（不推荐，难以精确计算坐标）同样会变成真批注。
 - **自动迁移**。开启后读取优先 `.md`，没有则回退 `.json`；下一次保存写 `.md`，旧 `.json` 原样保留不再更新。
 - **原子写盘**。md 混着你的笔记，保存走临时文件 + 替换，中途崩溃不会毁文件。
+- **手改容错**。callout 删一半留下机器行残迹：跳过该条、其余正常导入，残迹留在文件里等你手清。Typora 在渲染视图里复制粘贴 callout 会给 `[[...]]` 值套上不可见的 `<a>` 包装（wiki link 转换，源码模式也看不见）：导入时自动剥除，下次保存文件自愈；想彻底避免，从源代码模式复制。
 - **查询**：front matter 是 YAML 字段；callout 内 `key:: value` 双冒号兼容。
 
 ⚠️ **实验性说明**：格式仍可能调整（带版本号字段，保证旧文件可读）；单人场景验证有限。
+
+## 已知限制
+
+- **没有冲突合并。** 两台机器同时改同一个 sidecar，后保存的覆盖先保存的。单人使用没问题。
+- **开着文档时改 md，冲突取文件版。** 防抖窗口内（默认 2 秒）同一条批注两边都改，重载时以文件为准，本地的修改被静默丢弃。避开方法：改 md 前等防抖落盘，或改完 md 看到提示再动软件里的批注。
+- 大批注有防御性上限：多边形/折线 512 个顶点，墨迹 64 笔、每笔最多 2048 个点。超出的部分截断。
+- 别的阅读器打开这个 PDF 看不到批注——数据在 JSON 里，不在 PDF 里。这是设计使然（需要分享时用命令面板导出）。
 
 ## 许可证
 
