@@ -29,6 +29,7 @@
 #include "Favorites.h"
 #include "UpdateCheck.h"
 #include "CommandAvailability.h"
+#include "Sidecar.h"
 
 // clang-format off
 
@@ -821,7 +822,19 @@ CommandVisibility GetCommandVisibility(int cmdId, const AppCommandCtx& ctx, Comm
         return HasCopiedAnnotation() ? CommandVisibility::Show : MapForSurface(CommandVisibility::Disable, surface);
     }
 
-    if ((cmdId == CmdSaveAnnotations) || (cmdId == CmdSaveAnnotationsNewFile) || (cmdId == CmdDiscardChanges)) {
+    if ((cmdId == CmdSaveAnnotations) || (cmdId == CmdDiscardChanges)) {
+        return ctx.hasUnsavedAnnotations ? CommandVisibility::Show : MapForSurface(CommandVisibility::Disable, surface);
+    }
+    if (cmdId == CmdSaveAnnotationsNewFile) {
+        // separateSave keeps the annotations out of the PDF (they live in the
+        // sidecar), so "unsaved" is the wrong gate there: the PDF on disk
+        // never carries them and the flag is only ever set inside the
+        // debounce window. Offer the export whenever a sidecar document is
+        // loaded; with no annotations made yet the save simply produces a
+        // plain copy
+        if (SidecarSeparateSaveEnabled() && ctx.isPdf) {
+            return CommandVisibility::Show;
+        }
         return ctx.hasUnsavedAnnotations ? CommandVisibility::Show : MapForSurface(CommandVisibility::Disable, surface);
     }
 

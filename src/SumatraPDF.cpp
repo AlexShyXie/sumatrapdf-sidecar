@@ -5773,15 +5773,38 @@ bool SaveAnnotationsToMaybeNewPdfFile(WindowTab* tab) {
     }
     TempStr dstFilePath = ToUtf8Temp(dstFileName);
     bool savingToExisting = str::Eq(dstFilePath, srcFileName);
-    if (savingToExisting) {
-        return SaveAnnotationsToExistingFile(tab);
-    }
-
-    ShowErrorData data{tab, dstFilePath};
-    auto fn = MkFunc1(ShowSaveAnnotationError, &data);
-    ok = EngineMupdfSaveUpdated(engine, dstFilePath, fn);
-    if (!ok) {
-        return false;
+    if (SidecarWantsRedirect(engine)) {
+        // separateSave keeps the annotations in the sidecar, so the engine is
+        // never marked modified and EngineMupdfSaveUpdated refuses to write
+        // anything ("nothing unsaved") - the file dialog completes and
+        // nothing lands on disk. The live document DOES carry the annotations
+        // (imported from the sidecar at open time), and embedding exactly
+        // that is the point of this export: write a standalone copy.
+        // EngineMupdfSaveCopy also leaves the engine's dirty state alone
+        // (the sidecar remains the sync target), unlike
+        // EngineMupdfSaveUpdated which would clear it. Writing back over
+        // the original name is safe too: the sidecar import skips
+        // annotations the PDF itself already carries (PageHasAnnot)
+        if (savingToExisting) {
+            // our own write: don't let the file watcher treat it as external
+            tab->ignoreNextAutoReload = true;
+        }
+        ok = EngineMupdfSaveCopy(engine, dstFilePath);
+        if (!ok) {
+            tab->ignoreNextAutoReload = false;
+            MessageBoxWarning(win->hwndFrame, fmt("Failed to save annotations to '%s'", dstFilePath));
+            return false;
+        }
+    } else {
+        if (savingToExisting) {
+            return SaveAnnotationsToExistingFile(tab);
+        }
+        ShowErrorData data{tab, dstFilePath};
+        auto fn = MkFunc1(ShowSaveAnnotationError, &data);
+        ok = EngineMupdfSaveUpdated(engine, dstFilePath, fn);
+        if (!ok) {
+            return false;
+        }
     }
 
     // Capture selection before the engine (and Annotation*) is torn down.
