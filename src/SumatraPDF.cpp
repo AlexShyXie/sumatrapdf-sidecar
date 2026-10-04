@@ -5920,10 +5920,38 @@ bool MaybeSaveAnnotations(WindowTab* tab) {
     if (!shouldConfirm) {
         return true;
     }
-    // SIDECAR: separateSave mode writes the JSON sidecar instead of the PDF;
-    // on write failure, don't close (that would discard the annotations)
+    // SIDECAR: separateSave mode writes the JSON sidecar instead of the PDF.
+    // On failure (sidecar locked / unreadable, e.g. OneDrive holding it),
+    // never silently block the close - that deadlocks the window (no save,
+    // no close, no dialog) - and never silently discard the unsaved
+    // annotations either: offer the explicit choice
     if (SidecarWantsRedirect(engine)) {
-        return SidecarSaveTab(tab) == SidecarResult::Saved;
+        SidecarResult res = SidecarSaveTab(tab);
+        if (res == SidecarResult::Saved) {
+            return true;
+        }
+        if (res == SidecarResult::NotHandled) {
+            return true; // defensive: shouldn't happen after WantsRedirect
+        }
+        // Failed: retry path re-arms itself, so canceling here keeps the
+        // window open with the debounced retry running
+        HWND owner = tab->win ? tab->win->hwndFrame : nullptr;
+        TempStr msg = fmt(
+            "The annotations file could not be updated (locked or unreadable, e.g. by OneDrive),\n"
+            "and your unsaved annotations could not be merged with it.\n\n"
+            "Yes: overwrite the file with the current session\n"
+            "No: discard local changes and close\n"
+            "Cancel: keep the window open and retry");
+        UINT type = MB_YESNOCANCEL | MB_ICONEXCLAMATION | MbRtlReadingMaybe();
+        int choice = MsgBox(owner ? owner : GetActiveWindow(), msg, Tr("Warning"), type);
+        if (choice == IDYES) {
+            return SidecarSaveTab(tab, /*allowCreate=*/true, /*forceOverwrite=*/true) ==
+                   SidecarResult::Saved;
+        }
+        if (choice == IDNO) {
+            return true; // discard, close
+        }
+        return false; // cancel: keep open (the retry timer is armed)
     }
     tab->askedToSaveAnnotations = true;
     MainWindow* win = tab->win;

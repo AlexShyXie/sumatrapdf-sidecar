@@ -157,6 +157,30 @@ struct SidecarTarget {
     Str path;
     bool central = false;
     bool exists = false;
+    // path is heap-owned (str::Builder::TakeStr). The target is returned by
+    // value and dropped early on the poll path, so ownership is enforced
+    // here: freed on destruction, move-only. Before this, every poll tick
+    // (2s per tab) and every save leaked the resolved path(s) - nothing
+    // called str::Free on them anywhere
+    SidecarTarget() = default;
+    ~SidecarTarget() {
+        str::Free(path);
+    }
+    SidecarTarget(const SidecarTarget&) = delete;
+    SidecarTarget& operator=(const SidecarTarget&) = delete;
+    SidecarTarget(SidecarTarget&& o) noexcept : path(o.path), central(o.central), exists(o.exists) {
+        o.path = {};
+    }
+    SidecarTarget& operator=(SidecarTarget&& o) noexcept {
+        if (this != &o) {
+            str::Free(path);
+            path = o.path;
+            central = o.central;
+            exists = o.exists;
+            o.path = {};
+        }
+        return *this;
+    }
 };
 
 static char PathSepFor(Str dir) {
@@ -892,6 +916,13 @@ static int WriteSidecarAssets(Str jsonPath, const Vec<SidecarAnnot>& entries) {
         }
         VecAppend(written, sa.assetName);
         TempStr dst = path::JoinTemp(jdir, sa.assetName);
+        // content-addressed name: if the payload file is already there, it
+        // holds this exact content. Rewriting it anyway would touch mtime on
+        // every save, which is a re-upload storm on OneDrive - the very
+        // problem the sidecar exists to avoid
+        if (file::Exists(dst)) {
+            continue;
+        }
         Str data((char*)sa.assetBuf->data, (int)sa.assetBuf->len);
         if (!file::WriteFile(dst, data)) {
             logf("sidecar: failed to write asset '%s'\n", dst);
@@ -2024,6 +2055,12 @@ static bool ParseSidecarJson(fz_context* ctx, char* data, Vec<SidecarAnnot>& out
     }
     fz_catch(ctx) {
         fz_report_error(ctx);
+        // a mid-parse failure leaves entries already appended in out; free
+        // them, or a bad file being polled every 2s leaks them each tick
+        for (SidecarAnnot& sa : out) {
+            FreeSidecarAnnotStrings(ctx, sa);
+        }
+        VecClear(out);
     }
     return ok;
 }
@@ -2443,6 +2480,19 @@ static bool MdParseKvLine(Str inner, Str& key, Str& val) {
 // literal (e.g. a number with garbage after it) fails the whole callout
 // parse, which demotes the callout to user content
 static void AppendMdLiteral(str::Builder& b, Str v) {
+    // Typora round-trip poison: copying a callout in the rendered view and
+    // pasting it back wraps wiki-link-looking values ("[[...]]", i.e. every
+    // quads / vertices / inkList line) into an HTML anchor "<a>[[...]]</a>".
+    // The wrapper is invisible in the rendered view, so the user cannot see
+    // what happened. Strip it (narrowly: the inside must start an array /
+    // object) so the callout still parses; the next save rewrites the line
+    // from scratch, which removes the wrapper from the file for good
+    if (len(v) > 7 && str::StartsWith(v, StrL("<a>")) && str::EndsWith(v, StrL("</a>"))) {
+        Str inner(v.s + 3, len(v) - 7);
+        if (len(inner) > 0 && (inner.s[0] == '[' || inner.s[0] == '{')) {
+            v = inner;
+        }
+    }
     int e = len(v);
     while (e > 0 && (v.s[e - 1] == ' ' || v.s[e - 1] == '\t' || v.s[e - 1] == '\r')) {
         e--;
@@ -2630,15 +2680,34 @@ static void MdParseDoc(fz_context* ctx, const char* data, MdDoc& doc) {
 static bool ParseSidecarMd(fz_context* ctx, char* data, Vec<SidecarAnnot>& out) {
     MdDoc doc;
     MdParseDoc(ctx, data, doc);
+    int nMalformed = 0;
     for (MdSeg& seg : doc.segs) {
         if (seg.isCallout && seg.isAnnot) {
             VecAppend(out, std::move(seg.annot));
             // the strings moved with the struct; keep MdFreeDoc away from
             // the moved-from copy
             seg.isAnnot = false;
+        } else if (seg.isCallout && !seg.isAnnot) {
+            // a callout carrying machine ("key: value") lines that failed
+            // the annotation sanity check: half-written data (crashed save)
+            // or a hand-editing artifact (callout deleted halfway in the
+            // editor). Skip the entry - never hard-fail the whole file:
+            // a hard stop here blocks reload AND save, which deadlocks the
+            // window (nothing can be saved, the window cannot be closed).
+            // The remaining entries still import; the malformed callout
+            // survives as user content until deleted by hand
+            for (MdBodyLine& bl : seg.body) {
+                if (bl.kv) {
+                    nMalformed++;
+                    break;
+                }
+            }
         }
     }
     MdFreeDoc(ctx, doc);
+    if (nMalformed > 0) {
+        logf("sidecar: skipped %d malformed annotation callout(s) in md\n", nMalformed);
+    }
     return true;
 }
 
@@ -3351,8 +3420,19 @@ static Vec<SidecarSyncEntry> SidecarSyncEntriesFromParsed(const Vec<SidecarAnnot
 
 // full reload from disk: delete what the file owns (replayed from it) or
 // what was externally deleted (in base, absent from file); keep local edits
-// that were never synced. Returns true if the session changed.
-static bool SidecarReloadFromDisk(WindowTab* tab, EngineMupdf* e, const SidecarTarget& tgt, SidecarSyncState* st) {
+// that were never synced.
+// returns true when the engine content actually changed (annotations were
+// cleared / replayed). *ok (optional) reports whether the reload itself
+// succeeded: false = the file could not be read or parsed (locked,
+// half-written), true = the file was consumed (even if nothing changed).
+// The two meanings differ: an mtime-only touch (OneDrive) reloads fine but
+// changes nothing, while a caller about to save must treat ok=false as a
+// hard stop - never save over a file it couldn't even read
+static bool SidecarReloadFromDisk(WindowTab* tab, EngineMupdf* e, const SidecarTarget& tgt, SidecarSyncState* st,
+                                  bool* ok = nullptr) {
+    if (ok) {
+        *ok = false;
+    }
     MainWindow* win = tab->win;
     Str data = file::ReadFile(tgt.path);
     if (len(data) == 0) {
@@ -3406,6 +3486,11 @@ static bool SidecarReloadFromDisk(WindowTab* tab, EngineMupdf* e, const SidecarT
                 nRemoved++;
             }
         }
+    } else {
+        // adoption (the file appeared mid-session): everything in the file
+        // is new from this session's point of view, so the user gets a
+        // meaningful "Loaded N annotations" instead of silence
+        nAdded = len(mdIds);
     }
 
     Vec<Annotation*> annots;
@@ -3454,6 +3539,13 @@ static bool SidecarReloadFromDisk(WindowTab* tab, EngineMupdf* e, const SidecarT
     }
     int nImported = ImportSidecarEntries(e, entries);
     gSidecarImporting = false;
+    // the import mirrors the file, so it resets the engine's dirty flag;
+    // but the local unsaved annotations kept above (nKept) are still not
+    // written anywhere: re-arm the flag, or the debounced save (and the
+    // close confirmation, which reads it) would silently skip them
+    if (nKept > 0) {
+        e->modifiedAnnotations = true;
+    }
     for (SidecarAnnot& sa : entries) {
         FreeSidecarAnnotStrings(ctx, sa);
     }
@@ -3464,6 +3556,11 @@ static bool SidecarReloadFromDisk(WindowTab* tab, EngineMupdf* e, const SidecarT
     }
     SidecarSyncSetBase(st, std::move(mdIds));
     SidecarFileFingerprint(tgt.path, st->size, st->modTime);
+    if (ok) {
+        // the file was read and parsed; everything below is bookkeeping that
+        // cannot fail
+        *ok = true;
+    }
 
     bool changed = nDeleted > 0 || nImported > 0;
     int nTouched = nAdded + nRemoved + nUpdated;
@@ -3553,11 +3650,16 @@ static void SidecarPollTab(WindowTab* tab) {
     }
     SidecarSyncState* st = FindSidecarSyncState(tgt.path);
     if (!st) {
-        // no sync point yet (file adopted externally / pre-existing): adopt
-        // the current fingerprint, the next change reloads
-        st = GetSidecarSyncState(tgt.path);
-        st->size = sz;
-        st->modTime = ft;
+        // the file appeared mid-session (OneDrive delivered it, another
+        // reader created it): importing beats silently adopting the
+        // fingerprint - a window opened before the file existed would never
+        // pick up the remote annotations otherwise. The reload keeps local
+        // unsaved annotations and re-arms the dirty flag, so the debounced
+        // save merges both sides into the file
+        bool adoptOk = false;
+        if (SidecarReloadFromDisk(tab, e, tgt, nullptr, &adoptOk) && adoptOk) {
+            SidecarNotifyChanged((EngineBase*)e);
+        }
         return;
     }
     if (st->size == sz && FileTimeEq(st->modTime, ft)) {
@@ -3647,12 +3749,12 @@ void SidecarMaybeImport(EngineBase* engine) {
     }
     SidecarTarget use;
     if (sib.exists) {
-        use = sib;
+        use = std::move(sib);
         if (cen.exists) {
             logf("sidecar: both sibling and central JSON exist for '%s', using sibling\n", pdfPath);
         }
     } else if (cen.exists) {
-        use = cen;
+        use = std::move(cen);
     } else {
         logf("sidecar: no JSON sidecar found for '%s'\n", pdfPath);
         return;
@@ -3700,7 +3802,7 @@ void SidecarMaybeImport(EngineBase* engine) {
     // annotations behave like annotations that came with the PDF
 }
 
-SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
+SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate, bool forceOverwrite) {
     SidecarInstallNotifyHook();
     if (!tab) {
         return SidecarResult::NotHandled;
@@ -3736,7 +3838,7 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
     // drifted since our last sync point (the 2s poller was skipped due to
     // active editing, or the change landed within the poll window), reload
     // first; the debounced save then re-runs against the merged session
-    if (tgt.exists) {
+    if (tgt.exists && !forceOverwrite) {
         i64 szNow = 0;
         FILETIME ftNow{};
         SidecarSyncState* st = FindSidecarSyncState(tgt.path);
@@ -3745,13 +3847,27 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
             logf("sidecar: '%s' changed externally, reloading before save\n", tgt.path);
             ShowPlainNotification(win->hwndCanvas, StrL("External changes detected before saving, reloading first"),
                                   5000);
-            SidecarReloadFromDisk(tab, e, tgt, st);
-            // re-arm the save either way: on success the debounced save
-            // writes back the merged session; on failure (file locked) it
-            // retries through here until the file becomes writable
-            SidecarNotifyChanged(engine);
-            // caller sees success; the real write follows via the debounce
-            return SidecarResult::Saved;
+            bool reloadOk = false;
+            SidecarReloadFromDisk(tab, e, tgt, st, &reloadOk);
+            if (!reloadOk) {
+                // the file could not be read (locked / OneDrive): re-arm
+                // the debounced save and retry on the next tick - never
+                // hard-stop. A Failed return alone used to deadlock the
+                // close path (MaybeSaveAnnotations blocked the close with
+                // no dialog and no way out); the close path now offers an
+                // explicit choice (overwrite / discard / cancel) on Failed,
+                // and every other caller either ignores the result or
+                // retries through the timer
+                logf("sidecar: reload before save failed, will retry\n");
+                SidecarNotifyChanged(engine);
+                return SidecarResult::Failed;
+            }
+            // fall through: the merged session (external changes + kept
+            // local unsaved annotations) is written synchronously below.
+            // The old code returned Saved here and handed the real write to
+            // the 2s debounce timer, which dies with the window on the
+            // close path (MaybeSaveAnnotations) - the unsaved annotations
+            // were lost whenever the reload happened to run during a close
         }
     }
 

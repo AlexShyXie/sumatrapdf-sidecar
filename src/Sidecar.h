@@ -110,8 +110,11 @@ void SidecarMaybeImport(EngineBase* engine);
 // write the JSON sidecar for the tab's document; also clears the "modified"
 // state on success (like the PDF annotation save does). With allowCreate
 // false, an existing sidecar file is updated but no new file is created
-// (used by the debounced auto-save).
-SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate = true);
+// (used by the debounced auto-save). With forceOverwrite true, the external
+// -change check is skipped: the current session is written as-is (the user
+// explicitly chose this after a reload kept failing - e.g. the file locked
+// by OneDrive while closing the window)
+SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate = true, bool forceOverwrite = false);
 
 // annotations changed: (re)arm the debounced auto-save timer; only does
 // anything when a sidecar target was already established for the document
