@@ -117,8 +117,8 @@ static SeqStrings gCommandNames =
     "CmdOpenWithTotalCommander\0"
     "CmdOpenWithDoubleCommander\0"
     "CmdOpenWithAcrobat\0"
-    "CmdOpenWithFoxIt\0"
-    "CmdOpenWithFoxItPhantom\0"
+    "CmdOpenWithFoxit\0"
+    "CmdOpenWithFoxitPhantom\0"
     "CmdOpenWithPdfXchange\0"
     "CmdOpenWithXpsViewer\0"
     "CmdOpenWithHtmlHelp\0"
@@ -221,7 +221,7 @@ static SeqStrings gCommandNames =
     "CmdPdfEncrypt\0"
     "CmdPdfDecrypt\0"
     "CmdPdfBake\0"
-    "CmdPdShowInfo\0"
+    "CmdPdfShowInfo\0"
     "CmdDocumentExtractText\0"
     "CmdDocumentShowOutline\0"
     "CmdSetScreenshotHotkey\0"
@@ -444,8 +444,8 @@ static i32 gCommandIds[] = {
     CmdOpenWithTotalCommander,
     CmdOpenWithDoubleCommander,
     CmdOpenWithAcrobat,
-    CmdOpenWithFoxIt,
-    CmdOpenWithFoxItPhantom,
+    CmdOpenWithFoxit,
+    CmdOpenWithFoxitPhantom,
     CmdOpenWithPdfXchange,
     CmdOpenWithXpsViewer,
     CmdOpenWithHtmlHelp,
@@ -548,7 +548,7 @@ static i32 gCommandIds[] = {
     CmdPdfEncrypt,
     CmdPdfDecrypt,
     CmdPdfBake,
-    CmdPdShowInfo,
+    CmdPdfShowInfo,
     CmdDocumentExtractText,
     CmdDocumentShowOutline,
     CmdSetScreenshotHotkey,
@@ -703,7 +703,7 @@ SeqStrings gCommandDescriptions =
     "Toggle Menu Bar\0"
     "Copy Selection\0"
     "Translate Selection with Google\0"
-    "Translate Selection With DeepL\0"
+    "Translate Selection with DeepL\0"
     "Search Selection with Google\0"
     "Search Selection with Bing\0"
     "Search Selection with Wikipedia\0"
@@ -854,7 +854,7 @@ SeqStrings gCommandDescriptions =
     "Debug: Show Notification\0"
     "Debug: Start Stress Test\0"
     "Debug: Toggle Predictive Rendering\0"
-    "Debug: Toggle Rtl\0"
+    "Debug: Toggle RTL\0"
     "List Printers...\0"
     "Toggle Windows Previewer\0"
     "Toggle Windows Search Filter\0"

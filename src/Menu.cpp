@@ -195,7 +195,7 @@ static MenuDef menuDefFile[] = {
     },
     {
         TrN("Open in &Foxit Reader"),
-        CmdOpenWithFoxIt,
+        CmdOpenWithFoxit,
     },
     {
         TrN("Open &in PDF-XChange"),
@@ -1216,7 +1216,7 @@ static MenuDef menuDefDocumentOperations[] = {
     },
     {
         TrN("Show PDF Info"),
-        CmdPdShowInfo,
+        CmdPdfShowInfo,
     },
     {
         TrN("Show Document Table Of Contents"),
@@ -1421,7 +1421,7 @@ static int disableIfDirectoryOrBrokenPDF[] = {
     CmdDeleteFileAndOpenNext,
     CmdSendByEmail,
     CmdOpenWithAcrobat,
-    CmdOpenWithFoxIt,
+    CmdOpenWithFoxit,
     CmdOpenWithPdfXchange,
     CmdShowInFolder, // TODO: why?
 };
