@@ -2075,7 +2075,9 @@ static bool ParseSidecarJson(fz_context* ctx, char* data, Vec<SidecarAnnot>& out
 //   ---                       front matter (created once, then verbatim)
 //   sumatrapdf_sidecar: 2
 //   generator: SumatraPDF-sidecar/2-md
-//   file: report.pdf
+//   file: 'report.pdf'        values with ':', '#' or a leading '-' must
+//   title: 'Report: a study'  be quoted: Obsidian's property view parses
+//   filepath: '[...](<file:///...>)'  the front matter as strict YAML
 //   ---
 //   # user content ...        anything; preserved verbatim on save
 //
@@ -2807,6 +2809,49 @@ static bool WriteSidecarFileAtomic(Str path, Str data) {
     return ok;
 }
 
+// append "key: 'value'" with the value single-quoted. Obsidian parses the
+// front matter as strict YAML and rejects a plain value containing ": "
+// (e.g. a paper title "... diagnosis: an end-to-end ..."), a leading "- ",
+// or " #" (comment start); file names can hit the last two, and file paths
+// carry backslashes which single quotes keep literal (no \\ escaping).
+// Embedded ' is doubled per YAML.
+static void MdAppendFmKV(str::Builder& b, const char* key, Str v) {
+    b.Append(Str(key));
+    b.Append(StrL(": '"));
+    for (int i = 0; i < len(v); i++) {
+        char c = v.s[i];
+        b.AppendChar(c);
+        if (c == '\'') {
+            b.AppendChar('\'');
+        }
+    }
+    b.AppendChar('\'');
+}
+
+// filepath is written as an Obsidian file:// markdown link so the property
+// renders clickable:
+//   filepath: '[E:/dir/book.pdf](<file:///E:/dir/book.pdf>)'
+// Backslashes become forward slashes: a file:// URI must not contain '\',
+// and the link text matches the URI. Single-quoted like the other values:
+// nothing inside is an escape, the only quoting rule is ' doubled.
+static void MdAppendFmFilepath(str::Builder& b, Str path) {
+    b.Append(StrL("filepath: '"));
+    for (int pass = 0; pass < 2; pass++) {
+        b.Append(pass == 0 ? StrL("[") : StrL("](<file:///"));
+        for (int i = 0; i < len(path); i++) {
+            char c = path.s[i];
+            if (c == '\\') {
+                c = '/';
+            }
+            b.AppendChar(c);
+            if (c == '\'') {
+                b.AppendChar('\'');
+            }
+        }
+    }
+    b.Append(StrL(">)'"));
+}
+
 // build the merged .md for the tab's document: existing file parsed and
 // preserved (front matter, user text, callout headers and user body lines),
 // matched callouts rewritten from the live entries, deleted annotations'
@@ -2836,16 +2881,18 @@ static Str BuildSidecarMd(EngineMupdf* e, Str pdfPath, const Vec<SidecarAnnot>& 
         fb.Append(eol);
         TempStr base = path::GetBaseNameTemp(pdfPath);
         if (base && len(base) > 0) {
-            fb.Append(StrL("file: "));
-            fb.Append(Str(base));
+            MdAppendFmKV(fb, "file", base);
             fb.Append(eol);
         }
         Str title = DocTitle(e);
         if (len(title) > 0) {
-            fb.Append(StrL("title: "));
-            fb.Append(title);
+            MdAppendFmKV(fb, "title", title);
             fb.Append(eol);
             str::Free(title);
+        }
+        if (len(pdfPath) > 0) {
+            MdAppendFmFilepath(fb, pdfPath);
+            fb.Append(eol);
         }
         fb.Append(StrL("---"));
         fb.Append(eol);
