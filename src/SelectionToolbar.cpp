@@ -35,6 +35,7 @@
 #include "Toolbar.h"
 #include "Notifications.h"
 #include "SelectionToolbar.h"
+#include "SelectionToolbarCommon.h"
 
 // A small floating toolbar shown under/over a finished text selection with
 // the most common selection actions (copy, read aloud, highlight etc.).
@@ -42,28 +43,6 @@
 // availability rewritten on top of CommandAvailability.
 
 constexpr const WCHAR* kSelectionToolbarClassName = L"SumatraSelectionToolbar";
-
-static Kind kNotifCopiedToClipboard = "notifCopiedToClipboard";
-constexpr int kCopiedNotifTimeoutMs = 1500;
-
-struct SelectionToolbarButton {
-    int cmdId = 0;
-    Str label; // English literal, translated for button text or an icon tooltip
-    // A selection handler's SelectToolbarNameOrSvg can also supply user text or
-    // an SVG icon. For an icon, userLabel is its Name-based tooltip.
-    Str userLabel;
-    Str svgIcon;
-    Pixmap* icon = nullptr; // svgIcon rendered at the current size; not owned
-    Pixmap* iconDisabled = nullptr;
-    bool enabled = true;
-};
-
-static Str ButtonLabel(const SelectionToolbarButton& b) {
-    if (b.userLabel) {
-        return b.userLabel;
-    }
-    return Tr(b.label);
-}
 
 struct SelectionToolbar {
     MainWindow* win = nullptr;
@@ -75,93 +54,12 @@ struct SelectionToolbar {
     Rect lastPlaced;    // last screen rect we moved the window to (avoids redundant SetWindowPos)
     Rect lastSelBounds; // last canvas-space selection bounds used for placement
     DWORD lastPositionUpdateTick = 0;
-    // an action was picked for the current selection: stay hidden until it changes
-    bool dismissed = false;
     Vec<SelectionToolbarButton> buttons;
     Func1List<MainWindow*> onWindowMoved;
 };
 
-// candidate buttons; per-window visibility/enabled state comes from
-// GetCommandVisibility (hidden buttons are dropped, disabled ones grayed)
-static const SelectionToolbarButton gCandidateButtons[] = {
-    {CmdCopySelection, TrN("Copy to clipboard"), {}, Str(gIconCopy)},
-    {CmdTranslateSelection, StrL("Translate"), {}, Str(gIconTranslate)},
-    {CmdReadAloudSelection, StrL("Read Aloud"), {}, Str(gIconSpeak)},
-    {CmdCreateAnnotHighlight, StrL("Highlight"), {}, Str(gIconAnnotHighlight)},
-    {CmdCreateAnnotUnderline, StrL("Underline"), {}, Str(gIconAnnotUnderline)},
-    {CmdCreateAnnotSquiggly, StrL("Squiggly"), {}, Str(gIconAnnotSquiggly)},
-    {CmdCreateAnnotStrikeOut, StrL("Strike Out"), {}, Str(gIconAnnotStrikeOut)},
-    {CmdCreateAnnotText, TrN("Add text annotation"), {}, Str(gIconAnnotText)},
-};
-
-static const SelectionToolbarButton* FindCandidateButton(int cmdId) {
-    if (cmdId <= 0) {
-        return nullptr;
-    }
-    for (const SelectionToolbarButton& cand : gCandidateButtons) {
-        if (cand.cmdId == cmdId) {
-            return &cand;
-        }
-    }
-    return nullptr;
-}
-
-// Built-in buttons the selection toolbar should offer, in order.
-// Empty SelectionToolbarLayout is the standard set; otherwise the setting
-// lists command names (discussion #6015).
-static void CollectBuiltInSelectionToolbarCmds(Vec<int>& out) {
-    VecReset(out);
-    auto addDefault = [&out]() {
-        for (const SelectionToolbarButton& cand : gCandidateButtons) {
-            VecAppend(out, cand.cmdId);
-        }
-    };
-    Str setting = gSettings ? gSettings->selectionToolbarLayout : Str{};
-    if (str::IsEmptyOrWhiteSpace(setting)) {
-        addDefault();
-        return;
-    }
-    TempStr normalized = str::ReplaceTemp(setting, StrL(","), StrL(" "));
-    normalized = str::ReplaceTemp(normalized, StrL(";"), StrL(" "));
-    StrVec names;
-    Split(&names, normalized, StrL(" "), true);
-    int nButtons = 0;
-    for (Str name : names) {
-        Str tok = name;
-        str::TrimWSInPlace(tok, str::TrimOpt::Both);
-        if (len(tok) == 0) {
-            continue;
-        }
-        if (str::Eq(tok, StrL("|")) || str::EqI(tok, StrL("Separator"))) {
-            VecAppend(out, 0);
-            continue;
-        }
-        const SelectionToolbarButton* found = FindCandidateButton(GetCommandIdByName(tok));
-        if (!found) {
-            logf("SelectionToolbarLayout: no selection-toolbar button for '%s'\n", tok);
-            continue;
-        }
-        bool already = false;
-        for (int i = 0; i < len(out); i++) {
-            if (out[i] == found->cmdId) {
-                already = true;
-                break;
-            }
-        }
-        if (!already) {
-            VecAppend(out, found->cmdId);
-            nButtons++;
-        }
-    }
-    if (nButtons == 0) {
-        logf("SelectionToolbarLayout: nothing usable in '%s', using the standard layout\n", setting);
-        VecReset(out);
-        addDefault();
-    }
-}
-
 // selection handlers that asked for a button with SelectToolbarNameOrSvg
-static void AppendSelectionHandlerButtons(SelectionToolbar* tb, const AppCommandCtx& ctx) {
+void AppendSelectionHandlerButtons(Vec<SelectionToolbarButton>& buttons, const AppCommandCtx& ctx) {
     Vec<CustomCommand*> cmds;
     GetCommandsWithOrigId(cmds, CmdSelectionHandler);
     for (CustomCommand* cmd : cmds) {
@@ -182,55 +80,8 @@ static void AppendSelectionHandlerButtons(SelectionToolbar* tb, const AppCommand
             b.userLabel = s;
         }
         b.enabled = !CommandShouldDisable(v);
-        VecAppend(tb->buttons, b);
+        VecAppend(buttons, b);
     }
-}
-
-// Remove separators that would be leading, trailing, or adjacent after
-// unavailable commands have been dropped. A trailing layout separator is
-// retained when a selection-handler button follows it.
-static void NormalizeSelectionToolbarSeparators(Vec<SelectionToolbarButton>& buttons) {
-    int dst = 0;
-    bool separatorPending = false;
-    for (int i = 0; i < len(buttons); i++) {
-        SelectionToolbarButton b = buttons[i];
-        if (b.cmdId == 0) {
-            separatorPending = dst > 0;
-            continue;
-        }
-        if (separatorPending) {
-            buttons[dst++] = {};
-            separatorPending = false;
-        }
-        buttons[dst++] = b;
-    }
-    buttons.len = dst;
-}
-
-static void InitButtons(SelectionToolbar* tb, MainWindow* win) {
-    AppCommandCtx ctx = NewAppCommandCtx(win);
-    VecReset(tb->buttons);
-    Vec<int> ids;
-    CollectBuiltInSelectionToolbarCmds(ids);
-    for (int i = 0; i < len(ids); i++) {
-        if (ids[i] == 0) {
-            VecAppend(tb->buttons, {});
-            continue;
-        }
-        const SelectionToolbarButton* cand = FindCandidateButton(ids[i]);
-        if (!cand) {
-            continue;
-        }
-        CommandVisibility v = GetCommandVisibility(cand->cmdId, ctx, CommandSurface::Toolbar);
-        if (CommandShouldRemove(v)) {
-            continue;
-        }
-        SelectionToolbarButton b = *cand;
-        b.enabled = !CommandShouldDisable(v);
-        VecAppend(tb->buttons, b);
-    }
-    AppendSelectionHandlerButtons(tb, ctx);
-    NormalizeSelectionToolbarSeparators(tb->buttons);
 }
 
 constexpr int kBtnPadX = 8; // horizontal padding inside a button
@@ -242,11 +93,6 @@ constexpr int kButtonRadius = 6;
 constexpr int kToolbarFontPct = 108;
 // Throttle position moves during frequent canvas paints (plus 3229c8b2c).
 constexpr DWORD kSelTbPositionUpdateMinMs = 32;
-
-static bool IsActivelySelecting(MainWindow* win) {
-    MouseAction ma = win->mouseAction;
-    return ma == MouseAction::Selecting || ma == MouseAction::SelectingText;
-}
 
 static int SelectionBoundsSlack() {
     return DpiScale(3);
@@ -377,11 +223,11 @@ static bool GetSelectionEndPoint(MainWindow* win, Point& out);
 // The toolbar has done its job once an action is picked, so hide it until the
 // selection changes. Sticky-note placement records the selection end first,
 // because the command drops the selection.
-static void InvokeSelectionToolbarCommand(SelectionToolbar* tb, int cmdId) {
+void InvokeSelectionToolbarCommand(MainWindow* win, int cmdId) {
+    SelectionToolbar* tb = win ? win->selectionToolbar : nullptr;
     if (!tb || !cmdId) {
         return;
     }
-    MainWindow* win = tb->win;
     LPARAM commandPoint = 0;
     if (cmdId == CmdCreateAnnotText) {
         Point selectionEnd;
@@ -391,7 +237,7 @@ static void InvokeSelectionToolbarCommand(SelectionToolbar* tb, int cmdId) {
         DeleteOldSelectionInfo(win, true);
     }
     HideSelectionToolbar(win);
-    tb->dismissed = true;
+    win->selectionToolbarDismissed = true;
 
     if (cmdId != CmdCopySelection) {
         HwndPostCommand(win->hwndFrame, cmdId, commandPoint);
@@ -403,12 +249,12 @@ static void InvokeSelectionToolbarCommand(SelectionToolbar* tb, int cmdId) {
         return;
     }
     NotificationCreateArgs args;
-    args.hwndParent = win->hwndCanvas;
+    args.win = win;
     args.groupId = kNotifCopiedToClipboard;
     args.timeoutMs = kCopiedNotifTimeoutMs;
     args.corner = NotifCorner::BottomLeft;
     args.msg = Tr("Copied to clipboard");
-    RemoveNotificationsForGroup(win->hwndCanvas, kNotifCopiedToClipboard);
+    RemoveNotificationsForGroup(win, kNotifCopiedToClipboard);
     ShowNotification(args);
 }
 
@@ -417,7 +263,7 @@ static void OnSelToolbarButtonClicked(SelectionToolbar* tb, VirtMouseEvent* ev) 
     if (!cmdId) {
         return;
     }
-    InvokeSelectionToolbarCommand(tb, cmdId);
+    InvokeSelectionToolbarCommand(tb->win, cmdId);
 }
 
 // Build the layout tree for the current buttons and measure it into tb->size
@@ -483,12 +329,12 @@ static void LayoutToolbar(SelectionToolbar* tb) {
 // Ported from dengxibo/sumatrapdf-plus 89e4edfed.
 static bool GetSelectionEndPoint(MainWindow* win, Point& out) {
     DisplayModel* dm = win->AsFixed();
-    if (!dm || !dm->textSelection || dm->textSelection->result.len <= 0) {
+    if (!dm || !dm->textSelection || len(dm->textSelection->result) <= 0) {
         return false;
     }
-    TextSel& result = dm->textSelection->result;
-    int i = result.len - 1;
-    Rect r = dm->CvtToScreen(result.pages[i], ToRectF(result.rects[i]));
+    Vec<TextSel>& result = dm->textSelection->result;
+    int i = len(result) - 1;
+    Rect r = dm->CvtToScreen(result[i].pageNo, ToRectF(result[i].rect));
     if (r.IsEmpty()) {
         return false;
     }
@@ -502,37 +348,14 @@ static void PaintToolbar(SelectionToolbar*, VirtHostPaintEvent* ev) {
     ev->gfx->FillRoundedRect(ev->clientRect, cornerRadius, SelBarBg(), SelBarBorderColor());
 }
 
-// union of the on-screen parts of the selection, in canvas coordinates;
-// false if the selection is empty or fully scrolled out of view
-static bool GetSelectionBounds(MainWindow* win, Rect& out) {
-    DisplayModel* dm = win->AsFixed();
-    if (!dm) {
-        return false;
-    }
-    WindowTab* tab = win->CurrentTab();
-    if (!tab || !tab->selectionOnPage) {
-        return false;
-    }
-    Rect canvas = win->canvasRc;
-    Rect bounds;
-    bool first = true;
-    for (SelectionOnPage& sel : *tab->selectionOnPage) {
-        Rect r = sel.GetRect(dm).Intersect(canvas);
-        if (r.IsEmpty()) {
-            continue;
-        }
-        if (first) {
-            bounds = r;
-            first = false;
-        } else {
-            bounds = bounds.Union(r);
-        }
-    }
-    if (first) {
-        return false;
-    }
-    out = bounds;
-    return true;
+bool IsSelectionToolbarVisible(MainWindow* win) {
+    SelectionToolbar* tb = win ? win->selectionToolbar : nullptr;
+    return tb && tb->host && tb->host->IsVisible();
+}
+
+// the part of the canvas a selection can show in
+Rect SelectionCanvasRect(MainWindow* win, DisplayModel*) {
+    return win->canvasRc;
 }
 
 // Prefer above the selection, fall back to below; clamp to the canvas.
@@ -622,7 +445,7 @@ TempStr SelectionToolbarLayoutDumpTemp() {
     SelectionToolbar* tb = win ? GetOrCreateToolbar(win) : nullptr;
     bool visible = tb && tb->host && tb->host->IsVisible();
     out.Append(fmt("visible=%d\n", visible ? 1 : 0));
-    NotificationWnd* notif = win ? GetNotificationForGroup(win->hwndCanvas, kNotifCopiedToClipboard) : nullptr;
+    NotificationWnd* notif = win ? GetNotificationForGroup(win, kNotifCopiedToClipboard) : nullptr;
     out.Append(fmt("notif=%s\n", notif ? NotificationGetMessageTemp(notif) : TempStr(StrL(""))));
     if (visible) {
         Rect r = tb->host->ScreenRect();
@@ -632,7 +455,7 @@ TempStr SelectionToolbarLayoutDumpTemp() {
         out.Append(StrL("buttons=0\n"));
         return ToStrTemp(out);
     }
-    InitButtons(tb, win);
+    InitButtons(tb->buttons, win);
     LayoutToolbar(tb);
     int nSeparators = 0;
     for (const SelectionToolbarButton& b : tb->buttons) {
@@ -653,39 +476,6 @@ TempStr SelectionToolbarLayoutDumpTemp() {
     return ToStrTemp(out);
 }
 
-// Fire a selection-toolbar button the same way a click does, for -dbg-control tests.
-TempStr SelectionToolbarClickTemp(Str cmdName, int* exitCodeOut) {
-    str::Builder out;
-    auto finish = [&](Str msg, int code) -> TempStr {
-        out.Append(msg);
-        if (exitCodeOut) {
-            *exitCodeOut = code;
-        }
-        return ToStrTemp(out);
-    };
-    MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
-    SelectionToolbar* tb = win ? win->selectionToolbar : nullptr;
-    if (!tb || !tb->host || !tb->host->IsVisible()) {
-        return finish(StrL("ERROR toolbar-not-visible\n"), 1);
-    }
-    int cmdId = GetCommandIdByName(cmdName);
-    if (cmdId <= 0) {
-        return finish(fmt("ERROR unknown-cmd %s\n", cmdName), 1);
-    }
-    bool found = false;
-    for (const SelectionToolbarButton& b : tb->buttons) {
-        if (b.cmdId == cmdId) {
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        return finish(fmt("ERROR no-button %s\n", cmdName), 1);
-    }
-    InvokeSelectionToolbarCommand(tb, cmdId);
-    return finish(StrL("OK\n"), 0);
-}
-
 // Show the floating selection toolbar for the current text selection. Does
 // nothing if the feature is disabled (Annotations.SelectionToolbar) or there
 // is no on-screen text selection in a fixed-page document.
@@ -702,7 +492,7 @@ static void ShowSelectionToolbarNow(MainWindow* win) {
     if (!dm) {
         return;
     }
-    if (dm->textSelection->result.len <= 0) {
+    if (len(dm->textSelection->result) <= 0) {
         return;
     }
     Rect sel;
@@ -716,7 +506,7 @@ static void ShowSelectionToolbarNow(MainWindow* win) {
     tb->tab = win->CurrentTab();
     tb->lastPositionUpdateTick = GetTickCount();
     tb->lastSelBounds = sel;
-    InitButtons(tb, win);
+    InitButtons(tb->buttons, win);
     if (len(tb->buttons) == 0) {
         return;
     }
@@ -749,7 +539,7 @@ void ShowSelectionToolbar(MainWindow* win, SelToolbarShow when) {
     if (!win || !win->hwndCanvas || !gSettings->selectionToolbar) {
         return;
     }
-    if (win->selectionToolbar && win->selectionToolbar->dismissed) {
+    if (win->selectionToolbar && win->selectionToolbarDismissed) {
         return;
     }
     if (when == SelToolbarShow::Now) {
@@ -800,7 +590,7 @@ void UpdateSelectionToolbarPosition(MainWindow* win) {
         }
         return;
     }
-    if (win->CurrentTab() != tb->tab) {
+    if (!IsCurrentTab(win, tb->tab)) {
         HideSelectionToolbar(win);
         if (win->showSelection) {
             ShowSelectionToolbar(win, SelToolbarShow::Settled);
@@ -829,7 +619,7 @@ void UpdateSelectionToolbarPosition(MainWindow* win) {
     tb->lastPositionUpdateTick = now;
     tb->lastSelBounds = sel;
 
-    InitButtons(tb, win);
+    InitButtons(tb->buttons, win);
     LayoutToolbar(tb);
     if (PositionToolbar(tb, sel)) {
         tb->host->Invalidate(false);
@@ -861,13 +651,6 @@ void RefreshSelectionToolbarIcons(MainWindow* win) {
     }
     LayoutToolbar(tb);
     tb->host->Invalidate(false);
-}
-
-// The selection changed or went away: a new one gets the toolbar again.
-void ResetSelectionToolbarDismissed(MainWindow* win) {
-    if (win && win->selectionToolbar) {
-        win->selectionToolbar->dismissed = false;
-    }
 }
 
 // Hide the toolbar but keep the window around for reuse.
@@ -903,4 +686,9 @@ void DeleteSelectionToolbar(MainWindow* win) {
     delete tb->host;
     delete tb;
     win->selectionToolbar = nullptr;
+    win->selectionToolbarDismissed = false;
+}
+
+Vec<SelectionToolbarButton>* SelectionToolbarButtons(MainWindow* win) {
+    return &win->selectionToolbar->buttons;
 }

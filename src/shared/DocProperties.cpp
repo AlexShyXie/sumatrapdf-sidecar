@@ -1,0 +1,142 @@
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
+   License: Simplified BSD (see COPYING.BSD) */
+
+#include "base/Base.h"
+
+#include "DocProperties.h"
+
+static SeqStrings gPropNames =
+    "title\0"
+    "author\0"
+    "copyright\0"
+    "subject\0"
+    "creationDate\0"
+    "modDate\0"
+    "creatorApp\0"
+    "unsupportedFeatures\0"
+    "fontList\0"
+    "pdfVersion\0"
+    "pdfProducer\0"
+    "pdfFileStructure\0"
+    "files\0"
+    "keywords\0"
+    "encryption\0"
+    "signatures\0"
+    "imageSize\0"
+    "dpi\0"
+    "comment\0"
+    "cameraMake\0"
+    "cameraModel\0"
+    "dateOriginal\0"
+    "exposureTime\0"
+    "fNumber\0"
+    "isoSpeed\0"
+    "focalLength\0"
+    "focalLength35mm\0"
+    "flash\0"
+    "orientation\0"
+    "exposureProgram\0"
+    "meteringMode\0"
+    "whiteBalance\0"
+    "exposureBias\0"
+    "bitsPerSample\0"
+    "resolutionUnit\0"
+    "software\0"
+    "dateTime\0"
+    "yCbCrPositioning\0"
+    "exifVersion\0"
+    "dateTimeDigitized\0"
+    "componentsConfig\0"
+    "compressedBpp\0"
+    "maxAperture\0"
+    "lightSource\0"
+    "userComment\0"
+    "flashpixVersion\0"
+    "colorSpace\0"
+    "pixelXDimension\0"
+    "pixelYDimension\0"
+    "fileSource\0"
+    "sceneType\0"
+    "imageFileSize\0"
+    "imagePath\0"
+    "\0";
+
+// @gen-start docprop-pdf-info
+// clang-format off
+static SeqStrNum gPdfInfoPropsMap =
+    "Title\0" "\x02"
+    "Author\0" "\x04"
+    "Subject\0" "\x08"
+    "Copyright\0" "\x06"
+    "CreationDate\0" "\x0a"
+    "ModDate\0" "\x0c"
+    "Creator\0" "\x0e"
+    "Producer\0" "\x16"
+    "\0";
+// clang-format on
+// @gen-end docprop-pdf-info
+
+Str PdfInfoKeyFromProp(DocProp prop) {
+    return SeqStrNumStrByNumber(gPdfInfoPropsMap, (i64)prop);
+}
+
+int GetPropIdx(const Props& props, DocProp prop) {
+    int n = len(props);
+    for (int i = 0; i < n; i++) {
+        if (props[i].prop == prop) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+Str GetPropValueTemp(const Props& props, DocProp prop) {
+    int idx = GetPropIdx(props, prop);
+    return idx < 0 ? Str{} : props[idx].val;
+}
+
+void AddProp(Props& props, DocProp prop, Str val, bool replaceIfExists) {
+    ReportIf(prop == DocProp::None || len(val) == 0);
+    int idx = GetPropIdx(props, prop);
+    if (idx < 0) {
+        VecAppend(props, {prop, val});
+    } else if (replaceIfExists) {
+        props[idx].val = val;
+    }
+}
+
+// like AddProp but stores an owned (heap) copy of val. Use when props must
+// outlive the buffer val points into (e.g. the temp arena). Free with FreeProps.
+void AddPropOwned(Props& props, DocProp prop, Str val, bool replaceIfExists) {
+    if (len(val) == 0) {
+        return;
+    }
+    int idx = GetPropIdx(props, prop);
+    if (idx < 0) {
+        VecAppend(props, {prop, str::Dup(val)});
+    } else if (replaceIfExists) {
+        str::ReplaceWithCopy(&props[idx].val, val);
+    }
+}
+
+// frees values stored by AddPropOwned and empties props
+void FreeProps(Props& props) {
+    for (const PropValue& prop : props) {
+        str::Free(prop.val);
+    }
+    VecReset(props);
+}
+
+// gPropNames lists the names in DocProp order, so DocProp::Title (value 1) is
+// the first name (index 0); the value is index + 1.
+TempStr PropNameTemp(DocProp prop) {
+    int idx = (int)prop - 1;
+    if (idx < 0) {
+        return {};
+    }
+    return SeqStrByIndex(gPropNames, idx);
+}
+
+DocProp PropFromName(Str name) {
+    return (DocProp)(SeqStrIndex(gPropNames, name) + 1);
+}

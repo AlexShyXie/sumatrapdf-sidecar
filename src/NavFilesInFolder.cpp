@@ -35,6 +35,8 @@
 #include "FilterUtil.h"
 #include "FilterHighlightDraw.h"
 #include "NavFilesInFolder.h"
+#include "NavFilesInFolderCommon.h"
+#include "AppHelpersCommon.h"
 
 // A modeless directory browser listing sub-directories and files SumatraPDF
 // can open (judged by extension). Enter / double-click replaces the document
@@ -80,18 +82,6 @@ constexpr int kNavFallbackMaxDx = 720;
 constexpr int kNavFallbackMainDxMargin = 256; // main client dx minus this → preferred width
 constexpr int kNavFallbackMainDyMargin = 72;
 constexpr int kNavFallbackYOffset = 42; // top offset when centered over main
-
-struct NavFileEntry {
-    Str name; // owned; leaf display name (dirs end with "\\"); ".." for parent
-    Str path; // owned; full path (empty for "..")
-    bool isDir = false;
-    i64 size = 0; // file size; 0 for dirs / unknown
-};
-
-static void FreeNavEntry(NavFileEntry& e) {
-    str::Free(e.name);
-    str::Free(e.path);
-}
 
 struct ListBoxModelNav : ListBoxModel {
     Vec<NavFileEntry> all;     // owned; the whole listing
@@ -216,49 +206,7 @@ static void ScheduleFocusNavListBox() {
     uitask::Post(fn, "FocusNavListBox");
 }
 
-// skip GuessFileTypeFromName()'s IsDirectory() probe: name is relative to the
-// listed dir, and callers already skipped directories.
-static bool CanOpenFile(Str path) {
-    FileType kind = GuessFileTypeFromName(path, true);
-    return IsSupportedFileType(kind, true) || DocIsSupportedFileType(kind);
-}
-
-// dirs first, then files, each sorted naturally by name.
-// qsort: the old insertion sort was O(n^2) and froze on huge folders.
-static int CmpNavEntry(const NavFileEntry* a, const NavFileEntry* b) {
-    if (a->isDir != b->isDir) {
-        return a->isDir ? -1 : 1;
-    }
-    return str::CmpNatural(a->name, b->name);
-}
-
-static void SortNavEntries(Vec<NavFileEntry>& entries, int firstIdx) {
-    int n = len(entries) - firstIdx;
-    if (n <= 1) {
-        return;
-    }
-    auto cmp = (int (*)(const void*, const void*))CmpNavEntry;
-    qsort(entries.els + firstIdx, (size_t)n, sizeof(NavFileEntry), cmp);
-}
-
-static void FreeNavEntries(Vec<NavFileEntry>& entries) {
-    for (NavFileEntry& e : entries) {
-        FreeNavEntry(e);
-    }
-    VecReset(entries);
-}
-
-static void StealNavEntries(Vec<NavFileEntry>& dst, Vec<NavFileEntry>& src) {
-    FreeNavEntries(dst);
-    dst.els = src.els;
-    dst.len = src.len;
-    dst.cap = src.cap;
-    src.els = nullptr;
-    src.len = 0;
-    src.cap = 0;
-}
-
-static Str NavEntryBaseName(const NavFileEntry& e);
+Str NavEntryBaseName(const NavFileEntry& e);
 
 // rebuild the shown entries: all of them without a filter, else those whose
 // name has every filter word (the command palette's matching), without ".."
@@ -281,85 +229,7 @@ static void ClearNavModel(ListBoxModelNav* m) {
     VecReset(m->entries);
 }
 
-static bool SameNavEntries(const Vec<NavFileEntry>& a, const Vec<NavFileEntry>& b) {
-    if (len(a) != len(b)) {
-        return false;
-    }
-    for (int i = 0; i < len(a); i++) {
-        const NavFileEntry& ea = a[i];
-        const NavFileEntry& eb = b[i];
-        if (ea.isDir != eb.isDir || ea.size != eb.size || !str::Eq(ea.name, eb.name)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool DirHasParent(Str dir) {
-    if (len(dir) == 0) {
-        return false; // home view
-    }
-    TempStr parent = path::GetDirTemp(dir);
-    return !path::IsSame(parent, dir);
-}
-
-static void AppendParentEntry(Vec<NavFileEntry>& entries) {
-    NavFileEntry e;
-    e.name = str::Dup(StrL(".."));
-    e.isDir = true;
-    VecAppend(entries, e);
-}
-
-// leaf name for display: find-data names are usually basenames, but some network
-// providers put a relative or full path in cFileName — always show the leaf only.
-static TempStr NavLeafNameTemp(DirIterEntry* de) {
-    TempStr leaf = path::GetBaseNameTemp(de->name);
-    if (len(leaf) == 0) {
-        leaf = path::GetBaseNameTemp(de->filePath);
-    }
-    return leaf;
-}
-
-// Explorer's Quick access, fetched once per process because the shell resolves
-// every entry. F5 in the home view drops the cache.
-static Mutex gQuickAccessMutex;
-static bool gQuickAccessCached = false;
-static StrVec gQuickAccessDirs;
-static StrVec gQuickAccessFiles;
-
-static void ResetQuickAccessCache() {
-    gQuickAccessMutex.Lock();
-    gQuickAccessCached = false;
-    gQuickAccessMutex.Unlock();
-}
-
-static void GetQuickAccessCached(StrVec& dirsOut, StrVec& filesOut) {
-    gQuickAccessMutex.Lock();
-    if (!gQuickAccessCached) {
-        gQuickAccessDirs.Reset();
-        gQuickAccessFiles.Reset();
-        auto t = TimeGet();
-        ListShellQuickAccess(gQuickAccessDirs, gQuickAccessFiles);
-        logf("NavDirScan: quick access %d dirs, %d files in %.1fms\n", len(gQuickAccessDirs), len(gQuickAccessFiles),
-             TimeSinceInMs(t));
-        gQuickAccessCached = true;
-    }
-    dirsOut = gQuickAccessDirs;
-    filesOut = gQuickAccessFiles;
-    gQuickAccessMutex.Unlock();
-}
-
-// home entries show the full path: Quick access has many same-named folders
-static void AppendHomeDirEntry(Vec<NavFileEntry>& out, Str path) {
-    NavFileEntry e;
-    e.isDir = true;
-    e.path = str::Dup(path);
-    bool hasSep = path::IsSep(path.s[len(path) - 1]);
-    e.name = hasSep ? str::Dup(path) : str::Join(path, StrL("\\"));
-    VecAppend(out, e);
-}
-
-static void AppendHomeFileEntry(Vec<NavFileEntry>& out, Str path) {
+void AppendHomeFileEntry(Vec<NavFileEntry>& out, Str path) {
     if (!CanOpenFile(path)) {
         return;
     }
@@ -375,34 +245,15 @@ static void AppendHomeFileEntry(Vec<NavFileEntry>& out, Str path) {
     VecAppend(out, e);
 }
 
-// Home view: drive roots, then Explorer's Quick access folders and files
-static void CollectHomeEntries(Vec<NavFileEntry>& out) {
-    StrVec drives;
-    ListDriveRoots(drives);
-    for (int i = 0; i < len(drives); i++) {
-        AppendHomeDirEntry(out, drives[i]);
-    }
-
-    StrVec dirs;
-    StrVec files;
-    GetQuickAccessCached(dirs, files);
-    for (int i = 0; i < len(dirs); i++) {
-        AppendHomeDirEntry(out, dirs[i]);
-    }
-    for (int i = 0; i < len(files); i++) {
-        AppendHomeFileEntry(out, files[i]);
-    }
-}
-
 // Built on a worker thread: listing + filtering + sorting a folder of tens of
 // thousands of files must not freeze the UI (discussion #6014).
-static void CollectNavEntriesForDir(Str dir, Vec<NavFileEntry>& out) {
+void CollectNavEntriesForDir(Str dir, Vec<NavFileEntry>& out) {
     if (len(dir) == 0) {
         CollectHomeEntries(out);
         return;
     }
     // ".." also in a drive root, where it leads to the home view
-    AppendParentEntry(out);
+    AppendNavParentEntry(out);
     int firstIdx = 1; // keep ".." at the top when sorting
 
     DirIter di{dir};
@@ -555,7 +406,7 @@ static TempStr NavEntryPathTemp(NavFilesInFolderWnd* wnd, NavFileEntry& e) {
 }
 
 // entry display name without a trailing path separator (dirs use "name\\")
-static Str NavEntryBaseName(const NavFileEntry& e) {
+Str NavEntryBaseName(const NavFileEntry& e) {
     Str name = e.name;
     if (e.isDir && name.len > 0 && path::IsSep(name.s[name.len - 1])) {
         return Str(name.s, name.len - 1);
@@ -759,7 +610,7 @@ void NavFilesInFolderWnd::SetDir(Str dir, Str selectPath, int selectIdx, NavList
         // show ".." immediately so the window is usable while the listing runs
         ClearNavModel(m);
         if (!IsHome()) {
-            AppendParentEntry(m->all);
+            AppendNavParentEntry(m->all);
         }
         FilterNavEntries(m, filterWords);
         listBox->SetModel(m);
@@ -823,24 +674,13 @@ void NavFilesInFolderWnd::GoUp() {
     if (IsHome()) {
         return;
     }
-    if (!DirHasParent(currDir)) {
+    if (!NavDirHasParent(currDir)) {
         GoHome();
         return;
     }
     // select the directory we're coming from
     TempStr cameFrom = str::DupTemp(currDir);
     Navigate(path::GetDirTemp(currDir), cameFrom);
-}
-
-// cameFrom when it is a direct child of dir (so Back / Forward select it), else empty
-static Str SelectIfChildOf(Str cameFrom, Str dir) {
-    if (len(cameFrom) == 0 || len(dir) == 0) {
-        return {};
-    }
-    if (!path::IsSame(path::GetDirTemp(cameFrom), dir)) {
-        return {};
-    }
-    return cameFrom;
 }
 
 void NavFilesInFolderWnd::GoBack() {
@@ -1414,7 +1254,7 @@ bool NavFilesInFolderWnd::Create(MainWindow* mainWin, Str filePath) {
         TempStr hints = fmt("(Kbd/%s) %s (Kbd/%s) %s (Kbd/%s) %s", Tr("Enter"), Tr("open in current tab"),
                             Tr("Ctrl + Enter"), Tr("open in new tab"), Tr("Del"), Tr("delete file"));
         // the hints are secondary information, so they get a smaller font
-        PlatformFont* helpFont = GetDefaultGuiFontOfSize(std::max(GetAppFontSize() - 2, 8));
+        PlatformFont* helpFont = GetUserGuiFont({}, std::max(GetAppFontSize() - 2, 8));
         auto* k = new VirtRichText();
         ParseTipInto(k, hints);
         k->font = helpFont;

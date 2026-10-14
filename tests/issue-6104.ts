@@ -11,21 +11,16 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ControlClient, ControlCommand } from "./control.ts";
+import { IS_MAC } from "./host.ts";
 import { ROOT, cmdId, runStandalone, tmpPath } from "./util.ts";
-import {
-  captureWindowPixels,
-  captureWindowToPng,
-  getClassName,
-  getFocusedHwnd,
-  getRootWindow,
-  sendText,
-  sleep,
-} from "./winapi.ts";
-import { killAndWait, launchControlled, sendCommand } from "./win-automation.ts";
+import { captureWindowPixels, captureWindowToPng, sendText, sleep } from "./winapi.ts";
+import { killAndWait, launchControlled, sendCommand, findPalette, isFilterMatchTint } from "./win-automation.ts";
 
 const FILE_NAME = "issue6104.pdf";
-const LONG_DIR = ["C:", ...Array(30).fill("zzzzzzzzzzzzzzzzzzzz")].join("\\");
-const LONG_PATH = `${LONG_DIR}\\${FILE_NAME}`;
+const LONG_DIR = IS_MAC
+  ? `/${Array(30).fill("zzzzzzzzzzzzzzzzzzzz").join("/")}`
+  : ["C:", ...Array(30).fill("zzzzzzzzzzzzzzzzzzzz")].join("\\");
+const LONG_PATH = IS_MAC ? `${LONG_DIR}/${FILE_NAME}` : `${LONG_DIR}\\${FILE_NAME}`;
 
 const SETTINGS = `UiLanguage = en
 Theme = Light
@@ -59,15 +54,6 @@ async function paletteState(client: ControlClient): Promise<PaletteState | null>
   return { items: +m[1]!, queryLen: +m[2]! };
 }
 
-function findPalette(frame: number): { palette: number; edit: number } {
-  const edit = getFocusedHwnd(frame);
-  if (!edit || getClassName(edit) !== "Edit") {
-    return { palette: 0, edit: 0 };
-  }
-  const palette = getRootWindow(edit);
-  return { palette: palette === frame ? 0 : palette, edit };
-}
-
 function countYellowInLeftHalf(palette: number): number {
   const shot = captureWindowPixels(palette);
   if (!shot) {
@@ -81,7 +67,7 @@ function countYellowInLeftHalf(palette: number): number {
       const b = shot.data[off]!;
       const g = shot.data[off + 1]!;
       const r = shot.data[off + 2]!;
-      if (r > 240 && g > 240 && b < 30) {
+      if (isFilterMatchTint(r, g, b)) {
         count++;
       }
     }
@@ -104,9 +90,16 @@ export async function testit(): Promise<void> {
     const openDeadline = Date.now() + 8_000;
     let handles = { palette: 0, edit: 0 };
     while (Date.now() < openDeadline) {
-      handles = findPalette(frame);
-      if (handles.palette && handles.edit) {
-        break;
+      if (IS_MAC) {
+        if (await paletteState(client)) {
+          handles = { palette: frame, edit: frame };
+          break;
+        }
+      } else {
+        handles = findPalette(frame);
+        if (handles.palette && handles.edit) {
+          break;
+        }
       }
       await sleep(50);
     }
@@ -129,18 +122,22 @@ export async function testit(): Promise<void> {
       throw new Error(`issue-6104: file history query failed: ${JSON.stringify(state)}`);
     }
 
-    const paintDeadline = Date.now() + 3_000;
-    let yellow = 0;
-    while (Date.now() < paintDeadline) {
-      yellow = countYellowInLeftHalf(handles.palette);
-      if (yellow > 20) {
-        break;
+    if (IS_MAC) {
+      console.log("SKIP issue-6104 filename highlight: macOS has no window DC");
+    } else {
+      const paintDeadline = Date.now() + 3_000;
+      let yellow = 0;
+      while (Date.now() < paintDeadline) {
+        yellow = countYellowInLeftHalf(handles.palette);
+        if (yellow > 20) {
+          break;
+        }
+        await sleep(40);
       }
-      await sleep(40);
-    }
-    if (yellow <= 20) {
-      captureWindowToPng(handles.palette, tmpPath("issue-6104.png"));
-      throw new Error(`issue-6104: filename highlight not painted on the left; yellow=${yellow}`);
+      if (yellow <= 20) {
+        captureWindowToPng(handles.palette, tmpPath("issue-6104.png"));
+        throw new Error(`issue-6104: filename highlight not painted on the left; yellow=${yellow}`);
+      }
     }
 
     console.log("issue-6104: OK");

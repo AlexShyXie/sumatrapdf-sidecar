@@ -2,6 +2,7 @@
    License: Simplified BSD (see COPYING.BSD) */
 
 #include "base/Base.h"
+#include <locale.h>
 
 // must be last due to assert() over-write
 #include "base/tests/UtAssert.h"
@@ -124,6 +125,9 @@ static void StrSeqNumTest() {
     SeqStrNumAdvance(seq, off, &idx);
     utassert(idx == 1);
     utassert(str::Eq(SeqStrNumAt(seq, off), StrL("bar")));
+    num = 0;
+    s = SeqStrNumAt(seq, off, &num);
+    utassert(str::Eq(s, StrL("bar")) && num == -3);
 }
 
 static void StrSeqTest() {
@@ -924,7 +928,12 @@ void StrTest() {
     }
 
     utassert(str::IsDigit('0') && str::IsDigit(TEXT('5')) && str::IsDigit(L'9'));
+#if OS_WIN
     utassert(iswdigit(L'\u0660') && !str::IsDigit(L'\xB2'));
+#else
+    // wchar_t is 4 bytes here, so name the narrow overload explicitly
+    utassert(!str::IsDigit((char)L'\xB2'));
+#endif
 
     utassert(str::CmpNatural(StrL(".hg"), StrL("2.pdf")) < 0);
     utassert(str::CmpNatural(StrL("100.pdf"), StrL("2.pdf")) > 0);
@@ -937,8 +946,11 @@ void StrTest() {
     utassert(str::CmpNatural(StrL("a.pdf"), StrL("")) > 0);
     utassert(str::CmpNatural(Str{}, Str{}) == 0);
 
+#if OS_WIN
+// base/Base.h defines LOCALE_INVARIANT as a constant outside Windows
 #ifndef LOCALE_INVARIANT
 #define LOCALE_INVARIANT (MAKELCID(MAKELANGID(LANG_INVARIANT, SUBLANG_NEUTRAL), SORT_DEFAULT))
+#endif
 #endif
 
     // clang-format off
@@ -1104,6 +1116,29 @@ void StrTest() {
     }
 
     {
+        const char cp1251[] = {'\xcf', '\xf0', '\xe8', '\xe2', '\xe5', '\xf2'};
+        TempStr utf8 = strconv::ToMultiByteTemp(Str((char*)cp1251, dimof(cp1251)), 1251, CP_UTF8);
+        utassert(str::Eq(utf8, StrL("Привет")));
+        TempWStr wide = strconv::StrCPToWStrTemp(Str((char*)cp1251, dimof(cp1251)), 1251);
+        utassert(wstr::Eq(wide, WStrL(L"Привет")));
+        Str roundTrip = strconv::WStrToCodePage(1251, wide);
+        utassert(str::Eq(roundTrip, Str((char*)cp1251, dimof(cp1251))));
+        str::Free(roundTrip);
+    }
+
+    {
+        const char cp1252[] = {'\x80', ' ', '\x93', 'x', '\x94'};
+        TempStr utf8 = strconv::ToMultiByteTemp(Str((char*)cp1252, dimof(cp1252)), 1252, CP_UTF8);
+        utassert(str::Eq(utf8, StrL("€ “x”")));
+    }
+
+    {
+        const char cp932[] = {'\x82', '\xb1', '\x82', '\xf1', '\x82', '\xc9', '\x82', '\xbf', '\x82', '\xcd'};
+        TempStr utf8 = strconv::ToMultiByteTemp(Str((char*)cp932, dimof(cp932)), 932, CP_UTF8);
+        utassert(str::Eq(utf8, StrL("こんにちは")));
+    }
+
+    {
         char buf1[6]{};
         size_t cnt = str::BufAppend(Str(buf1, dimof(buf1)), StrL(""));
         utassert(0 == cnt);
@@ -1119,12 +1154,18 @@ void StrTest() {
     }
 
     {
+        // libarchive sets LC_CTYPE to the user locale. On macOS that makes
+        // isspace(0xA0) true; IsWs is the C-locale ASCII set.
+        const char* cur = setlocale(LC_CTYPE, nullptr);
+        TempStr saved = str::DupTemp(cur ? Str(cur) : StrL("C"));
+        setlocale(LC_CTYPE, "C");
         for (int c = 0x00; c < 0x100; c++) {
             utassert(!!isspace((u8)c) == str::IsWs((char)c));
         }
         for (int c = 0x00; c < 0x10000; c++) {
             utassert(!!iswspace((WCHAR)c) == wstr::IsWs((WCHAR)c));
         }
+        setlocale(LC_CTYPE, CStrTemp(saved));
     }
 
     strStrTest();

@@ -2,12 +2,14 @@
    License: GPLv3 */
 
 struct NotificationWnd;
+struct MainWindow;
 struct WindowTab;
 struct VirtCtrl;
 struct VirtRichText;
 struct ILayout;
 struct PlatformFont;
 
+extern Kind kNotifZoomOrView;
 extern Kind kNotifCursorPos;
 extern Kind kNotifActionResponse;
 extern Kind kNotifPageInfo;
@@ -51,6 +53,8 @@ constexpr const int kNotifDefaultMargin = 8;
 
 struct NotificationCreateArgs {
     HWND hwndParent = nullptr;
+    // as in ng: used when hwndParent isn't set, shows over win's canvas
+    MainWindow* win = nullptr;
     PlatformFont* font = nullptr;
     Kind groupId = kNotifActionResponse;
     bool warning = false;
@@ -82,6 +86,7 @@ struct NotificationCreateArgs {
     NotificationClosed onClosed;
 };
 
+void SetNotifWindow(NotificationCreateArgs&, MainWindow*);
 void NotificationUpdateMessage(NotificationWnd* wnd, Str msg, int timeoutInMS = 0, bool highlight = false);
 TempStr NotificationGetMessageTemp(NotificationWnd* wnd);
 void RemoveNotification(NotificationWnd*);
@@ -105,7 +110,16 @@ NotificationWnd* ShowWarningNotification(HWND hwndParent, Str msg, int timeoutMs
 NotificationWnd* ShowPlainNotification(HWND hwnd, Str msg, int timeoutMs = kNotifDefaultTimeOut);
 NotificationWnd* ShowPlainWarningNotification(HWND hwndParent, Str msg, int timeoutMs);
 
+// as in ng: address the notifications of win's canvas
+bool RemoveNotificationsForGroup(MainWindow*, Kind);
+NotificationWnd* GetNotificationForGroup(MainWindow*, Kind);
+NotificationWnd* ShowTemporaryNotification(MainWindow* win, Str msg, int timeoutMs = kNotifDefaultTimeOut);
+NotificationWnd* ShowWarningNotification(MainWindow* win, Str msg, int timeoutMs);
+NotificationWnd* ShowPlainNotification(MainWindow* win, Str msg, int timeoutMs = kNotifDefaultTimeOut);
+NotificationWnd* ShowPlainWarningNotification(MainWindow* win, Str msg, int timeoutMs);
+
 void MaybeDelayedWarningNotification(Str msg);
 void ShowMaybeDelayedNotifications(HWND hwndParent);
+void InstallLayoutNotifHooks();
 
 int CalcPerc(int current, int total);

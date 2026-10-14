@@ -1,0 +1,898 @@
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
+   License: GPLv3 */
+
+// ng: orig's properties window is a top-level HWND holding a read-only
+// multi-line Edit in Consolas and a "Copy To Clipboard" button. The text it
+// shows is built here exactly as orig builds it (same rows, same order, same
+// alignment); the window is a gpui Dialog with a read-only monospaced editor.
+
+#include "gui/GpuiBridge.h"
+#if OS_WIN
+#include "base/Win.h"
+#endif
+#include "VirtKeys.h"
+#include "base/File.h"
+#include "base/UITask.h"
+
+#if !OS_WIN
+#include <locale.h>
+#endif
+
+#include "gui/Dpi.h"
+#include "gui/UIModels.h"
+#include "gui/PlatformFont.h"
+
+#include "Settings.h"
+#include "AppSettings.h"
+#include "DocProperties.h"
+#include "DocController.h"
+#include "EngineBase.h"
+#include "base/GuessFileType.h"
+#include "EngineAll.h"
+#include "DisplayModel.h"
+#include "AppTools.h"
+#include "SumatraPDF.h"
+#include "MainWindow.h"
+#include "Commands.h"
+#include "Translations.h"
+#include "SumatraConfig.h"
+#include "Theme.h"
+#include "EutlTrust.h"
+#include "Notifications.h"
+#include "Print.h"
+#include "gui/AppShell.h"
+#include "gui/DialogWidgets.h"
+#include "gui/ToolWindow.h"
+
+#if OS_WIN
+#include <wincrypt.h>
+#endif
+#include "DocumentProperties.h"
+#include "DocumentPropertiesCommon.h"
+
+#include "SumatraLog.h"
+
+// ng: orig's PropertiesWnd. There is one dialog per window, so the state is a
+// single struct instead of orig's gPropertiesWindows list.
+struct PropertiesDlg {
+    MainWindow* win = nullptr;
+    bool visible = false;
+    str::Builder propsText;
+    gp::InputState* textEdit = nullptr;
+    // ng: the longest line and one "x" as gpui lays them out; filled by the
+    // frame that drew them, so a text change takes one more frame to size
+    gp::Bounds longestLine{};
+    gp::Bounds oneChar{};
+    bool remeasure = false;
+    bool eutlUpdating = false;
+    // orig's window, where the platform can have one (gui/ToolWindow.h);
+    // null: a dialog in the frame
+    ToolWindow* tw = nullptr;
+    // where the window was first put: only a moved one is remembered
+    Point initialPos;
+    // the window was placed (its position counts as the user's from then on)
+    bool toolSized = false;
+    // orig's edit font as GDI measures it, in dips: Consolas 14 is 8 x 17
+    float toolCharDx = 0;
+    float toolLineDy = 0;
+#if OS_WIN
+    PdfSigCert* certs = nullptr;
+    DialogSelect certSelect;
+#endif
+};
+
+static PropertiesDlg gProps;
+
+struct PropertiesView {
+    static void OnCopy(PropertiesView* self, gp::Ctx* cx, const gp::ClickEvent*);
+#if OS_WIN
+    static void OnViewCert(PropertiesView* self, gp::Ctx* cx, const gp::ClickEvent*);
+    static void OnUpdateEutl(PropertiesView* self, gp::Ctx* cx, const gp::ClickEvent*);
+#endif
+    static void OnClose(PropertiesView* self, gp::Ctx* cx, const gp::ClickEvent*);
+};
+
+static gp::Entity<PropertiesView> gPropertiesView;
+
+// ng: orig parses dates into a win32 SYSTEMTIME. Only the six fields matter,
+// and they have to exist off Windows too.
+struct PropDate {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+};
+
+// See: http://www.verypdf.com/pdfinfoeditor/pdf-date-format.htm
+// Format:  "D:YYYYMMDDHHMMSSxxxxxxx"
+// Example: "D:20091222171933-05'00'"
+static bool PdfDateParseA(Str date, PropDate* timeOut, int* timeZoneOut) {
+    if (len(date) == 0) {
+        return false;
+    }
+
+    *timeOut = PropDate();
+    *timeZoneOut = 0;
+
+    Str slice = date;
+    // "D:" at the beginning is optional
+    str::TrimPrefix(slice, StrL("D:"));
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+    Str end = str::Parse(slice,
+                         "%4d%2d%2d"
+                         "%2d%2d%2d",
+                         &year, &month, &day, &hour, &minute, &second);
+    if (!end.s) {
+        return false;
+    }
+    timeOut->year = year;
+    timeOut->month = month;
+    timeOut->day = day;
+    timeOut->hour = hour;
+    timeOut->minute = minute;
+    timeOut->second = second;
+    // parse optional timezone: Z, +HH'MM', -HH'MM' (or +HH'MM, +HHMM, +HH)
+    if (end.s[0] == 'Z') {
+        *timeZoneOut = 0;
+    } else if (end.s[0] == '+' || end.s[0] == '-') {
+        int sign = (end.s[0] == '+') ? 1 : -1;
+        int tzHour = 0;
+        int tzMin = 0;
+        Str tz = Str(end.s + 1, end.len - 1);
+        Str tzEnd = str::Parse(tz, "%2d'%2d", &tzHour, &tzMin);
+        if (!tzEnd.s) {
+            tzEnd = str::Parse(tz, "%2d:%2d", &tzHour, &tzMin);
+        }
+        if (!tzEnd.s) {
+            str::Parse(tz, "%2d", &tzHour);
+        }
+        *timeZoneOut = sign * ((tzHour * 100) + tzMin);
+    }
+    return true;
+    // don't bother about the day of week, we won't display it anyway
+}
+
+// See: ISO 8601 specification
+// Format:  "YYYY-MM-DDTHH:MM:SSZ"
+// Example: "2011-04-19T22:10:48Z"
+static bool IsoDateParse(Str date, PropDate* timeOut, int* timeZoneOut) {
+    if (len(date) == 0) {
+        return false;
+    }
+
+    *timeOut = PropDate();
+    *timeZoneOut = 0;
+
+    int year = 0, month = 0, day = 0;
+    Str end = str::Parse(date, "%4d-%2d-%2d", &year, &month, &day);
+    if (end.s) { // time is optional
+        timeOut->year = year;
+        timeOut->month = month;
+        timeOut->day = day;
+        int hour = 0, minute = 0, second = 0;
+        Str timeEnd = str::Parse(end, "T%2d:%2d:%2d", &hour, &minute, &second);
+        if (timeEnd.s) {
+            timeOut->hour = hour;
+            timeOut->minute = minute;
+            timeOut->second = second;
+            // parse optional timezone: Z, +HH:MM, -HH:MM
+            if (timeEnd.s[0] == 'Z') {
+                *timeZoneOut = 0;
+            } else if (timeEnd.s[0] == '+' || timeEnd.s[0] == '-') {
+                int sign = (timeEnd.s[0] == '+') ? 1 : -1;
+                int tzHour = 0;
+                int tzMin = 0;
+                Str tz = Str(timeEnd.s + 1, timeEnd.len - 1);
+                Str tzEnd = str::Parse(tz, "%2d:%2d", &tzHour, &tzMin);
+                if (!tzEnd.s) {
+                    str::Parse(tz, "%2d%2d", &tzHour, &tzMin);
+                }
+                *timeZoneOut = sign * ((tzHour * 100) + tzMin);
+            }
+        }
+    }
+    return end.s != nullptr;
+    // don't bother about the day of week, we won't display it anyway
+}
+
+static TempStr FormatDateTemp(const PropDate& date, int timeZone) {
+#if OS_WIN
+    SYSTEMTIME st{};
+    st.wYear = (WORD)date.year;
+    st.wMonth = (WORD)date.month;
+    st.wDay = (WORD)date.day;
+    st.wHour = (WORD)date.hour;
+    st.wMinute = (WORD)date.minute;
+    st.wSecond = (WORD)date.second;
+    WCHAR bufW[512]{};
+    int cchBufLen = dimof(bufW);
+    int ret = GetDateFormatW(LOCALE_USER_DEFAULT, DATE_SHORTDATE, &st, nullptr, bufW, cchBufLen);
+    if (ret < 2) { // GetDateFormat() failed or returned an empty result
+        return {};
+    }
+
+    // don't add 00:00:00 for dates without time
+    if (0 == date.hour && 0 == date.minute && 0 == date.second) {
+        TempStr res = ToUtf8Temp(bufW);
+        return AddTimeZone(res, timeZone);
+    }
+
+    WCHAR* tmp = bufW + ret;
+    tmp[-1] = ' ';
+    ret = GetTimeFormatW(LOCALE_USER_DEFAULT, 0, &st, nullptr, tmp, cchBufLen - ret);
+    if (ret < 2) { // GetTimeFormat() failed or returned an empty result
+        tmp[-1] = '\0';
+    }
+    TempStr res = ToUtf8Temp(bufW);
+    return AddTimeZone(res, timeZone);
+#else
+    if (date.year == 0) {
+        return {};
+    }
+
+    static const char* locale = setlocale(LC_TIME, "");
+    (void)locale;
+    struct tm tm{};
+    tm.tm_year = date.year - 1900;
+    tm.tm_mon = date.month - 1;
+    tm.tm_mday = date.day;
+    tm.tm_hour = date.hour;
+    tm.tm_min = date.minute;
+    tm.tm_sec = date.second;
+    char buf[512]{};
+    const char* format = (date.hour == 0 && date.minute == 0 && date.second == 0) ? "%x" : "%x %X";
+    if (strftime(buf, dimof(buf), format, &tm) == 0) {
+        return {};
+    }
+    return AddTimeZone(Str(buf), timeZone);
+#endif
+}
+
+// clang-format on
+
+void AppendDateProp(str::Builder& out, Str key, Str val, bool isPdfDate) {
+    PropDate date;
+    int timeZone = 0;
+    bool ok = false;
+    if (len(val) == 0) {
+        return;
+    }
+    if (isPdfDate) {
+        ok = PdfDateParseA(val, &date, &timeZone);
+    } else {
+        ok = IsoDateParse(val, &date, &timeZone);
+    }
+    if (!ok) {
+        return;
+    }
+    TempStr dateStr = FormatDateTemp(date, timeZone);
+    AppendProp(out, key, dateStr);
+}
+
+#if OS_WIN
+static void ViewCertDer(HWND parent, Str der) {
+    if (len(der) == 0) {
+        return;
+    }
+    PCCERT_CONTEXT cert =
+        CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, (const BYTE*)der.s, (DWORD)len(der));
+    if (!cert) {
+        return;
+    }
+    using Fn = BOOL(WINAPI*)(DWORD, const void*, HWND, LPCWSTR, DWORD, void*);
+    HMODULE dll = LoadLibraryW(L"cryptui.dll");
+    Fn view = dll ? (Fn)GetProcAddress(dll, "CryptUIDlgViewContext") : nullptr;
+    if (view) {
+        view(CERT_STORE_CERTIFICATE_CONTEXT, cert, parent, L"Certificate", 0, nullptr);
+    }
+    if (dll) {
+        FreeLibrary(dll);
+    }
+    CertFreeCertificateContext(cert);
+}
+
+TempStr FileTimeLocalTemp(const FILETIME& ft) {
+    FILETIME local{};
+    SYSTEMTIME st{};
+    if (!FileTimeToLocalFileTime(&ft, &local) || !FileTimeToSystemTime(&local, &st)) {
+        return {};
+    }
+    PropDate d;
+    d.year = st.wYear;
+    d.month = st.wMonth;
+    d.day = st.wDay;
+    d.hour = st.wHour;
+    d.minute = st.wMinute;
+    d.second = st.wSecond;
+    return FormatDateTemp(d, 0);
+}
+
+#endif
+
+// --- the dialog -------------------------------------------------------------
+
+// Open as an overlay or as its own window. The frame builder skips the
+// overlay when tw is set; accelerators and Escape still belong to it.
+bool IsPropertiesDialogVisible() {
+    return gProps.visible;
+}
+
+// Which action buttons the open properties dialog has.
+TempStr PropertiesDialogButtonsTemp(int* exitCodeOut) {
+    if (!gProps.visible) {
+        if (exitCodeOut) {
+            *exitCodeOut = 2;
+        }
+        return str::DupTemp(StrL("NOTREADY no-properties-window"));
+    }
+    int viewCert = 0;
+    int updateEutl = 0;
+#if OS_WIN
+    if (gProps.certs) {
+        viewCert = 1;
+        updateEutl = 1;
+    }
+#endif
+    if (exitCodeOut) {
+        *exitCodeOut = 0;
+    }
+    return fmt("copy=1 viewCert=%d updateEutl=%d", viewCert, updateEutl);
+}
+
+// the text the dialog shows. tests/issue-2254.ts.
+TempStr PropertiesDialogTextTemp(int* exitCodeOut) {
+    if (!gProps.visible) {
+        if (exitCodeOut) {
+            *exitCodeOut = 2;
+        }
+        return str::DupTemp(StrL("NOTREADY no-properties-window"));
+    }
+    if (exitCodeOut) {
+        *exitCodeOut = 0;
+    }
+    return str::DupTemp(ToStr(gProps.propsText));
+}
+
+// orig's SavePropertiesWindowPos: only a window the user moved is remembered
+static void SavePropertiesWindowPos() {
+    Rect rc = ToolWindowRect(gProps.tw);
+    Point pos = {rc.x, rc.y};
+    if (rc.IsEmpty() || !gProps.toolSized || pos == gProps.initialPos) {
+        return;
+    }
+    gSettings->propWinPos = pos;
+    ScheduleSaveSettings();
+}
+
+void DeletePropertiesWindow(MainWindow* win) {
+    if (!gProps.visible || (win && gProps.win != win)) {
+        return;
+    }
+    gProps.visible = false;
+    gp::Window* host = gProps.tw ? ToolWindowGpui(gProps.tw) : (gProps.win ? gProps.win->gpuiWin : nullptr);
+    if (gProps.textEdit && host) {
+        gp::InputBlur(gProps.textEdit, host->app, host);
+    }
+    if (gProps.tw) {
+        SavePropertiesWindowPos();
+        ToolWindowClose(gProps.tw);
+        gProps.tw = nullptr;
+    }
+    delete gProps.textEdit;
+    gProps.textEdit = nullptr;
+    gProps.propsText.Reset();
+#if OS_WIN
+    gProps.certSelect.Free();
+    FreePdfSigCerts(gProps.certs);
+    gProps.certs = nullptr;
+#endif
+    AppShellInvalidate(gProps.win);
+}
+
+void PropertiesView::OnCopy(PropertiesView*, gp::Ctx* cx, const gp::ClickEvent*) {
+    Str s = ToStr(gProps.propsText);
+    gp::ClipboardSetText(cx->win, ToGpui(s));
+    logf("DocumentProperties: copied %d bytes to the clipboard\n", len(s));
+    ShowTemporaryNotification(gProps.win, Tr("Copied to clipboard"));
+    gp::Notify(cx);
+}
+
+#if OS_WIN
+void PropertiesView::OnViewCert(PropertiesView*, gp::Ctx* cx, const gp::ClickEvent*) {
+    PdfSigCert* cert = gProps.certs;
+    for (int i = 0; cert && i < gProps.certSelect.sel; i++) {
+        cert = cert->next;
+    }
+    if (cert) {
+        ViewCertDer((HWND)gp::PlatWindowHandle(cx->win), cert->der);
+    }
+}
+
+void OnEutlUpdateDone(EutlUpdateJob* job) {
+    gProps.eutlUpdating = false;
+    if (IsMainWindowValidAndNotClosing(job->win)) {
+        if (job->ok) {
+            ShowTemporaryNotification(job->win, job->msg, kNotif5SecsTimeOut);
+        } else {
+            ShowWarningNotification(job->win, job->msg, kNotif5SecsTimeOut);
+        }
+        AppShellInvalidate(job->win);
+    }
+    str::Free(job->msg);
+    delete job;
+}
+
+void PropertiesView::OnUpdateEutl(PropertiesView*, gp::Ctx* cx, const gp::ClickEvent*) {
+    if (gProps.eutlUpdating) {
+        return;
+    }
+    gProps.eutlUpdating = true;
+    auto* job = new EutlUpdateJob;
+    job->win = gProps.win;
+    RunAsync(MkFunc0<EutlUpdateJob>(EutlUpdateThread, job), StrL("EutlUpdate"));
+    gp::Notify(cx);
+}
+#endif
+
+void PropertiesView::OnClose(PropertiesView*, gp::Ctx* cx, const gp::ClickEvent*) {
+    DeletePropertiesWindow((MainWindow*)nullptr);
+    gp::Notify(cx);
+}
+
+static void PropsToolSizeToContent();
+
+void OnGetFontsFinished(GetFontsResult* result) {
+    if (gProps.visible && gProps.win == result->win) {
+        Str marker = Tr("Getting font information...");
+        Str props = ToStr(gProps.propsText);
+        int pos = str::IndexOf(props, marker);
+        if (pos >= 0) {
+            gProps.propsText.RemoveAt(pos, len(gProps.propsText) - pos);
+        }
+        // fontsText starts with "\n" to separate it with a single empty line
+        EndWithSingleNewline(gProps.propsText);
+        gProps.propsText.Append(ToStr(result->fontsText));
+        gp::InputSetValue(gProps.textEdit, ToGpui(ToStr(gProps.propsText)));
+        gProps.remeasure = true;
+        PropsToolSizeToContent();
+        AppShellInvalidate(gProps.win);
+    }
+    result->fontsText.Reset();
+    delete result;
+}
+
+static void PropsOpenToolWindow(MainWindow* win);
+
+void ShowProperties(MainWindow* win, DocController* ctrl) {
+    if (gProps.visible) {
+        // orig: SetActiveWindow() on the one that is open
+        ToolWindowActivate(gProps.tw);
+        return;
+    }
+    if (!ctrl) {
+        return;
+    }
+
+    gProps.win = win;
+    gProps.propsText.Reset();
+    DisplayModel* dm = ctrl->AsFixed();
+#if OS_WIN
+    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
+    if (EngineMupdfIsPdf(engine)) {
+        EutlRegisterLookup();
+        gProps.certs = EngineMupdfGetSignatureCerts(engine);
+        if (gProps.certs) {
+            StrVec labels;
+            for (PdfSigCert* cert = gProps.certs; cert; cert = cert->next) {
+                labels.Append(cert->label);
+            }
+            gProps.certSelect.Init(win->gpuiWin ? win->gpuiWin->app : nullptr);
+            gProps.certSelect.SetItems(labels, 0);
+        }
+    }
+#endif
+    GetPropsText(ctrl, gProps.propsText);
+#if OS_WIN
+    AppendCertsText(gProps.propsText, gProps.certs);
+#endif
+    AlignPropertiesText(gProps.propsText);
+    EndWithSingleNewline(gProps.propsText);
+    gProps.propsText.Append(StrL("\n"));
+    gProps.propsText.Append(Tr("Getting font information..."));
+    gProps.textEdit = new gp::InputState;
+    gProps.textEdit->focus = gp::FocusHandleNew(win->gpuiWin ? win->gpuiWin->app : nullptr);
+    gProps.textEdit->kind = gp::InputKind::Textarea;
+    gProps.textEdit->mode.kind = gp::LayoutModeKind::PlainText;
+    gProps.textEdit->softWrap = false;
+    gProps.textEdit->readonly = true;
+    gp::InputSetValue(gProps.textEdit, ToGpui(ToStr(gProps.propsText)));
+    gProps.visible = true;
+    gProps.longestLine = {};
+    gProps.oneChar = {};
+    gProps.remeasure = true;
+    logf("ShowProperties: %d bytes of properties\n", len(gProps.propsText));
+    PropsOpenToolWindow(win);
+    AppShellInvalidate(win);
+
+    if (!dm || !dm->engine) {
+        auto* result = new GetFontsResult;
+        result->win = win;
+        OnGetFontsFinished(result);
+        return;
+    }
+    auto* data = new GetFontsData;
+    data->win = win;
+    data->engine = dm->engine;
+    data->engine->AddRef();
+    auto fn = MkFunc0<GetFontsData>(GetFontsThread, data);
+    RunAsync(fn, StrL("GetFontsThread"));
+}
+
+// orig sizes the window to the widest line and the number of lines, capped at
+// 80% of the work area. The dialog lives in this window, so the cap is 80% of
+// the window instead.
+constexpr float kPropsMinDx = 420;
+// a monospace advance, until the first frame has measured the real one
+constexpr float kPropsCharDxGuess = 8;
+constexpr float kPropsLineDyGuess = 20;
+// orig's SizeToContent: 16 + four "x" of slack after the longest line, then
+// the scrollbar, the edit's two edges and 16 more
+constexpr float kPropsLineSlackDx = 16;
+constexpr int kPropsSlackChars = 4;
+constexpr float kPropsEditPadDx = 17 + (2 * 2) + 16;
+constexpr float kPropsEditBorderDy = 2 * 2;
+constexpr int kPropsExtraLines = 3;
+// gpui's Dialog: the padding around the body, and the title + footer rows
+constexpr float kPropsDialogPadDx = 2 * 17;
+constexpr float kPropsDialogChromeDy = 130;
+
+static void PropsRelayout(MainWindow* win) {
+    if (gProps.visible && gProps.win == win) {
+        AppShellInvalidate(win);
+    }
+}
+
+// the line with the most characters (the text is monospaced) and the line count
+static Str PropsLongestLine(Str text, int* nLinesOut) {
+    Str longest;
+    int maxChars = -1;
+    int nLines = 0;
+    for (int off = 0; off < text.len;) {
+        Str rest = Str(text.s + off, text.len - off);
+        int nl = str::IndexOfChar(rest, '\n');
+        int lineLen = nl >= 0 ? nl : rest.len;
+        Str line = Str(rest.s, lineLen);
+        int nChars = 0;
+        for (int i = 0; i < lineLen; i++) {
+            // utf8: count the bytes that start a character
+            if (((u8)line.s[i] & 0xc0) != 0x80) {
+                nChars++;
+            }
+        }
+        if (nChars > maxChars) {
+            maxChars = nChars;
+            longest = line;
+        }
+        nLines++;
+        off += lineLen + (nl >= 0 ? 1 : 0);
+    }
+    *nLinesOut = nLines;
+    return longest;
+}
+
+// --- a window of its own (Windows) ------------------------------------------
+
+// orig's layout: the edit from the top edge, 8 at the sides and under the
+// button row, whose buttons have 8 above them
+constexpr float kPropsToolPad = 8;
+// orig's Button::GetIdealSize(): the text plus 2 x 12 and 2 x 5
+constexpr float kPropsBtnPadDx = 12;
+constexpr float kPropsBtnDy = 25;
+constexpr float kPropsBtnMinDx = 70;
+constexpr float kPropsBtnFontPx = 12;
+// the edit control's own margins around its text
+constexpr float kPropsEditMarginDx = 4;
+constexpr float kPropsEditMarginDy = 1;
+// Consolas: the advance of a character over the font's size
+constexpr float kConsolasAdvance = 1126.f / 2048.f;
+// gpui's inputs make a line 1.25 rem
+constexpr float kInputLineRems = 1.25f;
+
+static Str PropsToolTitle() {
+    return Tr("Document Properties");
+}
+
+// orig's closeOnEsc
+static bool PropsToolOnKey(MainWindow*, gp::Ctx*, const gp::KeyEvent* ev) {
+    if (ev->vk != VK_ESCAPE) {
+        return false;
+    }
+    DeletePropertiesWindow((MainWindow*)nullptr);
+    return true;
+}
+
+static void PropsToolOnClosed(MainWindow*) {
+    gProps.tw = nullptr;
+    DeletePropertiesWindow((MainWindow*)nullptr);
+}
+
+static void PropsToolOnMoved(MainWindow*, Rect) {
+    // orig saves on close; this keeps the last place for a window that goes
+    // away with its owner
+    if (gProps.visible && gProps.tw) {
+        SavePropertiesWindowPos();
+    }
+}
+
+static gp::El* PropsToolBuild(MainWindow* win, gp::Ctx* cx);
+
+static ToolWindowDesc PropsToolDesc() {
+    // orig: WS_OVERLAPPEDWINDOW without an owner
+    ToolWindowDesc desc;
+    desc.name = "properties";
+    desc.title = PropsToolTitle;
+    desc.frame = ToolWinFrame::Overlapped;
+    desc.resize = ToolWinResize::Resizable;
+    desc.owner = ToolWinOwner::TopLevel;
+    desc.minClient = Size(320, 200);
+    desc.build = PropsToolBuild;
+    desc.onKey = PropsToolOnKey;
+    desc.onClosed = PropsToolOnClosed;
+    desc.onMoved = PropsToolOnMoved;
+    return desc;
+}
+
+// orig's PropertiesWnd::SizeToContent, with its arithmetic (it adds the
+// classic frame sizes, not what the window really has): the window size in
+// pixels for the text as GDI measures it in orig's font. ng: gpui measures
+// text only while it paints, and the window has to have its size before it is
+// shown
+static Size PropsToolWindowSize(MainWindow* win) {
+    int dpi = std::max(AppShellWindowDpi(win), 96);
+    PlatformFont* propsFont = GetUserGuiFont(StrL("Consolas"), MulDiv(14, dpi, 96));
+
+    int maxLineDx = 0;
+    int nLines = 0;
+    Str text = ToStr(gProps.propsText);
+    for (int off = 0; off < text.len;) {
+        Str rest = Str(text.s + off, text.len - off);
+        int nl = str::IndexOfChar(rest, '\n');
+        int lineLen = nl >= 0 ? nl : rest.len;
+        Size size = PlatformFontMeasureText(propsFont, Str(rest.s, lineLen));
+        maxLineDx = std::max(size.dx, maxLineDx);
+        nLines++;
+        off += lineLen + (nl >= 0 ? 1 : 0);
+    }
+    maxLineDx += 16;
+
+    int lineHeight = PlatformFontLineHeight(propsFont);
+    int charDx = PlatformFontMeasureText(propsFont, StrL("x")).dx;
+    gProps.toolCharDx = (float)charDx * 96.f / (float)dpi;
+    gProps.toolLineDy = (float)lineHeight * 96.f / (float)dpi;
+    // a bit of slack so the longest lines don't touch the right edge
+    maxLineDx += 4 * charDx;
+
+    int pad = MulDiv((int)kPropsToolPad, dpi, 96);
+    // scrollbar + the edit's edges, as orig added them around the text
+    int editPadding = MulDiv(16 + 4, dpi, 96) + 16;
+    Size btnText = PlatformFontMeasureText(GetDefaultGuiFont(), Tr("Copy To Clipboard"));
+    int btnDx = std::max(btnText.dx + MulDiv(2 * (int)kPropsBtnPadDx, dpi, 96), MulDiv((int)kPropsBtnMinDx, dpi, 96));
+    int btnDy = btnText.dy + MulDiv(2 * 5, dpi, 96);
+    int wantedClientDx = std::max(maxLineDx + editPadding, btnDx + (2 * pad));
+
+    int editBorderDy = MulDiv(4, dpi, 96);
+    int btnAreaDy = std::max(MulDiv(40, dpi, 96), btnDy + (2 * pad));
+    int wantedClientDy = ((nLines + kPropsExtraLines) * lineHeight) + editBorderDy + btnAreaDy + pad;
+    Size outer = ToolWindowOuterSize(PropsToolDesc(), win, Size(wantedClientDx, wantedClientDy));
+
+    // cap at 80% of the work area
+    Rect work = AppShellWorkArea(win);
+    if (work.dx > 0) {
+        outer.dx = std::min(outer.dx, (work.dx * 80) / 100);
+    }
+    if (work.dy > 0) {
+        outer.dy = std::min(outer.dy, (work.dy * 80) / 100);
+    }
+    return outer;
+}
+
+// orig's placement: at PropWinPos or centered on the frame, kept on screen
+static Rect PropsToolRect(MainWindow* win, Size outer) {
+    Rect frame = AppShellWindowScreenRect(win);
+    Point saved = gSettings->propWinPos;
+    Rect r{saved.x, saved.y, outer.dx, outer.dy};
+    if (saved.IsEmpty()) {
+        r.x = frame.x + (frame.dx - outer.dx) / 2;
+        r.y = frame.y + (frame.dy - outer.dy) / 2;
+    }
+    return AppShellShiftToWorkArea(r, win, true);
+}
+
+static void PropsOpenToolWindow(MainWindow* win) {
+    if (gProps.tw || !ToolWindowsAvailable()) {
+        return;
+    }
+    Rect r = PropsToolRect(win, PropsToolWindowSize(win));
+    gProps.initialPos = {r.x, r.y};
+    gProps.toolSized = true;
+    gProps.tw = ToolWindowOpen(PropsToolDesc(), win, r);
+}
+
+// the text changed (the fonts arrived): orig sizes the window again, where
+// it is
+static void PropsToolSizeToContent() {
+    if (!gProps.visible || !gProps.tw || !IsMainWindowValid(gProps.win)) {
+        return;
+    }
+    Rect cur = ToolWindowRect(gProps.tw);
+    Size sz = PropsToolWindowSize(gProps.win);
+    ToolWindowMove(gProps.tw, Rect(cur.x, cur.y, sz.dx, sz.dy));
+}
+
+// orig's themed button, in the window's rem (see PropsToolBuild)
+static gp::El* PropsToolButton(gp::Ctx* cx, gp::Str id, Str label, gp::Listener onClick, float fontPx,
+                               bool disabled = false) {
+    gp::El* btn = gpc::Button::New(cx, id)->Label(ToGpui(label))->Disabled(disabled)->OnClick(onClick)->IntoEl();
+    return btn->H(kPropsBtnDy)->MinW(kPropsBtnMinDx)->PadX(kPropsBtnPadDx)->Font(fontPx)->Shrink0();
+}
+
+// ng: orig's edit is Consolas 14 px, which GDI lays out 8 wide and 17 high.
+// A gpui input's line is 1.25 rem whatever its font, and a font size is in
+// rems as well, so this window gets the rem that makes a line 17 and the font
+// sizes are given in that rem
+static gp::El* PropsToolBuild(MainWindow*, gp::Ctx* cx) {
+    if (!gProps.visible || !gProps.tw || !gProps.textEdit) {
+        return nullptr;
+    }
+    if (!gPropertiesView.IsValid()) {
+        gPropertiesView = gp::EntityNewState<PropertiesView>(cx->app);
+    }
+    float rem = gProps.toolLineDy / kInputLineRems;
+    gp::WindowSetRemSize(cx->win, rem);
+    float remScale = 16.f / rem;
+    const gp::Theme& th = gp::ThemeNow(cx->app);
+    gp::WinSize ws = gp::WindowSize(cx->win);
+
+    gp::InputState* state = gProps.textEdit;
+    state->softWrap = false;
+    gp::InputEditorStyle style;
+    style.foreground = th.foreground;
+    style.mutedForeground = th.mutedFg;
+    style.caret = th.caret;
+    style.selection = gp::RgbaOpacity(th.selection, 0.4f);
+    style.fontSize = (gProps.toolCharDx / kConsolasAdvance) * remScale;
+    style.fontFamily = gp::FontFamilyIntern(GStrL("Consolas"));
+
+    float btnRowDy = kPropsToolPad + kPropsBtnDy;
+    float editDy = std::max(ws.dipH - btnRowDy - kPropsToolPad, gProps.toolLineDy);
+    state->viewH = editDy - 2 * (1 + kPropsEditMarginDy);
+    gp::El* edit = gp::InputBase::New(cx, GStrL("properties-text"), true, gp::AccessibilityRole::MultilineTextInput)
+                       ->BindInput(state)
+                       ->W(gp::kFill)
+                       ->H(editDy)
+                       ->Shrink0()
+                       ->PadX(kPropsEditMarginDx)
+                       ->PadY(kPropsEditMarginDy)
+                       ->ClipY()
+                       ->ScrollY(state->scrollY)
+                       ->ScrollX(state->scrollX)
+                       ->ScrollFromPath()
+                       ->Bg(th.inputBg)
+                       ->Border(1, th.inputBorder)
+                       ->Child(gp::Textarea::New(cx, state, style));
+
+    float btnFont = kPropsBtnFontPx * remScale;
+    gp::El* footer = gp::Div(cx->a)->FlexRow()->JustifyEnd()->ItemsEnd()->Gap(kPropsToolPad)->H(btnRowDy)->Shrink0();
+    footer->Child(PropsToolButton(cx, GStrL("props-copy"), Tr("Copy To Clipboard"),
+                                  gp::ListenTo(gPropertiesView, &PropertiesView::OnCopy), btnFont));
+#if OS_WIN
+    if (gProps.certs) {
+        gProps.certSelect.PollChanged(cx->app);
+        if (gProps.certs->next) {
+            footer->Child(gProps.certSelect.Build(cx, StrL("props-certificate"), 220));
+        }
+        footer->Child(PropsToolButton(cx, GStrL("props-view-certificate"), Tr("View Certificate..."),
+                                      gp::ListenTo(gPropertiesView, &PropertiesView::OnViewCert), btnFont));
+        footer->Child(PropsToolButton(cx, GStrL("props-update-eutl"), Tr("Update EU Trusted List"),
+                                      gp::ListenTo(gPropertiesView, &PropertiesView::OnUpdateEutl), btnFont,
+                                      gProps.eutlUpdating));
+    }
+#endif
+    return gp::Div(cx->a)
+        ->FlexCol()
+        ->W(gp::kFill)
+        ->Flex1()
+        ->MinH(0)
+        ->PadX(kPropsToolPad)
+        ->PadB(kPropsToolPad)
+        ->Child(edit)
+        ->Child(footer);
+}
+
+gp::El* PropertiesDialogBuild(MainWindow* win, gp::Ctx* cx) {
+    if (!gProps.visible || gProps.tw || gProps.win != win) {
+        return nullptr;
+    }
+    if (!gPropertiesView.IsValid()) {
+        gPropertiesView = gp::EntityNewState<PropertiesView>(cx->app);
+    }
+    gp::WinSize ws = gp::WindowSize(cx->win);
+    int nLines = 0;
+    Str longest = PropsLongestLine(ToStr(gProps.propsText), &nLines);
+    float charDx = gProps.oneChar.w > 0 ? gProps.oneChar.w : kPropsCharDxGuess;
+    float lineDy = gProps.oneChar.h > 0 ? gProps.oneChar.h : kPropsLineDyGuess;
+    float lineDx = gProps.longestLine.w;
+    if (lineDx <= 0 || gProps.remeasure) {
+        // not measured yet (or measured for the previous text): estimate, and
+        // come back once this frame has laid the measuring line out
+        float guessDx = (float)len(longest) * charDx;
+        lineDx = std::max(lineDx, guessDx);
+        gProps.remeasure = false;
+        uitask::Post(MkFunc0(PropsRelayout, win), "PropsRelayout");
+    }
+    float editDx = lineDx + kPropsLineSlackDx + ((float)kPropsSlackChars * charDx) + kPropsEditPadDx;
+    float dx = std::max(kPropsMinDx, editDx + kPropsDialogPadDx);
+    dx = std::min(dx, ws.dipW * 0.8f);
+    float dy = ((float)(nLines + kPropsExtraLines) * lineDy) + kPropsEditBorderDy;
+    dy = std::min(dy, (ws.dipH * 0.8f) - kPropsDialogChromeDy);
+    dy = std::max(dy, lineDy * (float)kPropsExtraLines);
+
+    gpc::Textarea* area = gpc::Textarea::New(cx, GStrL("properties-text"), gProps.textEdit);
+    gp::El* edit = area->H(dy)->SoftWrap(false)->Readonly()->IntoEl()->Mono();
+    // the size gpui's inputs draw their text in, whatever the element says
+    float fontSize = gp::UiInputFontPx(gp::UiSize::Medium);
+    // ng: gpui measures text only while it paints, so the longest line and an
+    // "x" are laid out invisibly and their bounds read back on the next frame
+    gp::Rgba transparent{0, 0, 0, 0};
+    gp::El* measure = gp::Div(cx->a)->FlexCol()->ItemsStart()->H(0)->ClipX();
+    measure->Child(gp::TextEl(cx->a, GpuiDup(cx->a, longest))
+                       ->Mono()
+                       ->Font(fontSize)
+                       ->Fg(transparent)
+                       ->Shrink0()
+                       ->BoundsOut(&gProps.longestLine));
+    measure->Child(
+        gp::TextEl(cx->a, GStrL("x"))->Mono()->Font(fontSize)->Fg(transparent)->Shrink0()->BoundsOut(&gProps.oneChar));
+    gp::El* body = gp::Div(cx->a)->FlexCol()->W(gp::kFill)->Child(edit)->Child(measure);
+
+    gp::El* footer = gp::Div(cx->a)->FlexRow()->JustifyEnd()->Gap(8);
+#if OS_WIN
+    if (gProps.certs) {
+        gProps.certSelect.PollChanged(cx->app);
+        if (gProps.certs->next) {
+            footer->Child(gProps.certSelect.Build(cx, StrL("props-certificate"), 220));
+        }
+        footer->Child(gpc::Button::New(cx, GStrL("props-view-certificate"))
+                          ->Label(ToGpui(Tr("View Certificate...")))
+                          ->OnClick(gp::ListenTo(gPropertiesView, &PropertiesView::OnViewCert))
+                          ->IntoEl());
+        footer->Child(gpc::Button::New(cx, GStrL("props-update-eutl"))
+                          ->Label(ToGpui(Tr("Update EU Trusted List")))
+                          ->Disabled(gProps.eutlUpdating)
+                          ->OnClick(gp::ListenTo(gPropertiesView, &PropertiesView::OnUpdateEutl))
+                          ->IntoEl());
+    }
+#endif
+    footer->Child(gpc::Button::New(cx, GStrL("props-copy"))
+                      ->Label(ToGpui(Tr("Copy To Clipboard")))
+                      ->OnClick(gp::ListenTo(gPropertiesView, &PropertiesView::OnCopy))
+                      ->IntoEl());
+    // ng: a dialog in the frame has no close box
+    footer->Child(gpc::Button::New(cx, GStrL("props-close"))
+                      ->Label(ToGpui(Tr("Close")))
+                      ->Outline()
+                      ->OnClick(gp::ListenTo(gPropertiesView, &PropertiesView::OnClose))
+                      ->IntoEl());
+
+    return gpc::Dialog::New(cx)
+        ->Open(true)
+        ->Title(ToGpui(Tr("Document Properties")))
+        ->Body(body)
+        ->W(dx)
+        ->Footer(footer)
+        ->OnClose(gp::ListenTo(gPropertiesView, &PropertiesView::OnClose))
+        ->OnCancel(gp::ListenTo(gPropertiesView, &PropertiesView::OnClose))
+        ->IntoEl(ws);
+}

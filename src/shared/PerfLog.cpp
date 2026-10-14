@@ -1,0 +1,354 @@
+/* Copyright 2026 the SumatraPDF project authors (see AUTHORS file).
+   License: GPLv3 */
+
+#include "base/Base.h"
+#include "base/File.h"
+#include "base/Timer.h"
+#if OS_WIN
+#include "base/WinDynCalls.h"
+#include "base/DbgHelpDyn.h"
+#endif
+#include "PerfLog.h"
+
+#if !IS_PERF_LOG || !OS_WIN
+
+void InitPerfLog() {}
+void StartPerfLog() {}
+void StopPerfLog() {}
+void SetPerfLogPath(Str) {}
+void SavePerfLog() {}
+void DestroyPerfLog() {}
+
+#else
+
+constexpr int kMaxPerfDepth = 256;
+constexpr int kMaxPerfLogBytes = 256 * 1024 * 1024;
+// skip deep frames so a restore profile is not 1M str::IsNull lines
+constexpr int kMaxPerfLogDepth = 10;
+constexpr int kSymCap = 64 * 1024;
+constexpr int kLineBuf = 1024;
+constexpr Str kHexDigits = StrL("0123456789abcdef");
+
+struct PerfSym {
+    const void* addr;
+    const char* name;
+};
+
+static Arena* gPerfArena = nullptr;
+static Mutex gSymMutex;
+static AtomicInt gPerfOn = 0;
+static DWORD gMainThreadId = 0;
+static LARGE_INTEGER gQpcFreq = {};
+static Str gPerfLogPath;
+static bool gDbgHelpOk = false;
+static bool gPerfFull = false;
+static char* gRaw = nullptr;
+static LONG gRawUsed = 0;
+
+static PerfSym* gSyms = nullptr;
+static int gSymN = 0;
+
+static thread_local int gInHook = 0;
+static thread_local int gPerfDepth = 0;
+static thread_local LARGE_INTEGER gStartStack[kMaxPerfDepth];
+
+static int AppendHex(char* d, u64 v) {
+    char tmp[16];
+    int n = 0;
+    do {
+        tmp[n++] = kHexDigits.s[v & 15];
+        v >>= 4;
+    } while (v);
+    for (int i = 0; i < n; i++) {
+        d[i] = tmp[n - 1 - i];
+    }
+    return n;
+}
+
+static u32 HashPtr(const void* p) {
+    u64 x = (u64)(uintptr_t)p;
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27;
+    return (u32)x;
+}
+
+static PerfSym* FindSymSlot(const void* addr) {
+    u32 capMask = (u32)kSymCap - 1;
+    u32 slot = HashPtr(addr) & capMask;
+    for (int n = 0; n < kSymCap; n++) {
+        PerfSym& e = gSyms[slot];
+        if (!e.addr || e.addr == addr) {
+            return &e;
+        }
+        slot = (slot + 1) & capMask;
+    }
+    return nullptr;
+}
+
+static int FormatLine(char* d, int depth, DWORD tid, const void* addr, bool isExit, u64 us) {
+    int n = 0;
+    int indent = depth * 2;
+    for (int i = 0; i < indent; i++) {
+        d[n++] = ' ';
+    }
+    if (tid != gMainThreadId) {
+        n += AppendHex(d + n, tid);
+        d[n++] = ' ';
+    }
+    d[n++] = '0';
+    d[n++] = 'x';
+    n += AppendHex(d + n, (u64)(uintptr_t)addr);
+    if (isExit) {
+        d[n++] = ' ';
+        d[n++] = ' ';
+        n += AppendHex(d + n, us);
+    }
+    d[n++] = '\n';
+    d[n] = 0;
+    return n;
+}
+
+static void AppendLine(const char* s, int n) {
+    if (gPerfFull || !gRaw || n <= 0) {
+        return;
+    }
+    LONG end = InterlockedAdd(&gRawUsed, n);
+    LONG start = end - n;
+    if (start < 0 || end > kMaxPerfLogBytes) {
+        gPerfFull = true;
+        return;
+    }
+    memcpy(gRaw + start, s, (size_t)n);
+}
+
+static void EnsurePerfLog() {
+    if (gRaw) {
+        return;
+    }
+    gRaw = (char*)VirtualAlloc(nullptr, (SIZE_T)kMaxPerfLogBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    gRawUsed = 0;
+    QueryPerformanceFrequency(&gQpcFreq);
+    gPerfArena = ArenaNew();
+    gSyms = (PerfSym*)gPerfArena->Push((u64)kSymCap * sizeof(PerfSym), 8, true);
+}
+
+extern "C" void PerfEnterImpl(void* addr) {
+    if (gInHook) {
+        return;
+    }
+    gInHook = 1;
+
+    if (!AtomicIntGet(&gPerfOn)) {
+        gInHook = 0;
+        return;
+    }
+
+    int depth = gPerfDepth;
+    if (gPerfDepth < kMaxPerfDepth) {
+        gStartStack[gPerfDepth] = TimeGet();
+    }
+    gPerfDepth++;
+
+    if (depth <= kMaxPerfLogDepth) {
+        char buf[kLineBuf];
+        int n = FormatLine(buf, depth, GetCurrentThreadId(), addr, false, 0);
+        AppendLine(buf, n);
+    }
+
+    gInHook = 0;
+}
+
+extern "C" void PerfExitImpl(void* addr) {
+    if (gInHook) {
+        return;
+    }
+    gInHook = 1;
+
+    if (gPerfDepth <= 0) {
+        gInHook = 0;
+        return;
+    }
+    gPerfDepth--;
+
+    u64 us = 0;
+    if (gPerfDepth < kMaxPerfDepth && gQpcFreq.QuadPart) {
+        LARGE_INTEGER now = TimeGet();
+        u64 delta = (u64)(now.QuadPart - gStartStack[gPerfDepth].QuadPart);
+        us = (delta * 1000000ull) / (u64)gQpcFreq.QuadPart;
+    }
+
+    if (!AtomicIntGet(&gPerfOn)) {
+        gInHook = 0;
+        return;
+    }
+
+    if (gPerfDepth <= kMaxPerfLogDepth) {
+        char buf[kLineBuf];
+        int n = FormatLine(buf, gPerfDepth, GetCurrentThreadId(), addr, true, us);
+        AppendLine(buf, n);
+    }
+
+    gInHook = 0;
+}
+
+void InitPerfLog() {
+    gMainThreadId = GetCurrentThreadId();
+}
+
+void StartPerfLog() {
+    EnsurePerfLog();
+    if (len(gPerfLogPath) == 0) {
+        gPerfLogPath = str::Dup(GetPathInExeDirTemp(StrL("sumperf.txt")));
+    }
+    AtomicIntSet(&gPerfOn, 1);
+    AppendLine("perf log start\n", LenL("perf log start\n"));
+}
+
+void StopPerfLog() {
+    AtomicIntSet(&gPerfOn, 0);
+}
+
+void SetPerfLogPath(Str path) {
+    str::FreePtr(&gPerfLogPath);
+    gPerfLogPath = str::Dup(path);
+}
+
+static int ReadHexAddr(Str hex, u64& value) {
+    if (len(hex) < 3 || hex.s[0] != '0' || hex.s[1] != 'x') {
+        return 0;
+    }
+    value = 0;
+    int n = 2;
+    for (; n < len(hex); n++) {
+        char c = hex.s[n];
+        int d = str::IndexOfChar(kHexDigits, c);
+        if (d < 0) {
+            break;
+        }
+        value = (value << 4) | (u64)d;
+    }
+    return n == 2 ? 0 : n;
+}
+
+static void IndexLogAddrs(Str src) {
+    int i = 0;
+    while (i + 2 < src.len) {
+        if (src.s[i] != '0' || src.s[i + 1] != 'x') {
+            i++;
+            continue;
+        }
+        u64 v;
+        int n = ReadHexAddr(Str(src.s + i, len(src) - i), v);
+        if (n > 0 && gSymN * 2 < kSymCap) {
+            const void* addr = (const void*)(uintptr_t)v;
+            PerfSym* e = FindSymSlot(addr);
+            if (e && !e->addr) {
+                e->addr = addr;
+                gSymN++;
+            }
+        }
+        i += n > 0 ? n : 2;
+    }
+}
+
+static void FillSymNames() {
+    if (!gDbgHelpOk || !DynSymFromAddr || !gSyms) {
+        return;
+    }
+
+    char symBuf[sizeof(SYMBOL_INFO) + 512];
+    SYMBOL_INFO* info = (SYMBOL_INFO*)symBuf;
+    for (int i = 0; i < kSymCap; i++) {
+        PerfSym& e = gSyms[i];
+        if (!e.addr) {
+            continue;
+        }
+        memset(symBuf, 0, sizeof(symBuf));
+        info->SizeOfStruct = sizeof(SYMBOL_INFO);
+        info->MaxNameLen = 512;
+        DWORD64 disp = 0;
+        if (!DynSymFromAddr(GetCurrentProcess(), (DWORD64)e.addr, &disp, info) || !info->Name[0]) {
+            continue;
+        }
+        e.name = str::Dup(gPerfArena, Str(info->Name)).s;
+    }
+}
+
+static Str RawLog() {
+    LONG n = gRawUsed;
+    if (n > kMaxPerfLogBytes) {
+        n = kMaxPerfLogBytes;
+    }
+    if (n < 0 || !gRaw) {
+        return {};
+    }
+    return Str(gRaw, (int)n);
+}
+
+static Str RewriteLogTemp() {
+    Str src = RawLog();
+    str::Builder dst(gPerfArena);
+    dst.Reserve(src.len + 16);
+    int i = 0;
+    while (i < src.len) {
+        if (i + 2 < src.len && src.s[i] == '0' && src.s[i + 1] == 'x') {
+            u64 addr;
+            int n = ReadHexAddr(Str(src.s + i, len(src) - i), addr);
+            PerfSym* sym = n > 0 ? FindSymSlot((const void*)(uintptr_t)addr) : nullptr;
+            if (sym && sym->name) {
+                dst.Append(Str(sym->name));
+                i += n;
+                continue;
+            }
+        }
+        dst.AppendChar(src.s[i]);
+        i++;
+    }
+    return ToStr(dst);
+}
+
+void SavePerfLog() {
+    if (!gRaw) {
+        return;
+    }
+    Str path = gPerfLogPath;
+    if (len(path) == 0) {
+        path = GetPathInExeDirTemp(StrL("sumperf.txt"));
+    }
+    path = str::Dup(path);
+
+    StopPerfLog();
+
+    Str raw = RawLog();
+    file::WriteFile(path, raw);
+
+    if (!gDbgHelpOk) {
+        gDbgHelpOk = dbghelp::Initialize(ToWStrTemp(GetSelfExeDirTemp()), false);
+    }
+    if (gDbgHelpOk) {
+        gSymMutex.Lock();
+        IndexLogAddrs(raw);
+        FillSymNames();
+        Str named = RewriteLogTemp();
+        gSymMutex.Unlock();
+        file::WriteFile(path, named);
+    }
+
+    str::Free(path);
+}
+
+void DestroyPerfLog() {
+    AtomicIntSet(&gPerfOn, 0);
+    gSyms = nullptr;
+    ArenaDelete(gPerfArena);
+    gPerfArena = nullptr;
+    if (gRaw) {
+        VirtualFree(gRaw, 0, MEM_RELEASE);
+        gRaw = nullptr;
+    }
+    gRawUsed = 0;
+    str::FreePtr(&gPerfLogPath);
+}
+
+#endif

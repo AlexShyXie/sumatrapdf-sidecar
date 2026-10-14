@@ -38,10 +38,8 @@
 #include "PageThumbnails.h"
 #include "SidebarPanel.h"
 #include "TableOfContents.h"
-
-// When true, multi-highlight every TOC item that matches the current page
-// (issue #4642). Easy to flip for comparison with single-selection behavior.
-bool gShowAllMatchingTOC = true;
+#include "TableOfContentsCommon.h"
+#include "MenuDefs.h"
 
 // set tooltip for this item but only if the text isn't fully shown
 // TODO: I might have lost something in translation
@@ -50,11 +48,11 @@ static void TocCustomizeTooltip(TreeView::GetTooltipEvent* ev) {
     auto ti = ev->treeItem;
     auto* nm = ev->info;
     TocItem* tocItem = (TocItem*)ti;
-    IPageDestination* link = tocItem->GetPageDestination();
+    IPageDestination* link = tocItem->dest;
     if (!link) {
         return;
     }
-    Str path = PageDestGetValue(link);
+    Str path = link->GetValue();
     if (len(path) == 0) {
         path = tocItem->title;
     }
@@ -71,9 +69,8 @@ static void TocCustomizeTooltip(TreeView::GetTooltipEvent* ev) {
         return;
     }
 
-    bool isOk = (k == kindDestinationLaunchURL) || (k == kindDestinationLaunchFile) ||
-                (k == kindDestinationLaunchEmbedded) || (k == kindDestinationMupdf) || (k == kindDestinationDjVu) ||
-                (k == kindDestinationAttachment) || (k == kindDestinationJsMenu);
+    bool isOk = IsLaunchLinkKind(k) || (k == kindDestinationLaunchEmbedded) || (k == kindDestinationMupdf) ||
+                (k == kindDestinationDjVu) || (k == kindDestinationAttachment) || (k == kindDestinationJsMenu);
     ReportIf(!isOk);
 
     str::Builder infotip;
@@ -105,91 +102,6 @@ static void TocCustomizeTooltip(TreeView::GetTooltipEvent* ev) {
 // (while tab->ctrl still matches), which caused UAF in HandleLink
 // (crash 8bfe7adb1000001: EngineMupdf::HandleLink / dest->GetKind).
 
-// Own a stable copy of the destination at post time. Engine-private kinds
-// that hold fz_outline/fz_link (mupdf) are converted to scrollTo with
-// page/rect/zoom already resolved on the TocItem/dest.
-static IPageDestination* SnapshotDestForDeferredNav(IPageDestination* dest, int tocPageNo) {
-    if (!dest) {
-        return nullptr;
-    }
-    Kind k = dest->GetKind();
-    if (k == kindDestinationLaunchURL) {
-        Str url = ((PageDestinationURL*)dest)->url;
-        if (len(url) == 0) {
-            url = PageDestGetValue(dest);
-        }
-        return url ? new PageDestinationURL(url) : nullptr;
-    }
-    if (k == kindDestinationLaunchFile) {
-        auto* f = (PageDestinationFile*)dest;
-        auto* copy = new PageDestinationFile(f->path, f->dest);
-        copy->openInNewWindow = f->openInNewWindow;
-        copy->rect = f->rect;
-        return copy;
-    }
-    if (k == kindDestinationLaunchEmbedded || k == kindDestinationAttachment) {
-        auto* p = (PageDestination*)dest;
-        auto* copy = new PageDestination();
-        copy->kind = k;
-        copy->pageNo = p->pageNo;
-        copy->rect = p->rect;
-        copy->zoom = p->zoom;
-        copy->value = str::Dup(p->value);
-        copy->name = str::Dup(p->name);
-        copy->embedObjNum = p->embedObjNum;
-        return copy;
-    }
-    if (k == kindDestinationScrollTo) {
-        int pageNo = PageDestGetPageNo(dest);
-        if (pageNo <= 0) {
-            pageNo = tocPageNo;
-        }
-        if (pageNo < 1) {
-            logf("SnapshotDestForDeferredNav: skip scrollTo pageNo=%d (tocPageNo=%d)\n", PageDestGetPageNo(dest),
-                 tocPageNo);
-            return nullptr;
-        }
-        auto* copy = new PageDestination();
-        copy->kind = k;
-        copy->pageNo = pageNo;
-        copy->rect = PageDestGetRect(dest);
-        copy->zoom = PageDestGetZoom(dest);
-        copy->value = str::Dup(PageDestGetValue(dest));
-        copy->name = str::Dup(PageDestGetName(dest));
-        copy->loc = dest->loc;
-        return copy;
-    }
-    // mupdf, djvu, none → page navigation snapshot
-    int pageNo = PageDestGetPageNo(dest);
-    if (pageNo <= 0) {
-        pageNo = tocPageNo;
-    }
-    if (pageNo < 1) {
-        Str val = PageDestGetValue(dest);
-        if (val && IsExternalUrl(val)) {
-            return new PageDestinationURL(val);
-        }
-        logf("SnapshotDestForDeferredNav: skip dest kind pageNo=%d (tocPageNo=%d)\n", PageDestGetPageNo(dest),
-             tocPageNo);
-        return nullptr;
-    }
-    RectF r = PageDestGetRect(dest);
-    float zoom = PageDestGetZoom(dest);
-    if (k == kindDestinationMupdf) {
-        // Prefer resolved anchor; outline x/y can be 0 and scroll to the wrong place
-        RectF pt = PageDestGetDestPoint(dest);
-        if ((r.dx == 0 && r.dy == 0) || (r.dx == kDestUseDefault && r.dy == kDestUseDefault)) {
-            if (pt.x != 0 || pt.y != 0 || r.IsEmpty()) {
-                r = RectF{pt.x, pt.y, kDestUseDefault, kDestUseDefault};
-            }
-        }
-        zoom = dest->GetZoom2();
-    }
-    IPageDestination* copy = NewSimpleDest(pageNo, r, zoom);
-    copy->loc = dest->loc;
-    return copy;
-}
-
 #if IS_DEBUG
 bool TableOfContents_UnitTestSnapshotNamedDest() {
     PageDestination source;
@@ -202,110 +114,14 @@ bool TableOfContents_UnitTestSnapshotNamedDest() {
 
     IPageDestination* snapshot = SnapshotDestForDeferredNav(&source, 7);
     bool ok = snapshot && snapshot->GetKind() == kindDestinationScrollTo && PageDestGetPageNo(snapshot) == 1 &&
-              PageDestGetRect(snapshot) == source.rect && PageDestGetZoom(snapshot) == source.zoom &&
-              str::Eq(PageDestGetValue(snapshot), source.value) && str::Eq(PageDestGetName(snapshot), source.name);
+              snapshot->GetRect() == source.rect && snapshot->GetZoom() == source.zoom &&
+              str::Eq(snapshot->GetValue(), source.value) && str::Eq(snapshot->GetName(), source.name);
     delete snapshot;
     return ok;
 }
 #endif
 
-static TocItem* FindTocItemByTitlePage(TocItem* item, Str title, int pageNo) {
-    for (; item; item = item->next) {
-        if (pageNo > 0 && item->pageNo != pageNo) {
-            // keep searching children; same page can nest under different titles
-        } else if (title && item->title && str::Eq(title, item->title)) {
-            if (pageNo <= 0 || item->pageNo == pageNo) {
-                return item;
-            }
-        } else if (len(title) == 0 && pageNo > 0 && item->pageNo == pageNo) {
-            return item;
-        }
-        TocItem* found = FindTocItemByTitlePage(item->child, title, pageNo);
-        if (found) {
-            return found;
-        }
-    }
-    return nullptr;
-}
-
-struct GoToTocLinkData {
-    WindowTab* tab = nullptr;
-    DocController* ctrl = nullptr;
-    // owned snapshot; may be null (then pageNo alone is used)
-    IPageDestination* dest = nullptr;
-    int pageNo = 0;
-    // owned; used to re-select in tree after palette-driven nav
-    Str title;
-    // true when the navigation was driven from outside the tree (e.g. the
-    // command palette), so afterwards we must move the tree's selection to the
-    // item ourselves. For tree-driven navigation the tree is already selected.
-    bool selectInTree = false;
-
-    ~GoToTocLinkData() {
-        delete dest;
-        str::Free(title);
-    }
-};
-
-// URL / file / embedded targets keep pageNo = -1 by design; only page-nav dests need pageNo >= 1.
-static bool DestNeedsValidPageNo(IPageDestination* dest) {
-    if (!dest) {
-        return false;
-    }
-    Kind k = dest->GetKind();
-    return k != kindDestinationLaunchURL && k != kindDestinationLaunchFile && k != kindDestinationLaunchEmbedded &&
-           k != kindDestinationAttachment;
-}
-
-static GoToTocLinkData* NewGoToTocLinkData(MainWindow* win, TocItem* tocItem, bool selectInTree) {
-    DocController* ctrl = win->ctrl;
-    WindowTab* tab = win->CurrentTab();
-    if (!ctrl || !tab || tab->ctrl != ctrl) {
-        return nullptr;
-    }
-
-    int pageNo = tocItem->pageNo;
-    IPageDestination* origDest = tocItem->GetPageDestination();
-    if (origDest && pageNo < 1) {
-        // chaptered docs: pageNo stays -1 until the target chapter lays out.
-        // Resolve now, on the UI thread, so ResolveDest can cache the real
-        // page/loc on origDest before it gets snapshotted below -- otherwise
-        // SnapshotDestForDeferredNav has nothing but pageNo == -1 to go on
-        // and drops the destination.
-        Location loc = ctrl->ResolveDest(origDest);
-        if (loc.IsValid()) {
-            pageNo = ctrl->PageNoFromLocation(loc);
-        }
-    }
-    IPageDestination* dest = SnapshotDestForDeferredNav(origDest, pageNo);
-
-    // drop page-navigation destinations that still have no valid page and no
-    // chapter to resolve lazily (see DocController::ResolveDest)
-    if (dest && DestNeedsValidPageNo(dest) && PageDestGetPageNo(dest) < 1 && dest->loc.chapter < 1) {
-        logf("NewGoToTocLinkData: skip dest with pageNo=%d\n", PageDestGetPageNo(dest));
-        delete dest;
-        dest = nullptr;
-    }
-
-    // nothing to navigate to: no dest and no valid page number
-    if (!dest && pageNo < 1) {
-        logf("NewGoToTocLinkData: skip toc item pageNo=%d title='%s'\n", pageNo, tocItem->title);
-        return nullptr;
-    }
-
-    auto* data = new GoToTocLinkData;
-    data->ctrl = ctrl;
-    data->tab = tab;
-    data->pageNo = pageNo;
-    data->dest = dest;
-    data->selectInTree = selectInTree;
-    if (selectInTree && tocItem->title) {
-        data->title = str::Dup(tocItem->title);
-    }
-    return data;
-}
-
-static void GoToTocLink(GoToTocLinkData* d) {
+void GoToTocLink(GoToTocLinkData* d) {
     AutoDelete delData(d);
 
     auto* tab = d->tab;
@@ -318,7 +134,7 @@ static void GoToTocLink(GoToTocLinkData* d) {
     }
     MainWindow* win = tab->win;
     // destination snapshot is invalid if the DocController has been replaced
-    if (!ctrl || !IsMainWindowValidAndNotClosing(win) || win->CurrentTab() != tab || tab->ctrl != ctrl) {
+    if (!ctrl || !IsMainWindowValidAndNotClosing(win) || !IsCurrentTab(win, tab) || tab->ctrl != ctrl) {
         return;
     }
 
@@ -353,49 +169,6 @@ static void GoToTocLink(GoToTocLinkData* d) {
     }
 }
 
-// navigate to a TocItem regardless of whether it points to a page in this
-// document or to an external destination (used by the command palette, where
-// the user explicitly picked the item so we always honor it)
-// navigate to a TocItem (used by the command palette's TOC mode)
-void GoToTocItem(MainWindow* win, TocItem* tocItem) {
-    if (!win || !tocItem) {
-        return;
-    }
-    auto* data = NewGoToTocLinkData(win, tocItem, true);
-    if (!data) {
-        return;
-    }
-    auto fn = MkFunc0<GoToTocLinkData>(GoToTocLink, data);
-    uitask::Post(fn, "TaskGoToTocFromPalette");
-}
-
-static bool IsScrollToLink(IPageDestination* link) {
-    if (!link) {
-        return false;
-    }
-    const auto* kind = link->GetKind();
-    return kind == kindDestinationScrollTo;
-}
-
-static void GoToTocTreeItem(MainWindow* win, TreeItem ti, bool allowExternal) {
-    if (!ti) {
-        return;
-    }
-    TocItem* tocItem = (TocItem*)ti;
-    bool validPage = (tocItem->pageNo > 0);
-    bool isScroll = IsScrollToLink(tocItem->GetPageDestination());
-    bool hasChapterDest = tocItem->dest && tocItem->dest->loc.chapter >= 1;
-    if (validPage || allowExternal || isScroll || hasChapterDest) {
-        // delay changing the page until the tree messages have been handled
-        auto* data = NewGoToTocLinkData(win, tocItem, false);
-        if (!data) {
-            return;
-        }
-        auto fn = MkFunc0<GoToTocLinkData>(GoToTocLink, data);
-        uitask::Post(fn, "TaskGoToTocTreeItem");
-    }
-}
-
 void ClearTocBox(MainWindow* win) {
     if (!win->tocLoaded) {
         return;
@@ -419,132 +192,6 @@ void ClearTocBox(MainWindow* win) {
     win->currPageNo = 0;
 }
 
-struct VistorForPageNoData {
-    int pageNo = -1;
-
-    TocItem* bestMatch = nullptr;
-    int bestMatchPageNo = 0;
-    int nItems = 0;
-};
-
-static void visitTree(VistorForPageNoData* d, TreeItemVisitorData* vd) {
-    auto* tocItem = (TocItem*)vd->item;
-    if (!tocItem) {
-        return;
-    }
-    if (!d->bestMatch) {
-        // if nothing else matches, match the root node
-        d->bestMatch = tocItem;
-    }
-    ++d->nItems;
-    int page = tocItem->pageNo;
-    if ((page <= d->pageNo) && (page >= d->bestMatchPageNo) && (page >= 1)) {
-        d->bestMatch = tocItem;
-        d->bestMatchPageNo = page;
-        if (d->pageNo == d->bestMatchPageNo) {
-            // we can stop earlier if we found the exact match
-            vd->stopTraversal = true;
-            return;
-        }
-    }
-}
-
-// find the closest item in tree view to a given page number
-static TocItem* TreeItemForPageNo(TreeView* treeView, int pageNo) {
-    TreeModel* tm = treeView->treeModel;
-    if (!tm) {
-        return nullptr;
-    }
-    VistorForPageNoData d;
-    d.pageNo = pageNo;
-    auto fn = MkFunc1<VistorForPageNoData, TreeItemVisitorData*>(visitTree, &d);
-    VisitTreeModelItems(tm, fn);
-    // if there's only one item, we want to unselect it so that it can
-    // be selected by the user
-    if (d.nItems < 2) {
-        return nullptr;
-    }
-    return d.bestMatch;
-}
-
-struct VisitorForChapterData {
-    int chapter = -1;
-    int pageNo = 0;
-    TocItem* match = nullptr;
-    int matchPageNo = 0;
-};
-
-static void visitTreeForChapter(VisitorForChapterData* d, TreeItemVisitorData* vd) {
-    auto* tocItem = (TocItem*)vd->item;
-    if (!tocItem || tocItem->loc.chapter != d->chapter) {
-        return;
-    }
-    if (!d->match) {
-        d->match = tocItem;
-        d->matchPageNo = tocItem->pageNo;
-    }
-    int page = tocItem->pageNo;
-    if (page >= 1 && page <= d->pageNo && page >= d->matchPageNo) {
-        d->match = tocItem;
-        d->matchPageNo = page;
-        if (page == d->pageNo) {
-            vd->stopTraversal = true;
-        }
-    }
-}
-
-// closest item (in tree order) whose loc.chapter matches, preferring an exact
-// pageNo match; chaptered docs need chapter-first matching because unresolved
-// items all share pageNo == -1, so TreeItemForPageNo can't tell them apart
-static TocItem* TreeItemForChapter(TreeView* treeView, int chapter, int pageNo) {
-    TreeModel* tm = treeView->treeModel;
-    if (!tm || chapter < 1) {
-        return nullptr;
-    }
-    VisitorForChapterData d;
-    d.chapter = chapter;
-    d.pageNo = pageNo;
-    auto fn = MkFunc1<VisitorForChapterData, TreeItemVisitorData*>(visitTreeForChapter, &d);
-    VisitTreeModelItems(tm, fn);
-    return d.match;
-}
-
-struct CollectSamePageData {
-    int pageNo = 0;
-    Vec<TocItem*>* out = nullptr;
-};
-
-static void visitCollectSamePage(CollectSamePageData* d, TreeItemVisitorData* vd) {
-    auto* tocItem = (TocItem*)vd->item;
-    if (!tocItem || tocItem->pageNo < 1) {
-        return;
-    }
-    if (tocItem->pageNo == d->pageNo) {
-        VecAppend(*d->out, tocItem);
-    }
-}
-
-static bool TocMatchingItemsContains(const Vec<TocItem*>& items, TocItem* item) {
-    for (TocItem* t : items) {
-        if (t == item) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool TocMatchingItemsEq(const Vec<TocItem*>& a, const Vec<TocItem*>& b) {
-    if (len(a) != len(b)) {
-        return false;
-    }
-    for (int i = 0; i < len(a); i++) {
-        if (a[i] != b[i]) {
-            return false;
-        }
-    }
-    return true;
-}
-
 // Fill win->tocMatchingItems with every entry that should look "current" for
 // bestMatch: all TOC items on the same page, plus the ancestor chain (so a
 // nested 6 / 6.1 / 6.1.1 path all highlight together). TreeView still has only
@@ -555,11 +202,7 @@ static void SetTocMultiHighlight(MainWindow* win, TreeView* treeView, TocItem* b
         // All bookmarks that point at the same page as the best match (the issue's
         // "subsequent" same-page entries that TreeView single-select cannot show).
         if (bestMatch->pageNo >= 1 && treeView->treeModel) {
-            CollectSamePageData d;
-            d.pageNo = bestMatch->pageNo;
-            d.out = &next;
-            auto fn = MkFunc1<CollectSamePageData, TreeItemVisitorData*>(visitCollectSamePage, &d);
-            VisitTreeModelItems(treeView->treeModel, fn);
+            CollectTocItemsOnPage(treeView->treeModel, bestMatch->pageNo, next);
         }
 
         // Ancestor chain (chapter → section → subsection), including bestMatch.
@@ -579,13 +222,6 @@ static void SetTocMultiHighlight(MainWindow* win, TreeView* treeView, TocItem* b
     if (treeView && treeView->hwnd) {
         HwndInvalidate(treeView->hwnd, false);
     }
-}
-
-static bool TocItemIsMultiHighlight(MainWindow* win, TocItem* item) {
-    if (!gShowAllMatchingTOC || !win || !item) {
-        return false;
-    }
-    return TocMatchingItemsContains(win->tocMatchingItems, item);
 }
 
 // TODO: I can't use TreeItem->IsExpanded() because it's not in sync with
@@ -627,10 +263,10 @@ void UpdateTocSelection(MainWindow* win, int currPageNo) {
 
     TocItem* item = nullptr;
     if (win->ctrl && win->ctrl->HasChapters()) {
-        item = TreeItemForChapter(treeView, win->ctrl->CurrentLocation().chapter, currPageNo);
+        item = TreeItemForChapter(treeView->treeModel, win->ctrl->CurrentLocation().chapter, currPageNo);
     }
     if (!item) {
-        item = TreeItemForPageNo(treeView, currPageNo);
+        item = TreeItemForPageNo(treeView->treeModel, currPageNo);
     }
     if (win->tocKeepSelection) {
         // the tree selection is deliberately left alone: the user clicked a
@@ -667,10 +303,10 @@ void ExpandTocToCurrentPage(MainWindow* win) {
     TocItem* item = nullptr;
     if (win->ctrl->HasChapters()) {
         // unresolved chaptered items keep pageNo == -1; match by chapter first
-        item = TreeItemForChapter(treeView, win->ctrl->CurrentLocation().chapter, currPageNo);
+        item = TreeItemForChapter(treeView->treeModel, win->ctrl->CurrentLocation().chapter, currPageNo);
     }
     if (!item) {
-        item = TreeItemForPageNo(treeView, currPageNo);
+        item = TreeItemForPageNo(treeView->treeModel, currPageNo);
     }
     if (!item) {
         return;
@@ -716,80 +352,6 @@ void UpdateTocExpansionState(Vec<int>& tocState, TreeView* treeView, TocTree* do
     UpdateDocTocExpansionStateRecur(treeView, tocState, tocItem);
 }
 
-static bool inRange(WCHAR c, WCHAR low, WCHAR hi) {
-    return (low <= c) && (c <= hi);
-}
-
-// copied from mupdf/fitz/dev_text.c
-// clang-format off
-static bool isLeftToRightChar(WCHAR c) {
-    return (
-        inRange(c, 0x0041, 0x005A) ||
-        inRange(c, 0x0061, 0x007A) ||
-        inRange(c, 0xFB00, 0xFB06)
-    );
-}
-
-static bool isRightToLeftChar(WCHAR c) {
-    return (
-        inRange(c, 0x0590, 0x05FF) ||
-        inRange(c, 0x0600, 0x06FF) ||
-        inRange(c, 0x0750, 0x077F) ||
-        inRange(c, 0xFB50, 0xFDFF) ||
-        inRange(c, 0xFE70, 0xFEFE)
-    );
-}
-// clang-format off
-
-static void GetLeftRightCounts(TocItem* node, int& l2r, int& r2l) {
-next:
-    if (!node) {
-        return;
-    }
-    // short-circuit because this could overflow the stack due to recursion
-    // (happened in doc from https://github.com/sumatrapdfreader/sumatrapdf/issues/1795)
-    if (l2r + r2l > 1024) {
-        return;
-    }
-    if (node->title) {
-        TempWStr ws = ToWStrTemp(node->title);
-        for (int i = 0; i < ws.len; i++) {
-            WCHAR c = ws.s[i];
-            if (isLeftToRightChar(c)) {
-                l2r++;
-            } else if (isRightToLeftChar(c)) {
-                r2l++;
-            }
-        }
-    }
-    GetLeftRightCounts(node->child, l2r, r2l);
-    // could be: GetLeftRightCounts(node->next, l2r, r2l);
-    // but faster if not recursive
-    node = node->next;
-    goto next;
-}
-
-static void SetInitialExpandState(TocItem* item, Vec<int>& tocState) {
-    while (item) {
-        item->isOpenToggled = VecContains(tocState, item->id);
-        SetInitialExpandState(item->child, tocState);
-        item = item->next;
-    }
-}
-
-static void AddFavoriteFromToc(MainWindow* win, TocItem* dti) {
-    int pageNo = 0;
-    if (!dti) {
-        return;
-    }
-    if (dti->dest) {
-        pageNo = PageDestGetPageNo(dti->dest);
-    }
-    Str name = dti->title;
-    TempStr pageLabel = win->ctrl->GetPageLabeTemp(pageNo);
-    AddFavoriteWithLabelAndName(win, pageNo, pageLabel, name);
-}
-
 static void SaveAttachment(WindowTab* tab, Str fileName, int attachmentNo) {
     EngineBase* engine = tab->AsFixed()->GetEngine();
     Str data = EngineMupdfLoadAttachment(engine, attachmentNo);
@@ -803,23 +365,13 @@ static void SaveAttachment(WindowTab* tab, Str fileName, int attachmentNo) {
     str::Free(data);
 }
 
-static void OpenAttachment(WindowTab* tab, Str fileName, int attachmentNo) {
-    EngineBase* engine = tab->AsFixed()->GetEngine();
-    Str data = EngineMupdfLoadAttachment(engine, attachmentNo);
-    if (len(data) == 0) {
-        return;
-    }
-    OpenDocumentFromMemory(tab->win, data, fileName);
-    str::Free(data);
-}
-
 static void OpenEmbeddedFile(WindowTab* tab, IPageDestination* dest) {
     ReportIf(!tab || !dest);
     if (!tab || !dest) {
         return;
     }
     MainWindow* win = tab->win;
-    PageDestinationFile *destFile = (PageDestinationFile*)dest;
+    PageDestinationFile* destFile = (PageDestinationFile*)dest;
     Str path = destFile->path;
     Str tabPath = tab->filePath;
     if (!str::StartsWith(path, tabPath)) {
@@ -920,72 +472,6 @@ static void TocCollapseSameLevel(TreeView* tv, TreeItem ti) {
     tv->ResumeRedraw();
 }
 
-// clang-format off
-static MenuDef menuDefContextToc[] = {
-    {
-        TrN("Expand All"),
-        CmdExpandAll,
-    },
-    {
-        TrN("Collapse All"),
-        CmdCollapseAll,
-    },
-    {
-        TrN("Expand to Level 1"),
-        CmdTocExpandToLevel1,
-    },
-    {
-        TrN("Expand to Level 2"),
-        CmdTocExpandToLevel2,
-    },
-    {
-        TrN("Expand to Level 3"),
-        CmdTocExpandToLevel3,
-    },
-    {
-        TrN("Collapse Same Level"),
-        CmdTocCollapseSameLevel,
-    },
-    {
-        TrN("Expand to Current Page"),
-        CmdExpandToCurrentPage,
-    },
-    {
-        StrL(kMenuSeparator),
-        0,
-    },
-    {
-        TrN("Open Embedded PDF"),
-        CmdOpenEmbeddedPDF,
-    },
-    {
-        TrN("Save Embedded File..."),
-        CmdSaveEmbeddedFile,
-    },
-    {
-        TrN("Open Attachment"),
-        CmdOpenAttachment,
-    },
-    {
-        TrN("Save Attachment..."),
-        CmdSaveAttachment,
-    },
-    // note: strings cannot be "" or else items are not there
-    {
-        StrL("Add to favorites"),
-        CmdFavoriteAdd,
-    },
-    {
-        StrL("Remove from favorites"),
-        CmdFavoriteDel,
-    },
-    {
-        {},
-        0,
-    },
-};
-// clang-format on
-
 static void TocContextMenu(ContextMenuEvent* ev) {
     MainWindow* win = FindMainWindowByHwnd(ev->w->hwnd);
     Str filePath = win->ctrl->GetFilePath();
@@ -1017,7 +503,7 @@ static void TocContextMenu(ContextMenuEvent* ev) {
         // with the embedded stream number
         path = embeddedFile->path;
         // this is name of the file as set inside PDF file
-        fileName = PageDestGetName(dest);
+        fileName = dest->GetName();
         bool canOpenEmbedded = str::EndsWithI(fileName, StrL(".pdf"));
         if (!canOpenEmbedded) {
             MenuRemove(popup, CmdOpenEmbeddedPDF);
@@ -1035,7 +521,7 @@ static void TocContextMenu(ContextMenuEvent* ev) {
         // with the embedded stream number
         path = attachment->path;
         // this is name of the file as set inside PDF file
-        fileName = PageDestGetName(dest);
+        fileName = dest->GetName();
         // hack: attachmentNo is saved in pageNo see
         // PdfLoadAttachments and DestFromAttachment
         attachmentNo = pageNo;
@@ -1129,26 +615,6 @@ static void TocContextMenu(ContextMenuEvent* ev) {
 
 static void OnTocCustomDraw(TreeView::CustomDrawEvent* /*ev*/);
 
-// auto-expand root level ToC nodes if there are at most two
-static void AutoExpandTopLevelItems(TocItem* root) {
-    if (!root) {
-        return;
-    }
-    if (root->next && root->next->next) {
-        return;
-    }
-
-    if (!root->IsExpanded()) {
-        root->isOpenToggled = !root->isOpenToggled;
-    }
-    if (!root->next) {
-        return;
-    }
-    if (!root->next->IsExpanded()) {
-        root->next->isOpenToggled = !root->next->isOpenToggled;
-    }
-}
-
 void LoadTocTree(MainWindow* win) {
     WindowTab* tab = win->CurrentTab();
     if (!tab) {
@@ -1215,19 +681,6 @@ void RefreshTocTreeIfNeeded(MainWindow* win) {
     win->tocTreeView->SetTreeModel(tab->currToc);
 }
 
-static TocItem* FindTocItemByTitleAndPage(TocItem* item, Str title, int pageNo) {
-    while (item) {
-        if (item->pageNo == pageNo && str::Eq(item->title, title)) {
-            return item;
-        }
-        if (TocItem* found = FindTocItemByTitleAndPage(item->child, title, pageNo)) {
-            return found;
-        }
-        item = item->next;
-    }
-    return nullptr;
-}
-
 // The controller swapped in a different TocTree (the markdown / html TOC is
 // built in the background, see MarkdownModel). Show the new one, keeping the
 // selection on the same entry when it's still there.
@@ -1240,7 +693,7 @@ void ReloadTocTree(WindowTab* tab) {
     }
     // the tree view only ever shows the current tab; another tab picks up the
     // new tree when it's switched to
-    if (win->CurrentTab() != tab || !win->tocLoaded) {
+    if (!IsCurrentTab(win, tab) || !win->tocLoaded) {
         tab->currToc = nullptr;
         return;
     }
@@ -1528,7 +981,7 @@ static void TocTreeClick(TreeView::ClickEvent* ev) {
         ReportIf(true);
         return;
     }
-    GoToTocTreeItem(win, ev->treeItem, true);
+    GoToTocTreeItem(win, (TocItem*)ev->treeItem, true);
 }
 
 static void TocTreeSelectionChanged(TreeView::SelectionChangedEvent* ev) {
@@ -1554,7 +1007,7 @@ static void TocTreeSelectionChanged(TreeView::SelectionChangedEvent* ev) {
         gTocSelChangedByMouseClick = true;
     }
     bool allowExternal = ev->byMouse;
-    GoToTocTreeItem(win, ev->selectedItem, allowExternal);
+    GoToTocTreeItem(win, (TocItem*)ev->selectedItem, allowExternal);
 }
 
 // Tab / Ctrl+Tab focus movement (also reused by Favorites tree)
@@ -1627,62 +1080,6 @@ void TocTreeKeyDown2(TreeView::KeyDownEvent* ev) {
     }
     AdvanceFocus(win);
     ev->result = 1;
-}
-
-// Append a TocItem linked list onto resultFirst/resultLast (updates last).
-static void AppendTocSiblingList(TocItem*& resultFirst, TocItem*& resultLast, TocItem* list) {
-    if (!list) {
-        return;
-    }
-    if (!resultFirst) {
-        resultFirst = list;
-    } else {
-        resultLast->next = list;
-    }
-    resultLast = list;
-    while (resultLast->next) {
-        resultLast = resultLast->next;
-    }
-}
-
-// Recursively build a filtered copy of the TocItem tree.
-// Multi-word filter (command palette style): every word must appear in the
-// item's own title to keep that node. Non-matching ancestors are omitted and
-// matching descendants are promoted so only fully-matching rows are shown.
-// Returns nullptr if nothing matches.
-static TocItem* FilterTocItemRec(TocItem* item, const StrVec& words) {
-    if (!item) {
-        return nullptr;
-    }
-    TocItem* resultFirst = nullptr;
-    TocItem* resultLast = nullptr;
-    for (TocItem* si = item; si; si = si->next) {
-        TocItem* filteredChildren = FilterTocItemRec(si->child, words);
-        bool titleMatches = si->title && FilterMatches(si->title, words);
-        if (titleMatches) {
-            // keep this node; only fully-matching children stay nested under it
-            auto* copy = AllocTocItem(nullptr, si->title, si->pageNo);
-            copy->id = si->id;
-            copy->fontFlags = si->fontFlags;
-            copy->color = si->color;
-            copy->dest = si->dest;
-            copy->destNotOwned = true;
-            copy->isOpenDefault = true;
-            copy->isOpenToggled = false;
-            copy->child = filteredChildren;
-            for (TocItem* c = copy->child; c; c = c->next) {
-                c->parent = copy;
-            }
-            AppendTocSiblingList(resultFirst, resultLast, copy);
-        } else if (filteredChildren) {
-            // title does not match every word: drop this node, promote children
-            for (TocItem* c = filteredChildren; c; c = c->next) {
-                c->parent = nullptr;
-            }
-            AppendTocSiblingList(resultFirst, resultLast, filteredChildren);
-        }
-    }
-    return resultFirst;
 }
 
 static void ApplyTocFilter(MainWindow* win, Str filter) {
@@ -1891,7 +1288,7 @@ void ClearSidebarThumbnails(MainWindow* win) {
 // pages were moved, inserted or removed: the thumbnails start over
 void SidebarPagesChanged(MainWindow* win) {
     PageThumbnailsCtrl* thumbs = win->pageThumbs;
-    if (!thumbs || !thumbs->tab || thumbs->tab != win->CurrentTab()) {
+    if (!thumbs || !IsCurrentTab(win, thumbs->tab)) {
         return;
     }
     thumbs->SetTab(thumbs->tab);

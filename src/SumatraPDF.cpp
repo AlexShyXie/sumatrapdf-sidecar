@@ -25,6 +25,7 @@
 
 #include "gui/UIModels.h"
 #include "gui/Layout.h"
+#include "gui/BrowserView.h"
 #include "gui/win/WinGui.h"
 #include "gui/win/WebView.h"
 #include "gui/win/BrowserDocView.h"
@@ -142,6 +143,10 @@
 #include "CachedObjects.h"
 #include "SumatraPDF.h"
 #include "PerfLog.h"
+#include "SumatraPDFCommon.h"
+#include "VirtualDesktop.h"
+#include "SumatraCrashCommon.h"
+#include "OpenFileFilters.h"
 #include "SumatraLog.h"
 
 using Gdiplus::Graphics;
@@ -150,18 +155,11 @@ using Gdiplus::SolidBrush;
 
 constexpr const WCHAR* kCanvasClassName = L"SUMATRA_PDF_CANVAS";
 
-constexpr const char* kRestrictionsFileName = "sumatrapdfrestrict.ini";
-
-constexpr const char* kSumatraWindowTitle = "SumatraPDF";
 constexpr const WCHAR* kSumatraWindowTitleW = L"SumatraPDF";
 
 // used to show it in debug, but is not very useful,
 // so always disable
 
-// in plugin mode, the window's frame isn't drawn and closing and
-// fullscreen are disabled, so that SumatraPDF can be displayed
-// embedded (e.g. in a web browser)
-Str gPluginURL; // owned by Flags in WinMain
 bool gMyWindowWasEmbedded = false;
 
 static bool NeedsWindowEmbeddingHacks() {
@@ -179,10 +177,6 @@ static bool SettingsRestoreSession() {
 bool SettingsRememberOpenedFiles() {
     return gSettings->rememberOpenedFiles && !gMyWindowWasEmbedded;
 }
-
-static Kind kNotifPersistentWarning = "persistentWarning";
-static Kind kNotifDocErrors = "docErrors";
-static Kind kNotifZoomOrView = "zoomOrView";
 
 HBITMAP gBitmapReloadingCue;
 RenderCache* gRenderCache;
@@ -240,62 +234,12 @@ static void LogRedraw(Str what, HWND hwnd, const RECT* rc = nullptr) {
     }
 }
 
-// in restricted mode, some features can be disabled (such as
-// opening files, printing, following URLs), so that SumatraPDF
-// can be used as a PDF reader on locked down systems
-static Perm gPolicyRestrictions = Perm::All;
-// only the listed protocols will be passed to the OS for
-// opening in e.g. a browser or an email client (ignored,
-// if gPolicyRestrictions doesn't contain Perm::DiskAccess)
-static StrVec gAllowedLinkProtocols;
-// only files of the listed perceived types will be opened
-// externally by LinkHandler::LaunchFile (i.e. when clicking
-// on an in-document link); examples: "audio", "video", ...
-static StrVec gAllowedFileTypes;
-
-// Openable files in one directory, for next/prev and the end-of-document hint.
-// Built on a background thread: a folder of tens of thousands of files must
-// not freeze the UI (discussion #6014).
-static Str gNextPrevDir = {};
-static StrVec gNextPrevDirCache;
 static int gNextPrevDirScanGen = 0;
-static bool gNextPrevDirReady = false;
-static bool gNextPrevDirScanning = false;
-
-static void EnsureNextPrevDirScan(Str filePath);
 
 static void CloseDocumentInCurrentTab(MainWindow* /*win*/, bool keepUIEnabled, bool deleteModel);
 static void SetFrameTitleForTab(WindowTab* tab, bool needRefresh);
 static void OnSidebarSplitterMove(VirtSplitter::MoveEvent* /*ev*/);
 static void OnPanelsSplitterMove(VirtSplitter::MoveEvent* /*ev*/);
-
-EBookUI* GetEBookUI() {
-    if (!gSettings) return nullptr;
-    return &gSettings->eBookUI;
-}
-
-// A document is usually loaded on a worker thread, where walking the file
-// history (only ever touched on the UI thread) would race with it changing.
-// Such loads copy the settings before leaving the UI thread and park the copy
-// here for the engine to pick up.
-static thread_local FileEBookUI* gLoadThreadFileEBookUI;
-
-static void SetLoadThreadFileEBookUI(FileEBookUI* v) {
-    gLoadThreadFileEBookUI = v;
-}
-
-// per-document overrides of the ebook settings, null unless this document has
-// an EBookUI block in FileStates (#4600)
-FileEBookUI* GetFileEBookUI(Str filePath) {
-    if (!uitask::IsMainUIThread()) {
-        return gLoadThreadFileEBookUI;
-    }
-    if (!gSettings || len(filePath) == 0) {
-        return nullptr;
-    }
-    FileState* fs = FileHistoryFindByPath(filePath);
-    return fs ? fs->eBookUI : nullptr;
-}
 
 // the per-document settings to hand to a load running off the UI thread
 static FileEBookUI* CopyFileEBookUIForPath(Str filePath) {
@@ -367,103 +311,6 @@ LoadArgs* LoadArgs::Clone() {
     return res;
 }
 
-void SetCurrentLang(Str langCode) {
-    if (len(langCode) == 0) {
-        return;
-    }
-    str::ReplaceWithCopy(&gSettings->uiLanguage, langCode);
-    trans::SetCurrentLangByCode(gSettings->uiLanguage);
-}
-
-#define kDefaultFilePerceivedTypes "audio,video,webpage"
-#define kDefaultLinkProtocols "http,https,mailto,file"
-
-void InitializePolicies(bool restrict) {
-    // default configuration should be to restrict everything
-    ReportIf(gPolicyRestrictions != Perm::All);
-    ReportIf(len(gAllowedLinkProtocols) != 0 || len(gAllowedFileTypes) != 0);
-
-    // the -restrict command line flag overrides any sumatrapdfrestrict.ini configuration
-    if (restrict) {
-        gPolicyRestrictions = Perm::RestrictedUse;
-        return;
-    }
-
-    // allow to restrict SumatraPDF's functionality from an INI file in the
-    // same directory as SumatraPDF.exe (see ../docs/sumatrapdfrestrict.ini)
-    // (if the file isn't there, everything is allowed)
-    TempStr restrictPath = GetPathInExeDirTemp(Str(kRestrictionsFileName));
-    if (!file::Exists(restrictPath)) {
-        Split(&gAllowedLinkProtocols, StrL(kDefaultLinkProtocols), StrL(","));
-        Split(&gAllowedFileTypes, StrL(kDefaultFilePerceivedTypes), StrL(","));
-        return;
-    }
-
-    Str restrictData = file::ReadFile(restrictPath);
-    SquareTreeNode* root = ParseSquareTree(restrictData);
-    AutoDelete delRoot(root);
-    SquareTreeNode* polsec = root ? root->GetChild(StrL("Policies")) : nullptr;
-    gPolicyRestrictions = Perm::RestrictedUse;
-    // if the restriction file is broken, err on the side of full restriction
-    if (!polsec) {
-        return;
-    }
-
-    static Perm perms[] = {Perm::InternetAccess, Perm::DiskAccess,    Perm::SavePreferences, Perm::RegistryAccess,
-                           Perm::PrinterAccess,  Perm::CopySelection, Perm::FullscreenAccess};
-    static SeqStrings permNames =
-        "InternetAccess\0DiskAccess\0SavePreferences\0RegistryAccess\0PrinterAccess\0CopySelection\0FullscreenAccess\0";
-
-    // enable policies as indicated in sumatrapdfrestrict.ini
-    for (int i = 0; i < dimofi(perms); i++) {
-        Str name = SeqStrByIndex(permNames, i);
-        Str val = polsec->GetValue(name);
-        if (val && ParseInt(val) != 0) {
-            gPolicyRestrictions = gPolicyRestrictions | perms[i];
-        }
-    }
-
-    // determine the list of allowed link protocols and perceived file types
-    if ((gPolicyRestrictions & Perm::DiskAccess) != (Perm)0) {
-        Str value = polsec->GetValue(StrL("LinkProtocols"));
-        if (value) {
-            TempStr protocols = str::DupTemp(value);
-            str::ToLowerInPlace(protocols);
-            str::TransCharsInPlace(protocols, StrL(" :;"), StrL(",,,"));
-            Split(&gAllowedLinkProtocols, protocols, StrL(","), true);
-        }
-        value = polsec->GetValue(StrL("SafeFileTypes"));
-        if (value) {
-            TempStr protocols = str::DupTemp(value);
-            str::ToLowerInPlace(protocols);
-            str::TransCharsInPlace(protocols, StrL(" :;"), StrL(",,,"));
-            Split(&gAllowedFileTypes, protocols, StrL(","), true);
-        }
-    }
-}
-
-static void RestrictPolicies(Perm revokePermission) {
-    gPolicyRestrictions = (gPolicyRestrictions | Perm::RestrictedUse) & ~revokePermission;
-}
-
-bool HasPermission(Perm permission) {
-    return (permission & gPolicyRestrictions) == permission;
-}
-
-bool CanAccessDisk() {
-    return HasPermission(Perm::DiskAccess);
-}
-
-// TODO: could add a setting
-bool AnnotationsAreDisabled() {
-    if (!CanAccessDisk()) {
-        // annotations must be saved back to a file so lack of disk access
-        // implies no ability to edit annotations
-        return true;
-    }
-    return false;
-}
-
 // lets the shell open a URI for any supported scheme in
 // the appropriate application (web browser, mail client, etc.)
 bool SumatraLaunchBrowser(Str url) {
@@ -499,48 +346,6 @@ bool SumatraLaunchBrowser(Str url) {
     }
 
     return LaunchFileShell(url, {}, StrL("open"));
-}
-
-bool DocIsSupportedFileType(FileType kind) {
-    if (EpubDoc::IsSupportedFileType(kind)) {
-        return true;
-    }
-    if (Fb2Doc::IsSupportedFileType(kind)) {
-        return true;
-    }
-    if (MobiDoc::IsSupportedFileType(kind)) {
-        return true;
-    }
-    if (PalmDoc::IsSupportedFileType(kind)) {
-        return true;
-    }
-    return false;
-}
-
-// lets the shell open a file of any supported perceived type
-// in the default application for opening such files
-bool OpenFileExternally(Str path) {
-    if (!CanAccessDisk() || gPluginMode) {
-        return false;
-    }
-
-    // check if this file's perceived type is allowed
-    TempStr ext = path::GetExtTemp(path);
-    TempStr perceivedType = ReadRegStrTemp(HKEY_CLASSES_ROOT, ext, StrL("PerceivedType"));
-    // since we allow following hyperlinks, also allow opening local webpages
-    if (str::EndsWithI(path, StrL(".htm")) || str::EndsWithI(path, StrL(".html")) ||
-        str::EndsWithI(path, StrL(".xhtml"))) {
-        perceivedType = str::DupTemp(StrL("webpage"));
-    }
-    str::ToLowerInPlace(perceivedType);
-    if (gAllowedFileTypes.Contains(StrL("*"))) {
-        /* allow all file types (not recommended) */;
-    } else if (len(perceivedType) == 0 || !gAllowedFileTypes.Contains(perceivedType)) {
-        return false;
-    }
-
-    // TODO: only do this for trusted files (cf. IsUntrustedFile)?
-    return LaunchFileShell(path);
 }
 
 void SwitchToDisplayMode(MainWindow* win, DisplayMode displayMode, bool keepContinuous) {
@@ -607,6 +412,15 @@ static WindowTab* FindTabByFileInWindow(Str file, MainWindow* win) {
     return nullptr;
 }
 
+WindowTab* FindTabByFilePath(Str path, MainWindow* limitWin) {
+    return FindTabByFile(path, limitWin);
+}
+
+// Runs a command in win, as if picked from its menu.
+void ExecuteCmd(MainWindow* win, int cmdId) {
+    HwndSendCommand(win->hwndFrame, cmdId);
+}
+
 WindowTab* FindTabByFile(Str file, MainWindow* limitWin) {
     if (limitWin) {
         return FindTabByFileInWindow(file, limitWin);
@@ -617,18 +431,6 @@ WindowTab* FindTabByFile(Str file, MainWindow* limitWin) {
         }
     }
     return nullptr;
-}
-
-// ok for tab to be null
-void SelectTabInWindow(WindowTab* tab) {
-    if (!tab || !tab->win) {
-        return;
-    }
-    auto* win = tab->win;
-    if (tab == win->CurrentTab()) {
-        return;
-    }
-    TabsSelect(win, win->GetTabIdx(tab));
 }
 
 // Find the first window showing a given PDF file
@@ -718,31 +520,6 @@ void EndDocumentLoad(Str file) {
     }
 }
 
-// Find the first window that has been produced from <file>
-MainWindow* FindMainWindowBySyncFile(Str path, bool focusTab) {
-    for (MainWindow* win : gWindows) {
-        Vec<Rect> rects;
-        int page;
-        auto* dm = win->AsFixed();
-        if (dm && dm->pdfSync && dm->pdfSync->SourceToDoc(path, 0, 0, &page, rects) != PDFSYNCERR_UNKNOWN_SOURCEFILE) {
-            return win;
-        }
-        bool bringFore = focusTab && win->TabCount() > 1;
-        if (!bringFore) {
-            continue;
-        }
-        // bring a background tab to the foreground
-        for (WindowTab* tab : win->Tabs()) {
-            if (tab != win->CurrentTab() && tab->AsFixed() && tab->AsFixed()->pdfSync &&
-                tab->AsFixed()->pdfSync->SourceToDoc(path, 0, 0, &page, rects) != PDFSYNCERR_UNKNOWN_SOURCEFILE) {
-                TabsSelect(win, win->GetTabIdx(tab));
-                return win;
-            }
-        }
-    }
-    return nullptr;
-}
-
 static bool gShowPassword = false;
 
 class HwndPasswordUI : public PasswordUI {
@@ -822,20 +599,6 @@ EngineBase* CreatePdfEngineForDialog(Str path, HWND hwnd) {
     return CreateEngineMupdfFromFile(path, FileType::PDF, DpiGet(), &pwdUI);
 }
 
-// True while a tab is mid-load (async open). Used so we don't treat a plain
-// home/empty window as "still loading" for WindowState bookkeeping.
-static bool WindowHasDocumentLoading(MainWindow* win) {
-    if (!win) {
-        return false;
-    }
-    for (WindowTab* tab : win->Tabs()) {
-        if (tab->loadState == WindowTab::LoadState::Loading || tab->loadState == WindowTab::LoadState::LoadedPending) {
-            return true;
-        }
-    }
-    return false;
-}
-
 // update global windowState for next default launch when either
 // no pdf is opened or a document without window dimension information
 void RememberDefaultWindowPosition(MainWindow* win) {
@@ -909,7 +672,7 @@ static void UpdateSidebarDisplayState(WindowTab* tab, FileState* fs) {
     MainWindow* win = tab->win;
     fs->showToc = tab->showToc;
     str::ReplaceWithCopy(&fs->sidebarView, SidebarViewToStr(tab->sidebarView));
-    if (win->tocLoaded && tab == win->CurrentTab()) {
+    if (win->tocLoaded && IsCurrentTab(win, tab)) {
         TocTree* tocTree = tab->ctrl->GetToc();
         UpdateTocExpansionState(tab->tocState, win->tocTreeView, tocTree);
     }
@@ -931,15 +694,6 @@ void UpdateTabFileDisplayStateForTab(WindowTab* tab) {
     tab->ctrl->GetDisplayState(fs);
     UpdateDisplayStateWindowRect(win, fs, false);
     UpdateSidebarDisplayState(tab, fs);
-}
-
-static bool gForceRtl = false;
-
-bool IsUIRtl() {
-    if (gForceRtl) {
-        return true;
-    }
-    return trans::IsCurrLangRtl();
 }
 
 uint MbRtlReadingMaybe() {
@@ -1126,38 +880,6 @@ void RebuildMenuBarForWindow(MainWindow* win) {
     }
 }
 
-static bool ShouldSaveThumbnail(FileState* ds) {
-    // don't create thumbnails if we won't be needing them at all
-    if (!HasPermission(Perm::SavePreferences)) {
-        return false;
-    }
-
-    // don't materialize (hydrate) a cloud-only placeholder file just to make a
-    // thumbnail. opening it would force a slow, possibly multi-minute download
-    // (e.g. OneDrive "Files On-Demand" dehydrated file). issue #5756
-    if (path::IsCloudPlaceholder(ds->filePath)) {
-        logf("ShouldSaveThumbnail: skipping cloud placeholder '%s'\n", ds->filePath);
-        return false;
-    }
-
-    // don't create thumbnails for files that won't need them anytime soon
-    Vec<FileState*> list;
-    if (gSettings->homePageSortByFrequentlyRead) {
-        FileHistoryGetFrequencyOrder(list);
-    } else {
-        FileHistoryGetRecentlyOpenedOrder(list);
-    }
-    int idx = VecFind(list, ds);
-    if (idx < 0) {
-        return false;
-    }
-
-    if (HasThumbnail(ds)) {
-        return false;
-    }
-    return true;
-}
-
 struct ControllerCallbackHandler : DocControllerCallback {
     MainWindow* win{nullptr};
 
@@ -1190,7 +912,7 @@ void ControllerCallbackHandler::TocChanged(DocController* ctrl) {
         return;
     }
     MainWindow* win = tab->win;
-    if (!win || win->CurrentTab() != tab) {
+    if (!IsCurrentTab(win, tab)) {
         tab->currToc = nullptr;
         return;
     }
@@ -1264,141 +986,19 @@ void ControllerCallbackHandler::RenderThumbnail(DisplayModel* dm, Size size, con
     engine->disableAntiAlias = savedAntiAlias;
 }
 
-struct CreateThumbnailFromFileData {
-    Str filePath;
-    // when set, render from this clone of the open document instead of loading
-    // the file again (owned)
-    EngineBase* engine = nullptr;
-    Pixmap* bmp = nullptr;
-    // see LoadDocumentAsyncData: the thumbnail is rendered off the UI thread,
-    // so the per-document ebook settings have to come along as a copy (#4600)
-    FileEBookUI* fileEBookUI = nullptr;
-    ~CreateThumbnailFromFileData() {
-        str::Free(filePath);
-        SafeEngineRelease(&engine);
-        FreePixmap(bmp);
-        DeleteFileEBookUI(fileEBookUI);
-    }
-};
-
-static void CreateThumbnailFromFileFinish(CreateThumbnailFromFileData* d) {
+void CreateThumbnailFromFileFinish(CreateThumbnailFromFileData* d) {
     if (d->bmp) {
         FileState* fs = FileHistoryFindByPath(d->filePath);
         SetThumbnail(fs, d->bmp);
         d->bmp = nullptr;
+        MaybeRedrawHomePage();
     }
     delete d;
 }
 
-// an image next to the document with the same base name (Calibre puts a
-// "Title.jpg" cover next to "Title.epub") beats page 1 as the thumbnail
-static TempStr FindCoverImageTemp(Str docPath) {
-    static const char* kCoverExts[] = {".jpg", ".jpeg", ".png"};
-    TempStr noExt = path::GetPathNoExtTemp(docPath);
-    for (const char* ext : kCoverExts) {
-        TempStr cover = str::JoinTemp(noExt, Str(ext));
-        if (str::EqI(cover, docPath)) {
-            continue;
-        }
-        if (file::Exists(cover)) {
-            return cover;
-        }
-    }
-    return {};
-}
-
-static void CreateThumbnailFromFileThread(CreateThumbnailFromFileData* d) {
-    EngineBase* engine = d->engine;
-    TempStr cover = FindCoverImageTemp(d->filePath);
-    if (len(cover) > 0) {
-        SafeEngineRelease(&d->engine);
-        HwndPasswordUI pwdUI(nullptr);
-        engine = CreateEngineFromFile(cover, &pwdUI, true);
-    }
-    if (!engine && GuessFileTypeFromName(d->filePath, true) == FileType::Epub) {
-        // the cover the book itself declares, which isn't always page 1
-        Str coverData = EpubCoverImageData(d->filePath);
-        if (len(coverData) > 0) {
-            engine = CreateEngineImageFromData(coverData);
-        }
-        str::Free(coverData);
-    }
-    if (!engine) {
-        HwndPasswordUI pwdUI(nullptr);
-        SetLoadThreadFileEBookUI(d->fileEBookUI);
-        engine = CreateEngineFromFile(d->filePath, &pwdUI, true);
-        SetLoadThreadFileEBookUI(nullptr);
-    }
-    if (!engine) {
-        delete d;
-        return;
-    }
-    RectF pageRect = engine->PageMediabox(1);
-    if (pageRect.IsEmpty()) {
-        engine->Release();
-        delete d;
-        return;
-    }
-    pageRect = engine->Transform(pageRect, 1, 1.0f, 0);
-    float zoom = (float)kThumbnailDx / pageRect.dx;
-    pageRect.dy = std::min(pageRect.dy, (float)kThumbnailDy / zoom);
-    pageRect = engine->Transform(pageRect, 1, 1.0f, 0, true);
-    RenderPageArgs args(1, zoom, 0, &pageRect);
-    d->bmp = engine->RenderPage(args);
-    engine->Release();
-    d->engine = nullptr;
-    auto fn = MkFunc0<CreateThumbnailFromFileData>(CreateThumbnailFromFileFinish, d);
-    uitask::Post(fn, "SetThumbnailFromFile");
-}
-
-// create a thumbnail by loading the file with a temporary engine
-// used for lazy-loaded files that don't have a loaded controller
-static void CreateThumbnailFromFileAsync(FileState* ds, EngineBase* engine = nullptr) {
-    auto* d = new CreateThumbnailFromFileData();
-    d->filePath = str::Dup(ds->filePath);
-    d->engine = engine;
-    d->fileEBookUI = CopyFileEBookUI(ds->eBookUI);
-    auto fn = MkFunc0<CreateThumbnailFromFileData>(CreateThumbnailFromFileThread, d);
-    RunAsync(fn, StrL("CreateThumbnailFromFile"));
-}
-
-static void CreateThumbnailForFile(MainWindow* win, FileState* ds) {
-    if (!ShouldSaveThumbnail(ds)) {
-        return;
-    }
-
-    // don't create thumbnails for password protected documents
-    // (unless we're also remembering the decryption key anyway)
-    if (win->IsDocLoaded()) {
-        auto* model = win->AsFixed();
-        if (model) {
-            auto* engine = model->GetEngine();
-            bool withPwd = engine->IsPasswordProtected();
-            Str decrKey = engine->decryptionKey;
-            if (withPwd && len(decrKey) == 0) {
-                RemoveThumbnail(ds);
-                return;
-            }
-            // save decryption key to file history so the thumbnail thread can use it
-            if (decrKey && !str::Eq(ds->decryptionKey, decrKey)) {
-                str::ReplaceWithCopy(&ds->decryptionKey, decrKey);
-            }
-        }
-    }
-
-    // re-opening a PostScript file runs Ghostscript again (seconds for a big
-    // one), so hand the thread a clone of the engine we already have
-    EngineBase* clone = nullptr;
-    DisplayModel* dm = win->IsDocLoaded() ? win->AsFixed() : nullptr;
-    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
-    if (engine && engine->kind == kindEnginePostScript && str::Eq(engine->FilePath(), ds->filePath)) {
-        clone = engine->Clone();
-    }
-
-    // otherwise use file-based async thumbnail creation; it's independent
-    // of the tab lifecycle so it works even if the tab is closed before
-    // the render completes
-    CreateThumbnailFromFileAsync(ds, clone);
+EngineBase* CreateEngineForThumbnail(Str path) {
+    HwndPasswordUI pwdUI(nullptr);
+    return CreateEngineFromFile(path, &pwdUI, true);
 }
 
 /* Send the request to render a given page to a rendering thread */
@@ -1474,7 +1074,7 @@ void DeleteControllerAsync(DocController* ctrl) {
         return;
     }
     // no new requests for this model from here on
-    dm->pauseRendering = true;
+    dm->Retire();
     gRenderCache->AbortRendering(dm);
     if (!gRenderCache->IsRenderingFor(dm)) {
         // nothing to wait for, the common case
@@ -1583,8 +1183,6 @@ static void HideCanvasScrollbars(MainWindow* win) {
     HwndInvalidate(hwnd);
 }
 
-SeqStrings gScrollbarModeNames = "windows\0smart\0overlay\0hidden\0";
-
 int ScrollbarModeFromPrefs() {
     // embedded hosts get native scrollbars; override here, not in gSettings,
     // so the user's choice isn't written back to the settings file
@@ -1598,83 +1196,11 @@ int ScrollbarModeFromPrefs() {
     return idx;
 }
 
-bool ScrollbarsAreHidden() {
-    return ScrollbarModeFromPrefs() == kScrollbarHidden;
-}
-
-bool ScrollbarsUseOverlay() {
-    int mode = ScrollbarModeFromPrefs();
-    return mode == kScrollbarSmart || mode == kScrollbarOverlay;
-}
-
 OverlayScrollbar::Mode ScrollbarsOverlayMode() {
     if (ScrollbarModeFromPrefs() == kScrollbarOverlay) {
         return OverlayScrollbar::Mode::Thick;
     }
     return OverlayScrollbar::Mode::Smart;
-}
-
-SeqStrings gToolbarModeNames = "show\0hide\0overlay\0";
-
-int ToolbarModeFromPrefs() {
-    int idx = SeqStrIndexIS(gToolbarModeNames, gSettings->toolbar);
-    if (idx < 0) {
-        // not set / invalid: derive from the legacy showToolbar bool
-        idx = gSettings->showToolbar ? kToolbarShow : kToolbarHide;
-    }
-    return idx;
-}
-
-bool ToolbarModeIsOverlay() {
-    return ToolbarModeFromPrefs() == kToolbarOverlay;
-}
-
-bool ToolbarModeIsHidden() {
-    return ToolbarModeFromPrefs() == kToolbarHide;
-}
-
-void SetToolbarMode(int mode) {
-    Str name = SeqStrByIndex(gToolbarModeNames, mode);
-    if (len(name) == 0) {
-        name = StrL("show");
-        mode = kToolbarShow;
-    }
-    str::ReplaceWithCopy(&gSettings->toolbar, name);
-    // keep the legacy bool in sync so old versions stay sane
-    gSettings->showToolbar = (mode != kToolbarHide);
-}
-
-int FullscreenToolbarModeFromPrefs() {
-    int idx = SeqStrIndexIS(gToolbarModeNames, gSettings->fullscreen.toolbar);
-    if (idx < 0) {
-        // not set / invalid: derive from the legacy Fullscreen.ShowToolbar bool
-        idx = gSettings->fullscreen.showToolbar ? kToolbarShow : kToolbarHide;
-    }
-    return idx;
-}
-
-void SetFullscreenToolbarMode(int mode) {
-    Str name = SeqStrByIndex(gToolbarModeNames, mode);
-    if (len(name) == 0) {
-        name = StrL("hide");
-        mode = kToolbarHide;
-    }
-    str::ReplaceWithCopy(&gSettings->fullscreen.toolbar, name);
-    gSettings->fullscreen.showToolbar = (mode != kToolbarHide);
-}
-
-SeqStrings gToolbarPositionNames = "top\0bottom\0";
-
-int ToolbarPositionFromPrefs() {
-    int idx = SeqStrIndexIS(gToolbarPositionNames, gSettings->toolbarPosition);
-    if (idx < 0) {
-        idx = kToolbarTop;
-    }
-    return idx;
-}
-
-bool ToolbarAtBottom() {
-    return ToolbarPositionFromPrefs() == kToolbarBottom;
 }
 
 // Reverse the content-row HBox so the sidebar is on the right. RTL frames
@@ -1831,151 +1357,21 @@ void ControllerCallbackHandler::UpdateScrollbars(DisplayModel* dm, Size canvas) 
     }
 }
 
-static TempStr BuildZoomString(float zoomLevel) {
-    TempStr zoomLevelStr = ZoomLevelStr(zoomLevel);
-    Str zoomStr = Tr("Zoom");
-    return fmt("%s: %s", zoomStr, zoomLevelStr);
-}
-
-// Pages shown in the page-info tip: the current page, plus its facing partner
-// when that page is also visible (facing / book view with two images).
-static int CollectPageInfoPages(DocController* ctrl, int pageNo, int* pagesOut, int maxPages) {
-    int n = 0;
-    auto add = [&](int p) {
-        if (n >= maxPages || !ctrl->ValidPageNo(p)) {
-            return;
-        }
-        for (int i = 0; i < n; i++) {
-            if (pagesOut[i] == p) {
-                return;
-            }
-        }
-        pagesOut[n++] = p;
-    };
-    add(pageNo);
-    DisplayModel* dm = ctrl->AsFixed();
-    if (dm) {
-        DisplayMode mode = dm->GetDisplayMode();
-        if (IsFacing(mode) || IsBookView(mode)) {
-            if (dm->PageVisible(pageNo + 1)) {
-                add(pageNo + 1);
-            } else if (dm->PageVisible(pageNo - 1)) {
-                add(pageNo - 1);
-            }
-        }
-        // stable order for multi-page rows
-        if (n == 2 && pagesOut[0] > pagesOut[1]) {
-            int t = pagesOut[0];
-            pagesOut[0] = pagesOut[1];
-            pagesOut[1] = t;
-        }
-    }
-    return n;
-}
-
 // Light separator between page-info values: space + U+00B7 MIDDLE DOT + space.
-#define kPageInfoSep " \xC2\xB7 "
-
-static void UpdatePageInfoHelper(DocController* ctrl, NotificationWnd* wnd, int pageNo) {
-    if (!ctrl->ValidPageNo(pageNo)) {
-        pageNo = ctrl->CurrentPageNo();
-    }
-    int nPages = ctrl->PageCount();
-    TempStr pageInfo;
-    if (ShowChapterUi(ctrl)) {
-        Location loc = ctrl->LocationFromPageNo(pageNo);
-        int chapterPages = ctrl->ChapterPageCount(loc.chapter);
-        pageInfo = fmt("%s %d / %d, %s %d / %d", Tr("Chapter:"), loc.chapter, ctrl->ChapterCount(), Tr("Page:"),
-                       loc.page, chapterPages);
-    } else if (ctrl->HasPageLabels()) {
-        TempStr label = ctrl->GetPageLabeTemp(pageNo);
-        pageInfo = fmt("%s %s (%d / %d)", Tr("Page:"), label, pageNo, nPages);
-    } else {
-        pageInfo = fmt("%s %d / %d", Tr("Page:"), pageNo, nPages);
-    }
-    float zoomLevel = ctrl->GetZoomVirtual();
-    auto zoomStr = BuildZoomString(zoomLevel);
-    pageInfo = str::JoinTemp(pageInfo, StrL(kPageInfoSep), zoomStr);
-
-    // Image extras (issue #4456). Document file name is already on the tab.
-    DisplayModel* dm = ctrl->AsFixed();
-    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
-    if (engine && IsEngineImages(engine)) {
-        if (engine->kind == kindEngineImage) {
-            // Single image file (or multi-frame TIFF/GIF): resolution · size · non-default DPI
-            RectF box = engine->PageMediabox(pageNo);
-            int w = (int)lroundf(box.dx);
-            int h = (int)lroundf(box.dy);
-            i64 imgSize = -1;
-            EngineImagesGetPageFileInfo(engine, pageNo, nullptr, &imgSize);
-            TempStr detail{};
-            if (w > 0 && h > 0) {
-                detail = fmt("%d x %d", w, h);
-            }
-            if (imgSize >= 0) {
-                TempStr sizeStr = str::FormatSizeShortTemp(imgSize);
-                detail = detail ? fmt("%s%s%s", detail, StrL(kPageInfoSep), sizeStr) : sizeStr;
-            }
-            // fileDPI defaults to 96; only show when the image reports something else
-            float dpi = engine->GetFileDPI();
-            if (dpi > 0.5f && fabsf(dpi - 96.0f) > 0.5f) {
-                TempStr dpiStr = fmt("%.0f DPI", dpi);
-                detail = detail ? fmt("%s%s%s", detail, StrL(kPageInfoSep), dpiStr) : dpiStr;
-            }
-            if (detail) {
-                pageInfo = str::JoinTemp(pageInfo, StrL(kPageInfoSep), detail);
-            }
-        } else {
-            // Comic / image folder: per-page name · dimensions · bytes (both if facing)
-            int pages[2] = {};
-            int nShow = CollectPageInfoPages(ctrl, pageNo, pages, 2);
-            for (int i = 0; i < nShow; i++) {
-                int p = pages[i];
-                TempStr imgName{};
-                i64 imgSize = -1;
-                if (!EngineImagesGetPageFileInfo(engine, p, &imgName, &imgSize)) {
-                    continue;
-                }
-                RectF box = engine->PageMediabox(p);
-                int w = (int)lroundf(box.dx);
-                int h = (int)lroundf(box.dy);
-                TempStr detail{};
-                auto appendPart = [&](TempStr part) {
-                    if (len(part) == 0) {
-                        return;
-                    }
-                    detail = detail ? fmt("%s%s%s", detail, StrL(kPageInfoSep), part) : part;
-                };
-                appendPart(imgName);
-                if (w > 0 && h > 0) {
-                    appendPart(fmt("%d x %d", w, h));
-                }
-                if (imgSize >= 0) {
-                    appendPart(str::FormatSizeShortTemp(imgSize));
-                }
-                if (detail) {
-                    pageInfo = str::JoinTemp(pageInfo, StrL(kPageInfoSep), detail);
-                }
-            }
-        }
-    }
-
-    NotificationUpdateMessage(wnd, pageInfo);
-}
 
 // Show or refresh the page-info tip when the user wants it and a document is loaded.
 // CloseDocumentInCurrentTab / About / Favorites remove the notification; this restores it.
-static void ShowPageInfoIfWanted(MainWindow* win) {
+void ShowPageInfoIfWanted(MainWindow* win) {
     if (!win || !win->pageInfoWanted || !win->IsDocLoaded() || !win->ctrl) {
         return;
     }
-    NotificationWnd* wnd = GetNotificationForGroup(win->hwndCanvas, kNotifPageInfo);
+    NotificationWnd* wnd = GetNotificationForGroup(win, kNotifPageInfo);
     if (wnd) {
         UpdatePageInfoHelper(win->ctrl, wnd, -1);
         return;
     }
     NotificationCreateArgs args;
-    args.hwndParent = win->hwndCanvas;
+    args.win = win;
     args.timeoutMs = 0;
     args.msg = StrL("");
     args.groupId = kNotifPageInfo;
@@ -1985,26 +1381,13 @@ static void ShowPageInfoIfWanted(MainWindow* win) {
     UpdatePageInfoHelper(win->ctrl, wnd, -1);
 }
 
-static void TogglePageInfoHelper(MainWindow* win) {
-    if (!win) {
-        return;
-    }
-    if (win->pageInfoWanted) {
-        win->pageInfoWanted = false;
-        RemoveNotificationsForGroup(win->hwndCanvas, kNotifPageInfo);
-        return;
-    }
-    win->pageInfoWanted = true;
-    ShowPageInfoIfWanted(win);
-}
-
 void ControllerCallbackHandler::ZoomChanged(DocController* ctrl, float /*zoomVirtual*/) {
     // discard change requests from documents
     // loaded asynchronously in a background tab
     if (win->ctrl != ctrl) {
         return;
     }
-    NotificationWnd* wnd = GetNotificationForGroup(win->hwndCanvas, kNotifPageInfo);
+    NotificationWnd* wnd = GetNotificationForGroup(win, kNotifPageInfo);
     if (!wnd) {
         return;
     }
@@ -2069,7 +1452,7 @@ void ControllerCallbackHandler::PageNoChanged(DocController* ctrl, int pageNo) {
         }
     }
 
-    NotificationWnd* wnd = GetNotificationForGroup(win->hwndCanvas, kNotifPageInfo);
+    NotificationWnd* wnd = GetNotificationForGroup(win, kNotifPageInfo);
     if (!pageChanged) {
         if (wnd) {
             UpdatePageInfoHelper(win->ctrl, wnd, pageNo);
@@ -2101,18 +1484,6 @@ static NO_INLINE void VerifyController(DocController* ctrl, Str path) {
     ReportIf(true);
 }
 
-// Markdown and HTML both render in the WebView2 browser view via MarkdownModel,
-// each gated by its own UseFixedPageUI opt-out (fall back to MuPDF/ebook engines).
-static bool ShouldUseBrowserView(FileType kind) {
-    if (MarkdownModel::IsHtmlFileType(kind)) {
-        return !gSettings->htmlUI.useFixedPageUI;
-    }
-    if (MarkdownModel::IsSupportedFileType(kind)) {
-        return !gSettings->markdownUI.useFixedPageUI;
-    }
-    return false;
-}
-
 static DocController* CreateControllerForMarkdown(Str path, MainWindow* win) {
     FileType kind = GuessFileType(path, true);
     if (!MarkdownModel::IsSupportedFileType(kind)) {
@@ -2123,12 +1494,12 @@ static DocController* CreateControllerForMarkdown(Str path, MainWindow* win) {
         return nullptr;
     }
     DocController* ctrl = nullptr;
-    if (!mdModel->SetParentHwnd(win->hwndCanvas)) {
+    if (!mdModel->SetParentWindow(win, win->hwndCanvas)) {
         log(StrL("CreateControllerForMarkdown: WebView2 unavailable, falling back to MuPDF markdown view\n"));
         delete mdModel;
         return nullptr;
     }
-    mdModel->RemoveParentHwnd();
+    mdModel->RemoveParentWindow();
     ctrl = mdModel;
     ReportIf(!ctrl || !ctrl->AsMarkdown() || ctrl->AsFixed());
     VerifyController(ctrl, path);
@@ -2155,7 +1526,7 @@ static DocController* CreateControllerForChm(Str path, PasswordUI* pwdUI, MainWi
     // if the interactive backend (WebView2 / IE CLSID_WebBrowser) isn't
     // available, fall back on ChmEngine's fixed-page rendering
     DocController* ctrl = nullptr;
-    if (!chmModel->SetParentHwnd(win->hwndCanvas)) {
+    if (!chmModel->SetParentWindow(win, win->hwndCanvas)) {
         log(
             StrL("CreateControllerForChm: interactive CHM backend unavailable, falling back to ChmEngine fixed-page "
                  "view\n"));
@@ -2170,7 +1541,7 @@ static DocController* CreateControllerForChm(Str path, PasswordUI* pwdUI, MainWi
         ReportIf(!ctrl || !ctrl->AsFixed() || ctrl->AsChm());
     } else {
         // another ChmModel might still be active
-        chmModel->RemoveParentHwnd();
+        chmModel->RemoveParentWindow();
         ctrl = chmModel;
         ReportIf(!ctrl->AsChm() || ctrl->AsFixed());
     }
@@ -2351,63 +1722,7 @@ static void UpdateUiForCurrentTab(MainWindow* win) {
     }
 }
 
-static bool showTocByDefault(Str path, EngineBase* engine) {
-    if (gSettings->alwaysShowSidebar) {
-        return true;
-    }
-    if (!gSettings->showToc) {
-        return false;
-    }
-    // comic book bookmarks are usually just the list of files: only show
-    // ones from ComicInfo.xml (#6244)
-    FileType kind = GuessFileTypeFromName(path);
-    if (!IsEngineCbxSupportedFileType(kind)) {
-        return true;
-    }
-    return EngineCbxHasComicInfoToc(engine);
-}
-
-static bool IsEbookFileType(FileType ft) {
-    return ft == FileType::Epub || ft == FileType::Mobi || ft == FileType::Fb2 || ft == FileType::Fb2z ||
-           ft == FileType::PalmDoc || ft == FileType::HTML || ft == FileType::Txt || ft == FileType::Lit;
-}
-
 static float EbookLayoutAspectForView(MainWindow* win, Str path, DisplayMode displayMode, float zoom);
-
-// Per-type DefaultDisplayMode (empty = inherit the global DefaultDisplayMode).
-// Used only on first open when there is no remembered FileState (issue #2588).
-static DisplayMode DisplayModeForNewDocument(Str path, EngineBase* engine) {
-    DisplayMode dm = gSettings->defaultDisplayModeEnum;
-    Str modeStr;
-    Kind k = engine ? engine->kind : nullptr;
-    if (k == kindEngineComicBooks || k == kindEngineImageDir ||
-        (path && IsEngineCbxSupportedFileType(GuessFileTypeFromName(path, true)))) {
-        modeStr = gSettings->comicBookUI.defaultDisplayMode;
-    } else if (k == kindEngineEpub || k == kindEngineFb2 || k == kindEngineMobi || k == kindEnginePdb ||
-               k == kindEngineHtml || k == kindEngineTxt ||
-               (path && IsEbookFileType(GuessFileTypeFromName(path, true)))) {
-        modeStr = gSettings->eBookUI.defaultDisplayMode;
-    }
-    if (modeStr) {
-        return DisplayModeFromString(modeStr, dm);
-    }
-    return dm;
-}
-
-// First open only: ComicBookUI.DefaultZoom when set (issue #5946). Empty
-// keeps fit page, the historical comic default — not the global DefaultZoom.
-// Remembered FileState wins.
-static float ZoomForNewDocument(Str path, EngineBase* engine, float fallback) {
-    Kind k = engine ? engine->kind : nullptr;
-    if (k == kindEngineComicBooks || (path && IsEngineCbxSupportedFileType(GuessFileTypeFromName(path, true)))) {
-        float z = gSettings->comicBookUI.defaultZoomFloat;
-        if (z != 0) {
-            return z;
-        }
-        return kZoomFitPage;
-    }
-    return fallback;
-}
 
 // Research articles vs slides (issue #4055): portrait -> continuous + fit
 // width, landscape -> single page + fit page. First open only.
@@ -2694,9 +2009,9 @@ static void ReplaceDocumentInCurrentTab(LoadArgs* args, DocController* ctrl, Fil
             }
         } else if (IsBrowserDocController(win->ctrl)) {
             if (win->AsChm()) {
-                win->AsChm()->SetParentHwnd(win->hwndCanvas);
+                win->AsChm()->SetParentWindow(win, win->hwndCanvas);
             } else {
-                win->AsMarkdown()->SetParentHwnd(win->hwndCanvas);
+                win->AsMarkdown()->SetParentWindow(win, win->hwndCanvas);
             }
             FillCanvasThemeBackground(win->hwndCanvas);
             win->ctrl->SetDisplayMode(displayMode);
@@ -2804,15 +2119,6 @@ static void ReplaceDocumentInCurrentTab(LoadArgs* args, DocController* ctrl, Fil
         }
         if (args->showWin) {
             ShowWindow(win->hwndFrame, showType);
-            if (IsRunningOnWine()) {
-                Rect wr = HwndWindowRect(win->hwndFrame);
-                Rect cr = HwndClientRect(win->hwndFrame);
-                logf(
-                    "LoadDocument: showWin windowRect=(%d,%d,%d,%d) clientRect=(%d,%d,%d,%d) "
-                    "captionRect=(%d,%d,%d,%d)\n",
-                    wr.x, wr.y, wr.dx, wr.dy, cr.x, cr.y, cr.dx, cr.dy, win->captionRect.x, win->captionRect.y,
-                    win->captionRect.dx, win->captionRect.dy);
-            }
         }
 
         // Fire deferred SWP_FRAMECHANGED for custom caption so the
@@ -2879,7 +2185,7 @@ static void ReplaceDocumentInCurrentTab(LoadArgs* args, DocController* ctrl, Fil
         Str s = Tr("%s not supported");
         TempStr msg = fmt(s.s, unsupported);
         NotificationCreateArgs nargs;
-        nargs.hwndParent = win->hwndCanvas;
+        nargs.win = win;
         nargs.warning = true;
         nargs.timeoutMs = 16 * 1000; // auto-dismiss after 16 seconds
         nargs.groupId = kNotifPersistentWarning;
@@ -2901,7 +2207,7 @@ static void ReplaceDocumentInCurrentTab(LoadArgs* args, DocController* ctrl, Fil
     if (engineErr && engineErr->HasErrors()) {
         TempStr msg = fmt("[%s](CmdShowErrors) %s", Tr("Errors"), Tr("in document"));
         NotificationCreateArgs nargs;
-        nargs.hwndParent = win->hwndCanvas;
+        nargs.win = win;
         nargs.warning = true;
         nargs.timeoutMs = 16 * 1000; // auto-dismiss after 16 seconds
         nargs.groupId = kNotifDocErrors;
@@ -2923,7 +2229,7 @@ static void ReplaceDocumentInCurrentTab(LoadArgs* args, DocController* ctrl, Fil
         Str s = Tr("Font \"%s\" not found, using the default font");
         TempStr msg = fmt(s.s, missingFont);
         NotificationCreateArgs nargs;
-        nargs.hwndParent = win->hwndCanvas;
+        nargs.win = win;
         nargs.warning = true;
         nargs.timeoutMs = 16 * 1000; // auto-dismiss after 16 seconds
         nargs.groupId = kNotifPersistentWarning;
@@ -3089,7 +2395,6 @@ void ReloadDocument(MainWindow* win, bool autoRefresh, bool canAskForPassword) {
     DeleteFileState(fs);
 }
 
-constexpr int kSplitterDx = 5;
 constexpr int kSplitterDy = 4;
 
 // show / collapse a node of the frame's content row; a collapsed one takes no
@@ -3375,9 +2680,7 @@ static MainWindow* CreateMainWindow() {
         return nullptr;
     }
     // WM_NCCALCSIZE returning 0 disables DWM rounded corners; re-enable them.
-    if (!IsRunningOnWine()) {
-        SetWindowRoundedCorners(hwndFrame, true);
-    }
+    SetWindowRoundedCorners(hwndFrame, true);
 
     ReportIf(nullptr != FindMainWindowByHwnd(hwndFrame));
     MainWindow* win = new MainWindow(hwndFrame);
@@ -3540,14 +2843,6 @@ void ShowMainWindow(MainWindow* win, int windowState) {
     UpdateToolbarFindText(win);
     HwndEnsureOnScreen(win->hwndFrame);
 
-    if (IsRunningOnWine()) {
-        Rect wr = HwndWindowRect(win->hwndFrame);
-        Rect cr = HwndClientRect(win->hwndFrame);
-        logf("ShowMainWindow: windowRect=(%d,%d,%d,%d) clientRect=(%d,%d,%d,%d) captionRect=(%d,%d,%d,%d)\n", wr.x,
-             wr.y, wr.dx, wr.dy, cr.x, cr.y, cr.dx, cr.dy, win->captionRect.x, win->captionRect.y, win->captionRect.dx,
-             win->captionRect.dy);
-    }
-
     // the `true ||` is deliberate (always foreground); silence /analyze C6286/C6240
 #pragma warning(suppress : 6286 6240)
     if (len(gWindows) == 1 && (true || IsDebuggerPresent())) {
@@ -3568,11 +2863,6 @@ void ShowMainWindow(MainWindow* win, int windowState) {
     }
 }
 
-// Kind used so only one default-app bar is shown at a time
-static Kind kNotifDefaultApp = "defaultApp";
-// Cap how many extension links we put in the bar
-constexpr int kMaxDefaultAppLinks = 8;
-
 // On the home page: if we registered as Open With for extensions that no longer
 // open with us, show a bottom bar with per-extension fix links.
 static void MaybeShowDefaultAppNotification(MainWindow* win) {
@@ -3592,7 +2882,7 @@ static void MaybeShowDefaultAppNotification(MainWindow* win) {
     StrVec missing;
     CollectNonDefaultRegisteredExtensions(missing);
     if (len(missing) == 0) {
-        RemoveNotificationsForGroup(win->hwndCanvas, kNotifDefaultApp);
+        RemoveNotificationsForGroup(win, kNotifDefaultApp);
         return;
     }
 
@@ -3615,7 +2905,7 @@ static void MaybeShowDefaultAppNotification(MainWindow* win) {
     sb.Append(StrL(". Click a link to fix."));
 
     NotificationCreateArgs args;
-    args.hwndParent = win->hwndCanvas;
+    args.win = win;
     args.msg = ToStrTemp(sb);
     args.timeoutMs = kNotifNoTimeout;
     args.groupId = kNotifDefaultApp;
@@ -3703,38 +2993,22 @@ void UpdateAfterThemeChange() {
     UpdateDocumentColors();
 }
 
-static void RenameFileInHistory(Str oldPath, Str newPath) {
-    logf("RenameFileInHistory: oldPath: '%s', newPath: '%s'\n", oldPath, newPath);
-    if (path::IsSame(oldPath, newPath)) {
-        return;
-    }
-    FileState* fs = FileHistoryFindByPath(newPath);
-    bool oldIsPinned = false;
-    int oldOpenCount = 0;
-    if (fs) {
-        oldIsPinned = fs->isPinned;
-        oldOpenCount = fs->openCount;
-        FileHistoryRemove(fs);
-        // TODO: merge favorites as well?
-        if (len(*fs->favorites) > 0) {
-            UpdateFavoritesTreeForAllWindows();
+void ReloadSettingsUpdateWindows(bool showToolbarBefore) {
+    for (MainWindow* win : gWindows) {
+        if (gSettings->showToolbar != showToolbarBefore) {
+            ShowOrHideToolbar(win);
         }
-        DeleteFileState(fs);
-    }
-    fs = FileHistoryFindByPath(oldPath);
-    if (fs) {
-        SetFileStatePath(fs, newPath);
-        // merge Frequently Read data, so that a file
-        // doesn't accidentally vanish from there
-        fs->isPinned = fs->isPinned || oldIsPinned;
-        fs->openCount += oldOpenCount;
-        // the thumbnail is recreated by LoadDocument
-        FreePixmap(fs->thumbnail);
-        fs->thumbnail = nullptr;
+        UpdateFavoritesTree(win);
+        UpdateControlsColors(win);
+        if (DisplayModel* dm = win->AsFixed()) {
+            int dpi = win->frameDpi > 0 ? win->frameDpi : DpiGetForHwnd(win->hwndFrame);
+            dm->SetUiDpi(dpi);
+        }
+        ScheduleUiUpdate(win, kUiForceRelayout | kUiToolbarDirty);
     }
 }
 
-static void ReloadTab(WindowTab* tab) {
+void ReloadTab(WindowTab* tab) {
     // tab might have been closed, so first ensure it's still valid
     // https://github.com/sumatrapdfreader/sumatrapdf/issues/1958
     MainWindow* win = FindMainWindowByTab(tab);
@@ -3742,63 +3016,10 @@ static void ReloadTab(WindowTab* tab) {
         return;
     }
     tab->reloadOnFocus = true;
-    if (tab == win->CurrentTab()) {
+    if (IsCurrentTab(win, tab)) {
         // delay the reload slightly, in case we get another request immediately after this one
         SetTimer(win->hwndCanvas, kAutoReloadTimerID, kAutoReloadDelayInMs, nullptr);
     }
-}
-
-static void ScheduleReloadTab(WindowTab* tab) {
-    auto fn = MkFunc0<WindowTab>(ReloadTab, tab);
-    uitask::Post(fn, "ReloadTab");
-}
-
-static void AutoReloadResetFileState(WindowTab* tab) {
-    tab->autoReloadSize = -1;
-    tab->autoReloadModTime = {};
-    tab->autoReloadStartMs = 0;
-}
-
-// Called from the AUTO_RELOAD_TIMER tick. Returns true if the file changed
-// since the previous tick, i.e. whoever is writing it isn't done: the caller
-// then re-arms the timer instead of reloading a half-written document.
-//
-// The first tick after a notification always reports "changing" (there's no
-// previous state to compare against), so a reload happens one interval later
-// than it used to. That's deliberate: a LaTeX run used to produce two reloads,
-// one of a truncated file ("document has no pages") and one of the finished
-// file.
-//
-// Gives up after kAutoReloadMaxWaitMs so a file that is appended to
-// continuously (a log being tailed) still reloads.
-//
-// Note: file::GetSize()/GetModificationTime() go through the 1-hour network
-// attribute cache, so on a network drive both values look stable right away
-// and we reload immediately, as before.
-bool AutoReloadFileStillChanging(WindowTab* tab) {
-    if (!tab || len(tab->filePath) == 0) {
-        return false;
-    }
-    u64 now = GetTickCount64();
-    if (tab->autoReloadStartMs == 0) {
-        tab->autoReloadStartMs = now;
-    } else if (now - tab->autoReloadStartMs > kAutoReloadMaxWaitMs) {
-        logf("AutoReloadFileStillChanging: '%s' still changing after %d ms, reloading anyway\n", tab->filePath,
-             (int)(now - tab->autoReloadStartMs));
-        AutoReloadResetFileState(tab);
-        return false;
-    }
-
-    i64 size = file::GetSize(tab->filePath);
-    FILETIME modTime = file::GetModificationTime(tab->filePath);
-    bool changed = (size != tab->autoReloadSize) || !FileTimeEq(modTime, tab->autoReloadModTime);
-    tab->autoReloadSize = size;
-    tab->autoReloadModTime = modTime;
-    if (changed) {
-        return true;
-    }
-    AutoReloadResetFileState(tab);
-    return false;
 }
 
 // return true if adjustd path
@@ -3834,9 +3055,7 @@ static void LoadDocumentMarkNotExist(MainWindow* win, Str path, bool noSavePrefs
     // display the notification ASAP (serializing settings can introduce a notable delay)
     win->RedrawAll(true);
 
-    if (!FileHistoryMarkFileInexistent(path)) {
-        return;
-    }
+    FileHistoryDemote(path);
     // TODO: handle this better. see https://github.com/sumatrapdfreader/sumatrapdf/issues/1674
     if (!noSavePrefs) {
         ScheduleSaveSettings();
@@ -3925,7 +3144,7 @@ static void SetTabLoadError(WindowTab* tab, Str path) {
 
 static void ShowFileNotFound(MainWindow* win, Str path, bool noSavePrefs, bool showWin) {
     NotificationCreateArgs nargs;
-    nargs.hwndParent = win->hwndCanvas;
+    nargs.win = win;
     nargs.warning = true;
     nargs.msg = fmt(Tr("File %s not found").s, path);
     nargs.plainText = true; // `path` is not ours, don't parse it as tip markup
@@ -3974,7 +3193,7 @@ static void ShowLoadErrorInTab(MainWindow* win, LoadArgs* args, Str path) {
     if (!isNewTab) {
         SetTabLoadError(tab, path);
     }
-    if (tab == win->CurrentTab()) {
+    if (IsCurrentTab(win, tab)) {
         // a failed load into a background tab must not clobber win->ctrl,
         // which mirrors the current tab's (possibly loaded) document
         win->ctrl = nullptr;
@@ -3990,7 +3209,7 @@ static void ShowLoadErrorInTab(MainWindow* win, LoadArgs* args, Str path) {
 void ShowErrorLoadingNotification(MainWindow* win, Str path, bool noSavePrefs, bool showWin) {
     // Same translation as Canvas OnPaintError ("Error loading %s").
     NotificationCreateArgs nargs;
-    nargs.hwndParent = win->hwndCanvas;
+    nargs.win = win;
     nargs.msg = fmt("%s: %s", fmt(Tr("Error loading %s").s, path), FileLoadErrorReasonTemp(path));
     // `path` is attacker-controlled, so the message must not be parsed as tip
     // markup: a "[x](CmdExec ...)" in it would become a clickable command link
@@ -4034,8 +3253,8 @@ MainWindow* LoadDocumentFinish(LoadArgs* args) {
     win->DeleteToolTip();
 
     if (targetTab) {
-        ReportIf(targetTab != win->CurrentTab());
-        if (targetTab != win->CurrentTab()) {
+        ReportIf(!IsCurrentTab(win, targetTab));
+        if (!IsCurrentTab(win, targetTab)) {
             DeleteOrphanedController(win, args->ctrl);
             return nullptr;
         }
@@ -4269,7 +3488,7 @@ static void CALLBACK LoadingMessageTimerProc(HWND /*hwnd*/, UINT /*msg*/, UINT_P
                 continue;
             }
             hasLoadingTabs = true;
-            if (tab == win->CurrentTab() && tab->loadStartedAt != 0 && now - tab->loadStartedAt >= 1000) {
+            if (IsCurrentTab(win, tab) && tab->loadStartedAt != 0 && now - tab->loadStartedAt >= 1000) {
                 HwndInvalidate(win->hwndCanvas);
             }
         }
@@ -4344,7 +3563,7 @@ static void DispatchQueuedDocumentLoads() {
         int idx = 0;
         for (int i = 0; i < len(gLoadQueue); i++) {
             LoadArgs* args = gLoadQueue[i]->args;
-            if (IsLoadTargetValid(args) && args->targetTab && args->targetTab == args->win->CurrentTab()) {
+            if (IsLoadTargetValid(args) && IsCurrentTab(args->win, args->targetTab)) {
                 idx = i;
                 break;
             }
@@ -4441,7 +3660,7 @@ static void LoadDocumentAsyncFinish(LoadDocumentAsyncData* d) {
         args->onFinished.Call(false);
         return;
     }
-    if (args->targetTab && args->targetTab != win->CurrentTab()) {
+    if (args->targetTab && !IsCurrentTab(win, args->targetTab)) {
         WindowTab* tab = args->targetTab;
         tab->loadState = WindowTab::LoadState::LoadedPending;
         // a background reload of a previously failed tab succeeded
@@ -4476,7 +3695,7 @@ static void UpdateCopyProgressUI(CopyProgressUITask* task) {
     ReportIf(tab->win != win);
     tab->loadCopyBytesCopied = task->bytesCopied;
     tab->loadCopyBytesTotal = task->bytesTotal;
-    if (tab == win->CurrentTab()) {
+    if (IsCurrentTab(win, tab)) {
         HwndInvalidate(tab->win->hwndCanvas);
     }
 }
@@ -4676,7 +3895,7 @@ void StartLoadDocument(LoadArgs* argsIn) {
     if (argsIn->targetTab) {
         argsIn->targetTab->skipHistory = argsIn->skipHistory;
         argsIn->targetTab->loadState = WindowTab::LoadState::Loading;
-        if (argsIn->targetTab == win->CurrentTab()) {
+        if (IsCurrentTab(win, argsIn->targetTab)) {
             HwndInvalidate(win->hwndCanvas);
         }
     } else if (SettingsUseTabs() && !argsIn->forceReuse) {
@@ -4775,7 +3994,7 @@ void StartLoadDocument(LoadArgs* argsIn) {
             // is not current, defer attach the same way LoadDocumentAsyncFinish
             // does — LoadModelIntoTab will call LoadDocumentFinish later.
             // Without this we ReportIf and drop the controller (crash 8c4d3ae8).
-            if (args->targetTab && args->targetTab != win->CurrentTab()) {
+            if (args->targetTab && !IsCurrentTab(win, args->targetTab)) {
                 WindowTab* tab = args->targetTab;
                 tab->loadState = WindowTab::LoadState::LoadedPending;
                 tab->pendingLoadArgs = args;
@@ -4960,6 +4179,12 @@ MainWindow* LoadDocument(LoadArgs* args) {
     return result;
 }
 
+// as in ng: open path in win (or a new window when win is null) with default arguments
+MainWindow* LoadDocument(MainWindow* win, Str path) {
+    LoadArgs args(path, win);
+    return LoadDocument(&args);
+}
+
 // Loads document data into the MainWindow.
 void LoadModelIntoTab(WindowTab* tab) {
     if (!tab) {
@@ -4985,7 +4210,7 @@ void LoadModelIntoTab(WindowTab* tab) {
     if (gSettings->lazyLoading && win->ctrl && !tab->ctrl && !tab->IsNonDocumentTab() &&
         tab->loadState == WindowTab::LoadState::None) {
         NotificationCreateArgs args;
-        args.hwndParent = win->hwndCanvas;
+        args.win = win;
         args.msg = fmt(Tr("Loading...").s);
         args.warning = true;
         ShowNotification(args);
@@ -5086,9 +4311,9 @@ void LoadModelIntoTab(WindowTab* tab) {
     // showing it earlier (at the previous tab's canvas geometry) made it
     // visibly jump when e.g. the Home tab has no toolbar or ToC sidebar
     if (win->AsChm()) {
-        win->AsChm()->SetParentHwnd(win->hwndCanvas);
+        win->AsChm()->SetParentWindow(win, win->hwndCanvas);
     } else if (win->AsMarkdown()) {
-        win->AsMarkdown()->SetParentHwnd(win->hwndCanvas);
+        win->AsMarkdown()->SetParentWindow(win, win->hwndCanvas);
     }
 
     DisplayModel* dm = win->AsFixed();
@@ -5157,44 +4382,6 @@ void LoadModelIntoTab(WindowTab* tab) {
     }
 }
 
-enum class MeasurementUnit {
-    pt,
-    mm,
-    in
-};
-
-static TempStr FormatCursorPositionTemp(EngineBase* engine, PointF pt, MeasurementUnit unit) {
-    pt.x = std::max(pt.x, 0.0f);
-    pt.y = std::max(pt.y, 0.0f);
-    pt.x /= engine->GetFileDPI();
-    pt.y /= engine->GetFileDPI();
-
-    // for MeasurementUnit::in
-    float factor = 1;
-    Str unitName = StrL("in");
-    if (unit == MeasurementUnit::pt) {
-        factor = 72;
-        unitName = StrL("pt");
-    } else if (unit == MeasurementUnit::mm) {
-        factor = 25.4f;
-        unitName = StrL("mm");
-    }
-
-    TempStr xPos = str::FormatFloatWithThousandSepTemp((double)pt.x * (double)factor);
-    TempStr yPos = str::FormatFloatWithThousandSepTemp((double)pt.y * (double)factor);
-    if (unit != MeasurementUnit::in) {
-        // use similar precision for all units
-        if (xPos.len >= 2 && str::IsDigit(xPos.s[xPos.len - 2])) {
-            xPos.len--;
-        }
-        if (yPos.len >= 2 && str::IsDigit(yPos.s[yPos.len - 2])) {
-            yPos.len--;
-        }
-    }
-    return fmt("%s x %s %s", xPos, yPos, unitName);
-}
-
-static auto cursorPosUnit = MeasurementUnit::pt;
 void UpdateCursorPositionHelper(MainWindow* win, Point pos, NotificationWnd* wnd) {
     ReportIf(!win->AsFixed());
     EngineBase* engine = win->AsFixed()->GetEngine();
@@ -5275,7 +4462,7 @@ void RerenderTabPage(WindowTab* tab, int pageNo) {
     }
     gRenderCache->Invalidate(dm, pageNo, dm->GetEngine()->PageMediabox(pageNo));
     MainWindow* win = tab->win;
-    if (win->CurrentTab() != tab) {
+    if (!IsCurrentTab(win, tab)) {
         return;
     }
     if (win->pageThumbs && win->pageThumbs->active) {
@@ -5450,9 +4637,9 @@ static void CloseDocumentInCurrentTab(MainWindow* win, bool keepUIEnabled, bool 
         FillCanvasThemeBackground(win->hwndCanvas);
     }
     if (win->AsChm()) {
-        win->AsChm()->RemoveParentHwnd();
+        win->AsChm()->RemoveParentWindow();
     } else if (win->AsMarkdown()) {
-        win->AsMarkdown()->RemoveParentHwnd();
+        win->AsMarkdown()->RemoveParentWindow();
     }
     ClearTocBox(win);
     ClearSidebarThumbnails(win);
@@ -5496,7 +4683,7 @@ static void CloseDocumentInCurrentTab(MainWindow* win, bool keepUIEnabled, bool 
         ResetReadAloudStateForTab(currentTab);
         if (hadReading && win->hwndCanvas) {
             NotificationCreateArgs args;
-            args.hwndParent = win->hwndCanvas;
+            args.win = win;
             args.msg = Tr("Reading stopped");
             args.timeoutMs = 2000;
             ShowNotification(args);
@@ -5517,10 +4704,10 @@ static void CloseDocumentInCurrentTab(MainWindow* win, bool keepUIEnabled, bool 
     } else {
         win->currentTabTemp = nullptr;
     }
-    RemoveNotificationsForGroup(win->hwndCanvas, kNotifActionResponse);
-    RemoveNotificationsForGroup(win->hwndCanvas, kNotifPageInfo);
-    RemoveNotificationsForGroup(win->hwndCanvas, kNotifCursorPos);
-    RemoveNotificationsForGroup(win->hwndCanvas, kNotifZoomOrView);
+    RemoveNotificationsForGroup(win, kNotifActionResponse);
+    RemoveNotificationsForGroup(win, kNotifPageInfo);
+    RemoveNotificationsForGroup(win, kNotifCursorPos);
+    RemoveNotificationsForGroup(win, kNotifZoomOrView);
 
     // Tab/document change aborts any in-progress drag/select. Without releasing
     // capture, LoadModelIntoTab left the canvas capturing the mouse after the
@@ -5608,74 +4795,16 @@ static void ShowSaveAnnotationError(ShowErrorData* d, Str err) {
     ShowSavedAnnotationsFailedNotification(tab->win->hwndCanvas, path, err);
 }
 
-// Identity of the selected annotation for restore after save/reload (Annotation*
-// pointers die with the engine).
-struct SavedAnnotSel {
-    bool valid = false;
-    int pageNo = -1;
-    AnnotationType type = AnnotationType::Unknown;
-    RectF bounds;
-};
-
-static SavedAnnotSel CaptureSelectedAnnotation(WindowTab* tab) {
-    SavedAnnotSel key;
-    Annotation* a = tab ? tab->selectedAnnotation : nullptr;
-    if (!a) {
-        return key;
-    }
-    key.valid = true;
-    key.pageNo = a->pageNo;
-    key.type = a->type;
-    key.bounds = a->bounds;
-    return key;
-}
-
-static Annotation* FindMatchingAnnotation(WindowTab* tab, const SavedAnnotSel& key) {
-    if (!key.valid || !tab) {
-        return nullptr;
-    }
-    EngineBase* engine = tab->GetEngine();
-    if (!engine) {
-        return nullptr;
-    }
-    Vec<Annotation*> annots;
-    EngineMupdfGetAnnotations(engine, annots);
-    for (Annotation* a : annots) {
-        if (a->pageNo == key.pageNo && a->type == key.type && a->bounds == key.bounds) {
-            return a;
-        }
-    }
-    return nullptr;
-}
-
-// Returns the current engine only after proving that tab still belongs to a live window.
-// Modal UI can dispatch messages that close the tab or replace its engine.
-static EngineBase* GetLiveTabEngine(WindowTab* tab, MainWindow** winOut) {
-    if (winOut) {
-        *winOut = nullptr;
-    }
-    MainWindow* win = FindMainWindowByTab(tab);
-    if (!win) {
-        return nullptr;
-    }
-    DisplayModel* dm = tab->AsFixed();
-    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
-    if (engine && winOut) {
-        *winOut = win;
-    }
-    return engine;
-}
-
 bool SaveAnnotationsToExistingFile(WindowTab* tab) {
     MainWindow* win = nullptr;
     EngineBase* engine = GetLiveTabEngine(tab, &win);
     if (!engine) {
         return false;
     }
-    if (win->CurrentTab() != tab) {
+    if (!IsCurrentTab(win, tab)) {
         SelectTabInWindow(tab);
         engine = GetLiveTabEngine(tab, &win);
-        if (!engine || win->CurrentTab() != tab) {
+        if (!engine || !IsCurrentTab(win, tab)) {
             return false;
         }
     }
@@ -5717,10 +4846,10 @@ bool SaveAnnotationsToMaybeNewPdfFile(WindowTab* tab) {
     if (!engine) {
         return false;
     }
-    if (win->CurrentTab() != tab) {
+    if (!IsCurrentTab(win, tab)) {
         SelectTabInWindow(tab);
         engine = GetLiveTabEngine(tab, &win);
-        if (!engine || win->CurrentTab() != tab) {
+        if (!engine || !IsCurrentTab(win, tab)) {
             return false;
         }
     }
@@ -5767,7 +4896,7 @@ bool SaveAnnotationsToMaybeNewPdfFile(WindowTab* tab) {
     // The file dialog pumps messages. The original tab might have been closed,
     // switched away from, or reloaded with a different engine while it was open.
     engine = GetLiveTabEngine(tab, &win);
-    if (!engine || engine != engineBeforeDialog || win->CurrentTab() != tab ||
+    if (!engine || engine != engineBeforeDialog || !IsCurrentTab(win, tab) ||
         !str::Eq(engine->FilePath(), srcFileName)) {
         return false;
     }
@@ -6051,13 +5180,6 @@ bool ResolveUnsavedChanges(WindowTab* tab, UnsavedChangesAction action, Str newP
     return false;
 }
 
-// After a message pump, a nested DDE CloseAllTabs / CloseWindow may have
-// already removed this tab. GetTabIdx does not dereference `tab`, so a freed
-// pointer just comes back as -1. Do not delete it again.
-static bool TabStillInWindow(MainWindow* win, WindowTab* tab) {
-    return IsMainWindowValid(win) && !win->isBeingClosed && win->GetTabIdx(tab) >= 0;
-}
-
 void CloseTab(WindowTab* tab, bool quitIfLast) {
     if (!tab) {
         return;
@@ -6078,7 +5200,7 @@ void CloseTab(WindowTab* tab, bool quitIfLast) {
     // Tab switches already call HideFindBar via SaveCurrentWindowTab.
     // Same for the floating selection/highlight toolbar: it holds a tab*
     // and would otherwise stay on screen after the tab is gone.
-    if (tab == win->CurrentTab()) {
+    if (IsCurrentTab(win, tab)) {
         HideFindBar(win);
         HideSelectionToolbar(win);
         HideAnnotationHoverOverlay(win);
@@ -6090,9 +5212,9 @@ void CloseTab(WindowTab* tab, bool quitIfLast) {
             return;
         }
     }
-    RemoveNotificationsForGroup(win->hwndCanvas, kNotifPageInfo);
-    RemoveNotificationsForGroup(win->hwndCanvas, kNotifAnnotation);
-    RemoveNotificationsForGroup(win->hwndCanvas, kNotifZoomOrView);
+    RemoveNotificationsForGroup(win, kNotifPageInfo);
+    RemoveNotificationsForGroup(win, kNotifAnnotation);
+    RemoveNotificationsForGroup(win, kNotifZoomOrView);
     RemoveNotificationsForTab(tab);
 
     RememberRecentlyClosedDocument(tab->filePath);
@@ -6343,70 +5465,6 @@ void CloseWindow(MainWindow* win, bool quitIfLast, bool forceClose) {
     }
 }
 
-// returns false if no filter has been appended
-static bool AppendFileFilterForDoc(DocController* ctrl, str::Builder& fileFilter) {
-    Kind type = nullptr;
-    if (ctrl->AsFixed()) {
-        type = ctrl->AsFixed()->engineType;
-    } else if (ctrl->AsChm()) {
-        type = kindEngineChm;
-    }
-    // markdown has no engine kind; it falls through to the default filter below.
-    // Prefer GetDefaultFileExt() where it distinguishes formats (xps, epub, …);
-    // fall back to engine kind for the rest.
-    auto ext = ctrl->GetDefaultFileExt();
-    if (str::EqI(ext, StrL(".xps"))) {
-        fileFilter.Append(Tr("XPS documents"));
-    } else if (str::EqI(ext, StrL(".docx"))) {
-        fileFilter.Append(Tr("Word documents"));
-    } else if (str::EqI(ext, StrL(".xlsx"))) {
-        fileFilter.Append(Tr("Excel workbooks"));
-    } else if (str::EqI(ext, StrL(".pptx"))) {
-        fileFilter.Append(Tr("PowerPoint presentations"));
-    } else if (str::EqI(ext, StrL(".epub"))) { // NOLINT(bugprone-branch-clone): see kindEngineEpub below
-        // .epub can be handled by kindEngineMupdf
-        fileFilter.Append(Tr("EPUB ebooks"));
-    } else if (type == kindEngineDjVu) {
-        fileFilter.Append(Tr("DjVu documents"));
-    } else if (type == kindEngineComicBooks) {
-        fileFilter.Append(Tr("Comic books"));
-    } else if (type == kindEngineImage) {
-        Str imgDefExt = ctrl->GetDefaultFileExt();
-        if (len(imgDefExt) > 0 && imgDefExt.s[0] == '.') {
-            imgDefExt = Str(imgDefExt.s + 1, imgDefExt.len - 1);
-        }
-        fileFilter.Append(fmt(Tr("Image files (*.%s)").s, imgDefExt));
-    } else if (type == kindEngineImageDir) {
-        return false; // only show "All files"
-    } else if (type == kindEnginePostScript || type == kindEngineDvi) {
-        // also offer the PDF the converter produced (SaveFileAs writes it)
-        if (type == kindEngineDvi) {
-            fileFilter.Append(Tr("DVI documents"));
-        } else {
-            fileFilter.Append(Tr("PostScript documents"));
-        }
-        fileFilter.Append(fmt("\1*%s\1", ctrl->GetDefaultFileExt()));
-        fileFilter.Append(Tr("PDF documents"));
-        fileFilter.Append(StrL("\1*.pdf\1"));
-        return false;
-    } else if (type == kindEngineChm) {
-        fileFilter.Append(Tr("CHM documents"));
-    } else if (type == kindEngineEpub) {
-        fileFilter.Append(Tr("EPUB ebooks"));
-    } else if (type == kindEngineMobi) {
-        fileFilter.Append(Tr("Mobi documents"));
-    } else if (type == kindEngineFb2) {
-        fileFilter.Append(Tr("FictionBook documents"));
-    } else if (type == kindEnginePdb) {
-        fileFilter.Append(Tr("PalmDoc documents"));
-    } else if (type == kindEngineTxt) {
-        fileFilter.Append(Tr("Text documents"));
-    } else {
-        fileFilter.Append(Tr("PDF documents"));
-    }
-    return true;
-}
-
 static bool SaveDocAs(MainWindow* win, Str dstPath);
 
 static void SaveCurrentFileAs(MainWindow* win) {
@@ -6429,7 +5487,7 @@ static void SaveCurrentFileAs(MainWindow* win) {
     }
 
     if (len(srcFileName) == 0) {
-        ShowTemporaryNotification(win->hwndCanvas, Tr("File path not available"), kNotif5SecsTimeOut);
+        ShowTemporaryNotification(win, Tr("File path not available"), kNotif5SecsTimeOut);
         return;
     }
 
@@ -6532,7 +5590,7 @@ static bool SaveDocAs(MainWindow* win, Str dstPath) {
         }
     }
     if (len(srcFileName) == 0) {
-        ShowTemporaryNotification(win->hwndCanvas, Tr("File path not available"), kNotif5SecsTimeOut);
+        ShowTemporaryNotification(win, Tr("File path not available"), kNotif5SecsTimeOut);
         return false;
     }
     DisplayModel* dm = win->AsFixed();
@@ -6607,11 +5665,6 @@ TempStr SaveFileAsResultTemp(Str dstPath, int* exitCodeOut) {
     }
     *exitCodeOut = 0;
     return StrL("OK");
-}
-
-// FilePicker: empty/os = Windows dialog; sumatrapdf = Navigate Files in Folder.
-static bool FilePickerIsSumatraPDF() {
-    return gSettings && str::EqI(gSettings->filePicker, StrL("sumatrapdf"));
 }
 
 // Show in folder: Explorer (and select the file) unless File / Open / Use SumatraPDF
@@ -6708,18 +5761,6 @@ WindowTab* FindTabByFilePath(Str path) {
     return nullptr;
 }
 
-// move to the recycle bin and forget it in the file history / thumbnail cache
-void DeleteFileFromDiskAndHistory(Str path) {
-    file::DeleteFileToTrash(path);
-    DeleteThumbnailForFile(path);
-    FileState* fs = FileHistoryFindByPath(path);
-    if (fs) {
-        FileHistoryRemove(fs);
-        DeleteFileState(fs);
-    }
-    ScheduleSaveSettings();
-}
-
 static void DeleteCurrentFile(MainWindow* win) {
     if (!CanAccessDisk()) {
         return;
@@ -6743,6 +5784,8 @@ static void DeleteCurrentFile(MainWindow* win) {
         win->RedrawAll(true);
     }
 }
+
+static bool RenameCurrentFileTo(MainWindow* win, Str dstFilePath);
 
 static void RenameCurrentFile(MainWindow* win) {
     if (!CanAccessDisk()) {
@@ -6805,11 +5848,17 @@ static void RenameCurrentFile(MainWindow* win) {
     if (!ok) {
         return;
     }
-    TempStr dstFilePath = ToUtf8Temp(dstFilePathW);
+    RenameCurrentFileTo(win, ToUtf8Temp(dstFilePathW));
+}
+
+// the work half of Rename File: moves the open document to dstFilePath and
+// reloads it from there. false when the move failed
+static bool RenameCurrentFileTo(MainWindow* win, Str dstFilePath) {
+    TempStr srcPath = str::DupTemp(win->ctrl->GetFilePath());
     TempStr dstPathNormalized = path::NormalizeTemp(dstFilePath);
     TempStr srcPathNormalized = path::NormalizeTemp(srcPath);
     if (path::IsSame(srcPathNormalized, dstPathNormalized)) {
-        return;
+        return true;
     }
 
     UpdateTabFileDisplayStateForTab(win->CurrentTab());
@@ -6817,19 +5866,19 @@ static void RenameCurrentFile(MainWindow* win) {
     HwndSetFocus(win->hwndFrame);
 
     DWORD flags = MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING;
-    BOOL moveOk = MoveFileExW(srcPathW.s, dstFilePathW, flags);
+    BOOL moveOk = MoveFileExW(CWStrTemp(srcPath), CWStrTemp(dstFilePath), flags);
     if (!moveOk) {
         LogLastError();
         LoadArgs args(srcPath, win);
         args.forceReuse = true;
         LoadDocument(&args);
         NotificationCreateArgs nargs;
-        nargs.hwndParent = win->hwndCanvas;
+        nargs.win = win;
         nargs.msg = Tr("Failed to rename the file!");
         nargs.warning = true;
         nargs.timeoutMs = 0;
         ShowNotification(nargs);
-        return;
+        return false;
     }
     RenameFileInHistory(srcPath, dstPathNormalized);
 
@@ -6851,6 +5900,20 @@ static void RenameCurrentFile(MainWindow* win) {
         // tabs-in-titlebar draws into the frame non-client area
         RedrawWindow(win->hwndFrame, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
     }
+    return true;
+}
+
+// -dbg-control TestRenameFile: Rename File without its dialog
+TempStr RenameFileResultTemp(Str dstPath, int* exitCodeOut) {
+    *exitCodeOut = 1;
+    if (len(gWindows) == 0 || !gWindows[0] || !gWindows[0]->IsDocLoaded()) {
+        return StrL("NOTREADY no-document");
+    }
+    if (!RenameCurrentFileTo(gWindows[0], dstPath)) {
+        return StrL("FAIL rename");
+    }
+    *exitCodeOut = 0;
+    return StrL("OK");
 }
 
 static void CreateLnkShortcut(MainWindow* win) {
@@ -7023,80 +6086,6 @@ static void DuplicateInNewTab(MainWindow* win) {
     }
 }
 
-// File-type filters for IFileOpenDialog. Heap-owned wide strings stay alive
-// for the whole Show() call (modal dialog pumps messages / temp arena).
-struct OpenFileFilterList {
-    Vec<WStr> names;
-    Vec<WStr> patterns;
-    Vec<COMDLG_FILTERSPEC> specs;
-
-    ~OpenFileFilterList() {
-        for (int i = 0; i < len(names); i++) {
-            wstr::Free(names[i]);
-        }
-        for (int i = 0; i < len(patterns); i++) {
-            wstr::Free(patterns[i]);
-        }
-    }
-
-    void Add(Str name, Str pattern) {
-        WStr nw = ToWStr(name);
-        WStr pw = ToWStr(pattern);
-        VecAppend(names, nw);
-        VecAppend(patterns, pw);
-        COMDLG_FILTERSPEC s{};
-        s.pszName = nw.s;
-        s.pszSpec = pw.s;
-        VecAppend(specs, s);
-    }
-};
-
-static void BuildOpenFileFilters(OpenFileFilterList& out) {
-    const struct {
-        Str name;
-        Str filter;
-        bool available;
-    } fileFormats[] = {
-        {Tr("PDF documents"), StrL("*.pdf;*.p7m"), true},
-        {Tr("XPS documents"), StrL("*.xps;*.oxps"), true},
-        {Tr("DjVu documents"), StrL("*.djvu"), true},
-        {Tr("PostScript documents"), StrL("*.ps;*.eps"), IsEnginePsAvailable()},
-        {Tr("DVI documents"), StrL("*.dvi"), IsEngineDviAvailable()},
-        {Tr("Comic books"), StrL("*.cbz;*.cbr;*.cb7;*.cbt"), true},
-        {Tr("CHM documents"), StrL("*.chm"), true},
-        {Tr("SVG documents"), StrL("*.svg"), true},
-        {Tr("EPUB ebooks"), StrL("*.epub"), true},
-        {Tr("Microsoft Reader ebooks"), StrL("*.lit"), true},
-        {Tr("Markdown documents"), StrL("*.md;*.markdown"), true},
-        {Tr("Mobi documents"), StrL("*.mobi"), true},
-        {Tr("FictionBook documents"), StrL("*.fb2;*.fb2z;*.zfb2;*.fb2.zip"), true},
-        {Tr("PalmDoc documents"), StrL("*.pdb;*.prc"), true},
-        {Tr("Images"),
-         StrL("*.bmp;*.dib;*.gif;*.jpg;*.jpeg;*.jfif;*.jxr;*.hdp;*.wdp;*.png;*.tga;*.tif;*.tiff;*.webp;*.heic;*.heif;"
-              "*.avif;*.jxl;*.jp2;*.j2k;*.jpx;*.jpf;*.jpm;*.j2c;*.ico"),
-         true},
-        {Tr("Text documents"), StrL("*.txt;*.log;*.nfo;file_id.diz;read.me;*.tcr"), true},
-    };
-
-    str::Builder allPat;
-    for (const auto& ff : fileFormats) {
-        if (!ff.available) {
-            continue;
-        }
-        if (len(allPat) > 0) {
-            allPat.AppendChar(';');
-        }
-        allPat.Append(ff.filter);
-    }
-    out.Add(Tr("All supported documents"), ToStr(allPat));
-    for (const auto& ff : fileFormats) {
-        if (ff.available && ff.name) {
-            out.Add(ff.name, ff.filter);
-        }
-    }
-    out.Add(Tr("All files"), StrL("*.*"));
-}
-
 // Standard Windows IFileOpenDialog multi-select open.
 static void OpenFileWithOSFilePicker(MainWindow* win, bool skipHistory = false) {
     if (!CanAccessDisk()) {
@@ -7191,7 +6180,7 @@ static void OpenFile(MainWindow* win, bool skipHistory = false) {
     OpenFileWithOSFilePicker(win, skipHistory);
 }
 
-static void RemoveFailedFiles(StrVec& files) {
+void RemoveFailedFiles(StrVec& files) {
     StrNode* curr = gFilesFailedToOpen;
     while (curr) {
         int idx = files.Find(curr->s);
@@ -7202,39 +6191,7 @@ static void RemoveFailedFiles(StrVec& files) {
     }
 }
 
-static void OpenNextPrevFileInFolder(MainWindow* win, bool forward, Str pathToDelete = {});
 static void MaybeShowNextFileScrollHint(MainWindow* win);
-static bool IsAtDocumentBottom(MainWindow* win);
-
-static bool IsOpenableNextPrevFile(Str path) {
-    FileType kind = GuessFileTypeFromName(path, true);
-    return IsSupportedFileType(kind, true) || DocIsSupportedFileType(kind);
-}
-
-// File history is UI-thread only, so snapshot paths in this dir before the
-// worker runs and merge them there (unsupported types the user has opened).
-static void CollectHistoryFilesInDir(Str dir, StrVec& out) {
-    Vec<FileState*>* states = FileHistoryStates();
-    if (!states) {
-        return;
-    }
-    for (FileState* fs : *states) {
-        if (!fs || len(fs->filePath) == 0) {
-            continue;
-        }
-        TempStr d = path::GetDirTemp(fs->filePath);
-        if (!str::EqI(d, dir)) {
-            continue;
-        }
-        // DirIter already keeps openable names; only extra is unsupported
-        // types the user has opened (so we don't Contains() each history
-        // path against tens of thousands of listed files).
-        if (IsOpenableNextPrevFile(fs->filePath)) {
-            continue;
-        }
-        out.Append(fs->filePath);
-    }
-}
 
 // Take ownership of src's pages so a 50k-file result isn't copied on the UI thread.
 static void StealStrVec(StrVec& dst, StrVec& src) {
@@ -7250,37 +6207,6 @@ static void StealStrVec(StrVec& dst, StrVec& src) {
     src.sortIndexes = nullptr;
     src.size = 0;
     src.nextPageSize = 256;
-}
-
-// Keep the cached list naturally sorted without a full SortNatural on the UI thread.
-static void InsertSortedNatural(StrVec* v, Str s) {
-    if (v->Contains(s)) {
-        return;
-    }
-    int lo = 0;
-    int hi = len(*v);
-    while (lo < hi) {
-        int mid = lo + ((hi - lo) / 2);
-        if (StrLessNatural(v->At(mid), s)) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    v->InsertAt(lo, s);
-}
-
-struct PendingNextPrevNav {
-    MainWindow* win = nullptr;
-    bool forward = true;
-    Str pathToDelete; // owned
-    ~PendingNextPrevNav() { str::Free(pathToDelete); }
-};
-static PendingNextPrevNav* gPendingNextPrevNav = nullptr;
-
-static void ClearPendingNextPrevNav() {
-    delete gPendingNextPrevNav;
-    gPendingNextPrevNav = nullptr;
 }
 
 struct NextPrevDirScanReq {
@@ -7379,7 +6305,7 @@ static void NextPrevDirScanThread(NextPrevDirScanReq* req) {
     uitask::Post(fn, "FinishNextPrevDirScan");
 }
 
-static void StartNextPrevDirScan(Str dir) {
+void StartNextPrevDirScan(Str dir) {
     gNextPrevDirScanGen++;
     gNextPrevDirReady = false;
     gNextPrevDirScanning = true;
@@ -7397,118 +6323,15 @@ static void StartNextPrevDirScan(Str dir) {
     RunAsync(fn, StrL("NextPrevDirScan"));
 }
 
-static void EnsureNextPrevDirScan(Str filePath) {
-    if (len(filePath) == 0 || !CanAccessDisk() || gPluginMode) {
-        return;
-    }
-    TempStr dir = path::GetDirTemp(filePath);
-    if (path::IsSame(dir, gNextPrevDir) && (gNextPrevDirReady || gNextPrevDirScanning)) {
-        return;
-    }
-    StartNextPrevDirScan(dir);
-}
-
-// nullptr if the background listing is still running. Do not copy the vector.
-static StrVec* GetNextPrevFilesReady(Str path) {
-    EnsureNextPrevDirScan(path);
-    if (!gNextPrevDirReady) {
-        return nullptr;
-    }
-    RemoveFailedFiles(gNextPrevDirCache);
-    // `path` itself is often one of the removed ones: it's the file we're
-    // navigating away from and it may have just failed to load (the error page)
-    // or be an unsupported type opened explicitly. Callers locate it in the list
-    // to know where to continue from, so it has to be there (#5917)
-    InsertSortedNatural(&gNextPrevDirCache, path);
-    return &gNextPrevDirCache;
-}
-
 // at folder ends: forward = last file (next), !forward = first file (prev)
 static void ShowNoFileToOpenNotif(MainWindow* win, bool forward) {
     NotificationCreateArgs nargs;
-    nargs.hwndParent = win->hwndCanvas;
+    nargs.win = win;
     nargs.timeoutMs = kNotifDefaultTimeOut;
     nargs.corner = NotifCorner::BottomRight;
     Str tip = forward ? Tr("Last file in folder.") : Tr("First file in folder.");
     nargs.msg = fmt("%s [%s](CmdNavigateFilesInFolder)", tip, Tr("Navigate"));
     ShowNotification(nargs);
-}
-
-// end-of-document hint for "open next file in folder" discoverability
-static Kind kNotifNextFileHint = "nextFileHint";
-
-static bool IsAtDocumentBottom(MainWindow* win) {
-    DocController* ctrl = win->ctrl;
-    if (!ctrl) {
-        return false;
-    }
-    DisplayModel* dm = win->AsFixed();
-    if (dm) {
-        return dm->IsAtDocumentEnd();
-    }
-    // CHM / Markdown render in a browser control that scrolls itself, so we
-    // can't tell how far down it is. Comparing page numbers instead said "at
-    // the end" for a document the user had barely started reading, which put
-    // the open-next-file tip on screen on the first scroll down.
-    return false;
-}
-
-// next openable file after the current tab's path (no wrap), or empty if none.
-// outN/outM are 1-based index of the next file and total count when non-null.
-static TempStr PeekNextFileInFolderTemp(MainWindow* win, int* outN = nullptr, int* outM = nullptr) {
-    if (outN) {
-        *outN = 0;
-    }
-    if (outM) {
-        *outM = 0;
-    }
-    if (!win || win->IsCurrentTabAbout() || !CanAccessDisk() || gPluginMode) {
-        return {};
-    }
-    WindowTab* tab = win->CurrentTab();
-    if (!tab || len(tab->filePath) == 0) {
-        return {};
-    }
-    Str path = tab->filePath;
-    StrVec* files = GetNextPrevFilesReady(path);
-    if (!files) {
-        return {}; // listing still running; hint is shown when it finishes
-    }
-    int nFiles = len(*files);
-    if (nFiles < 2) {
-        return {};
-    }
-    int idx = files->Find(path);
-    if (idx < 0 || idx + 1 >= nFiles) {
-        return {}; // no wrap: already last
-    }
-    Str next = files->At(idx + 1);
-    if (!file::Exists(next)) {
-        return {};
-    }
-    if (outN) {
-        *outN = idx + 2; // 1-based index of the next file
-    }
-    if (outM) {
-        *outM = nFiles;
-    }
-    return str::DupTemp(next);
-}
-
-void DismissNextFileScrollHint(MainWindow* win) {
-    if (!win || !win->hwndCanvas) {
-        return;
-    }
-    RemoveNotificationsForGroup(win->hwndCanvas, kNotifNextFileHint);
-}
-
-static void OnNextFileHintClosed(NotificationClosedEvent* ev) {
-    RemoveNotification(ev->wnd);
-    if (ev->reason != NotifCloseReason::User) {
-        return;
-    }
-    gSettings->showFileNavigateHint = false;
-    ScheduleSaveSettings();
 }
 
 static void MaybeShowNextFileScrollHint(MainWindow* win) {
@@ -7539,7 +6362,7 @@ static void MaybeShowNextFileScrollHint(MainWindow* win) {
     // leading space so the "·" doesn't abut the file name
     ParseTipInto(rich, fmt(" · %d/%d · [%s](CmdNavigateFilesInFolder)", n, m, Tr("browse")));
     NotificationCreateArgs args;
-    args.hwndParent = win->hwndCanvas;
+    args.win = win;
     args.groupId = kNotifNextFileHint;
     args.corner = NotifCorner::BottomRight;
     args.timeoutMs = kNotifNoTimeout;
@@ -7621,7 +6444,7 @@ static bool GoToFileInBrowserView(MainWindow* win, Str path) {
     return false;
 }
 
-static void OpenNextPrevFileInFolder(MainWindow* win, bool forward, Str pathToDelete) {
+void OpenNextPrevFileInFolder(MainWindow* win, bool forward, Str pathToDelete) {
     ReportIf(win->IsCurrentTabAbout());
     if (win->IsCurrentTabAbout()) {
         return;
@@ -7631,7 +6454,7 @@ static void OpenNextPrevFileInFolder(MainWindow* win, bool forward, Str pathToDe
     }
 
     // dismiss document error notifications from the previous document
-    RemoveNotificationsForGroup(win->hwndCanvas, kNotifDocErrors);
+    RemoveNotificationsForGroup(win, kNotifDocErrors);
     DismissNextFileScrollHint(win);
 
     WindowTab* tab = win->CurrentTab();
@@ -7703,21 +6526,6 @@ static void OpenNextPrevFileInFolder(MainWindow* win, bool forward, Str pathToDe
     args.onFinished = MkFunc1<NextPrevFileInFolderData, bool>(OnNextPrevFileInFolderLoaded, d);
     StartLoadDocument(&args);
 }
-
-static void DeleteCurrentFileAndOpenNext(MainWindow* win) {
-    if (!CanAccessDisk() || !win->IsDocLoaded() || gPluginMode) {
-        return;
-    }
-    TempStr path = str::DupTemp(win->ctrl->GetFilePath());
-    // this happens e.g. for embedded documents and directories
-    if (!file::Exists(path)) {
-        return;
-    }
-    OpenNextPrevFileInFolder(win, true, path);
-}
-
-constexpr int kSidebarMinDx = 150;
-constexpr int kTocMinDy = 100;
 
 constexpr int kFrameBorderSize = 1;
 // size (DIP) of the min/max/restore/close caption glyphs
@@ -7958,12 +6766,9 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     // inset by border for resize hit-testing (only with custom caption, not when maximized/fullscreen)
     if (win->tabsInTitlebar && !IsZoomed(win->hwndFrame) && !win->isFullScreen && !win->presentation) {
         rc.x += kFrameBorderSize;
-        // on Wine top border is kFrameBorderSize - 1 because 1px is already NC area
-        // (WM_NCCALCSIZE keeps 1px NC to prevent DWM transparent flash)
-        int topBorder = IsRunningOnWine() ? kFrameBorderSize - 1 : kFrameBorderSize;
-        rc.y += topBorder;
+        rc.y += kFrameBorderSize;
         rc.dx -= 2 * kFrameBorderSize;
-        rc.dy -= kFrameBorderSize + topBorder;
+        rc.dy -= 2 * kFrameBorderSize;
     }
 
     // hide overlay scrollbars before relayout so they don't appear at
@@ -8175,18 +6980,9 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
 
     if (showCaption) {
         win->captionRect = win->captionLayout->lastBounds;
-        if (IsRunningOnWine()) {
-            logf(
-                "RelayoutFrame: tabsInTitlebar tabHeight=%d captionHeight=%d captionRect=(%d,%d,%d,%d) "
-                "showingMenuBar=%d\n",
-                tabHeight, captionHeight, win->captionRect.x, win->captionRect.y, win->captionRect.dx,
-                win->captionRect.dy, (int)showingMenuBar);
-        }
         if (updateToolbars) {
             RelayoutCaption(win);
         }
-    } else if (showTabsBar && IsRunningOnWine()) {
-        logf("RelayoutFrame: tabsVisible tabHeight=%d\n", tabHeight);
     }
 
     // in overlay mode the toolbar floats over the canvas and is positioned
@@ -8332,9 +7128,7 @@ static void EndFrameRedrawSuppression(MainWindow* win) {
     RedrawWindow(win->hwndFrame, nullptr, nullptr,
                  RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
     GdiFlush();
-    if (!IsRunningOnWine()) {
-        DwmFlush();
-    }
+    DwmFlush();
 }
 
 static void UpdateOverlayScrollbarPositions(MainWindow* win) {
@@ -8767,33 +7561,7 @@ void SetCurrentLanguageAndRefreshUI(Str langCode) {
 // cycle the toolbar mode show -> overlay -> hide -> show
 // (fullscreen uses Fullscreen.Toolbar; home page overlay has no effect, so only
 // toggle show <-> hide there)
-static void OnMenuViewShowHideToolbar(MainWindow* win) {
-    if (win->isFullScreen) {
-        int mode = FullscreenToolbarModeFromPrefs();
-        int next = kToolbarShow;
-        if (mode == kToolbarShow) {
-            next = kToolbarOverlay;
-        } else if (mode == kToolbarOverlay) {
-            next = kToolbarHide;
-        }
-        SetFullscreenToolbarMode(next);
-    } else if (win->IsCurrentTabAbout()) {
-        int mode = ToolbarModeFromPrefs();
-        SetToolbarMode(mode == kToolbarHide ? kToolbarShow : kToolbarHide);
-    } else {
-        int mode = ToolbarModeFromPrefs();
-        int next = kToolbarShow;
-        if (mode == kToolbarShow) {
-            next = kToolbarOverlay;
-        } else if (mode == kToolbarOverlay) {
-            next = kToolbarHide;
-        }
-        SetToolbarMode(next);
-    }
-    for (MainWindow* w : gWindows) {
-        ShowOrHideToolbar(w);
-    }
-}
+void ToolbarModeApplied(MainWindow*) {}
 
 static void SetToolbarModeAndApply(int mode) {
     SetToolbarMode(mode);
@@ -8809,41 +7577,6 @@ void MaybeRedrawHomePage() {
             w->RedrawAll(true);
         }
     }
-}
-
-// toggles 'show pages continuously' state
-static void ToggleContinuousView(MainWindow* win) {
-    if (!win->IsDocLoaded()) {
-        return;
-    }
-
-    DisplayMode newMode = win->ctrl->GetDisplayMode();
-    switch (newMode) {
-        case DisplayMode::SinglePage:
-        case DisplayMode::Continuous:
-            newMode = IsContinuous(newMode) ? DisplayMode::SinglePage : DisplayMode::Continuous;
-            break;
-        case DisplayMode::Facing:
-        case DisplayMode::ContinuousFacing:
-            newMode = IsContinuous(newMode) ? DisplayMode::Facing : DisplayMode::ContinuousFacing;
-            break;
-        case DisplayMode::BookView:
-        case DisplayMode::ContinuousBookView:
-            newMode = IsContinuous(newMode) ? DisplayMode::BookView : DisplayMode::ContinuousBookView;
-            break;
-    }
-    SwitchToDisplayMode(win, newMode);
-}
-
-static void ToggleMangaMode(MainWindow* win) {
-    DisplayModel* dm = win->AsFixed();
-    if (!dm) {
-        return;
-    }
-    dm->SetDisplayR2L(!dm->GetDisplayR2L());
-    ScrollState state = dm->GetScrollState();
-    dm->Relayout(dm->GetZoomVirtual(), dm->GetRotation());
-    dm->SetScrollState(state);
 }
 
 static void ToggleUniformPageWidth(MainWindow* win) {
@@ -8958,44 +7691,6 @@ static Point GetSmartZoomPos(MainWindow* win, Point suggestdPoint) {
     return {};
 }
 
-static void ShowZoomNotification(MainWindow* win, float zoomLevel) {
-    // don't show zoom info if showing page info
-    NotificationWnd* wnd = GetNotificationForGroup(win->hwndCanvas, kNotifPageInfo);
-    if (wnd) {
-        return;
-    }
-    NotificationCreateArgs args;
-    args.groupId = kNotifZoomOrView;
-    args.timeoutMs = 2000;
-    args.hwndParent = win->hwndCanvas;
-    args.msg = BuildZoomString(zoomLevel);
-    ShowNotification(args);
-}
-
-static void ShowViewModeNotification(MainWindow* win, int cmdId) {
-    NotificationWnd* wnd = GetNotificationForGroup(win->hwndCanvas, kNotifPageInfo);
-    if (wnd) {
-        return;
-    }
-    Str viewName;
-    if (cmdId == CmdSinglePageView) {
-        viewName = Tr("Single Page");
-    } else if (cmdId == CmdFacingView) {
-        viewName = Tr("Facing");
-    } else if (cmdId == CmdBookView) {
-        viewName = Tr("Book View");
-    } else {
-        return;
-    }
-    TempStr msg = fmt("%s: %s", Tr("View"), viewName);
-    NotificationCreateArgs args;
-    args.groupId = kNotifZoomOrView;
-    args.timeoutMs = 2000;
-    args.hwndParent = win->hwndCanvas;
-    args.msg = msg;
-    ShowNotification(args);
-}
-
 // if suggestedPoint is provided, it's position on canvas and we'll try to preserve that point after zoom
 // if suggestedPoint is nullptr we'll try to pick a smart point to zoom around if smartZoom is true
 void SmartZoom(MainWindow* win, float factor, Point* pt, bool smartZoom) {
@@ -9021,80 +7716,9 @@ void SmartZoom(MainWindow* win, float factor, Point* pt, bool smartZoom) {
     ShowZoomNotification(win, factor);
 }
 
-// Zoom so that the current selection (Ctrl + drag rectangle or selected text)
-// fills the window, and centre it. The selection itself is left alone so it can
-// still be copied afterwards, and a navigation point is added first so Back
-// returns to the view you zoomed from (issue #1699).
-static void ZoomToSelection(MainWindow* win) {
-    DisplayModel* dm = win->AsFixed();
-    WindowTab* tab = win->CurrentTab();
-    if (!dm || !tab || !win->showSelection || !tab->selectionOnPage) {
-        return;
-    }
-
-    // the selection doesn't move in page coordinates while we zoom, so remember
-    // it there and map it back to the screen once the new zoom is applied
-    int pageNo = 0;
-    RectF selPage;
-    Rect selScreen;
-    bool isFirst = true;
-    for (SelectionOnPage& sel : *tab->selectionOnPage) {
-        Rect rc = sel.GetRect(dm);
-        if (rc.IsEmpty()) {
-            continue;
-        }
-        if (isFirst) {
-            pageNo = sel.pageNo;
-            selPage = sel.rect;
-            selScreen = rc;
-            isFirst = false;
-            continue;
-        }
-        selScreen = selScreen.Union(rc);
-        if (sel.pageNo == pageNo) {
-            selPage = selPage.Union(sel.rect);
-        }
-    }
-    Rect viewPort = dm->GetViewPort();
-    if (isFirst || selScreen.dx <= 0 || selScreen.dy <= 0 || viewPort.dx <= 0 || viewPort.dy <= 0) {
-        return;
-    }
-
-    float fx = (float)viewPort.dx / (float)selScreen.dx;
-    float fy = (float)viewPort.dy / (float)selScreen.dy;
-    float newZoom = dm->GetZoomVirtual(true) * std::min(fx, fy);
-    newZoom = limitValue(newZoom, kZoomMin, kZoomMax);
-
-    // remember the zoom too, so Back undoes the whole "zoom to selection"
-    dm->AddNavPoint(true);
-    SmartZoom(win, newZoom, nullptr, false);
-
-    // put the middle of the selection in the middle of the window
-    Rect rc = dm->CvtToScreen(pageNo, selPage);
-    viewPort = dm->GetViewPort();
-    // the selection can already be centered on either axis, in which case
-    // there's nothing to scroll (ScrollYBy asserts on a 0 delta)
-    int dx = rc.x + (rc.dx / 2) - (viewPort.dx / 2);
-    int dy = rc.y + (rc.dy / 2) - (viewPort.dy / 2);
-    if (0 != dx) {
-        dm->ScrollXBy(dx);
-    }
-    if (0 != dy) {
-        dm->ScrollYBy(dy, false);
-    }
-}
-
 /* Zoom document in window 'hwnd' to zoom level 'zoom'.
    'zoom' is given as a floating-point number, 1.0 is 100%, 2.0 is 200% etc.
 */
-static void OnMenuZoom(MainWindow* win, int menuId) {
-    if (!win->IsDocLoaded()) {
-        return;
-    }
-
-    float zoom = ZoomMenuItemToZoom(menuId);
-    SmartZoom(win, zoom, nullptr, true);
-}
 
 static void ChangeZoomLevel(MainWindow* win, float newZoom, bool pagesContinuously) {
     if (!win->IsDocLoaded()) {
@@ -9242,9 +7866,7 @@ void EnterFullScreen(MainWindow* win, bool presentation) {
 
     UpdateWindowFrameBorderColor(win);
     // disable DWM rounded corners and border for true edge-to-edge fullscreen
-    if (!IsRunningOnWine()) {
-        SetWindowRoundedCorners(win->hwndFrame, false);
-    }
+    SetWindowRoundedCorners(win->hwndFrame, false);
 
     SetWindowLong(win->hwndFrame, GWL_STYLE, ws);
     uint flags = SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER;
@@ -9266,14 +7888,10 @@ void EnterFullScreen(MainWindow* win, bool presentation) {
     RepositionAnnotEditToolbar(win);
     // show menu bar rebar after layout positions it correctly
     ShowMenuBarRebar(win);
-    BrowserDocView* browserView = nullptr;
     if (win->AsChm()) {
-        browserView = win->AsChm()->docView;
+        BrowserViewRefreshSurface(win->AsChm()->docView);
     } else if (win->AsMarkdown()) {
-        browserView = win->AsMarkdown()->docView;
-    }
-    if (browserView) {
-        browserView->RefreshControllerSurface();
+        BrowserViewRefreshSurface(win->AsMarkdown()->docView);
     }
     EndFrameRedrawSuppression(win);
 
@@ -9378,9 +7996,7 @@ void ExitFullScreen(MainWindow* win) {
     }
 
     // restore DWM rounded corners and border
-    if (!IsRunningOnWine()) {
-        SetWindowRoundedCorners(win->hwndFrame, true);
-    }
+    SetWindowRoundedCorners(win->hwndFrame, true);
     UpdateWindowFrameBorderColor(win);
 
     // If we were maximized before fullscreen, re-maximize against the current
@@ -9421,34 +8037,6 @@ void ExitFullScreen(MainWindow* win) {
     // show menu bar rebar after layout positions it correctly
     ShowMenuBarRebar(win);
     EndFrameRedrawSuppression(win);
-}
-
-void ToggleFullScreen(MainWindow* win, bool presentation) {
-    bool enterFullScreen = presentation ? !win->presentation : !win->isFullScreen;
-
-    if (win->presentation || win->isFullScreen) {
-        ExitFullScreen(win);
-    } else {
-        RememberDefaultWindowPosition(win);
-    }
-
-    if (enterFullScreen && (!presentation || win->IsDocLoaded())) {
-        EnterFullScreen(win, presentation);
-    }
-}
-
-static void TogglePresentationMode(MainWindow* win) {
-    // only DisplayModel currently supports an actual presentation mode
-    ToggleFullScreen(win, win->AsFixed() != nullptr);
-}
-
-// make sure that idx falls within <0, max-1> inclusive range
-// negative numbers wrap from the end
-static int wrapIdx(int idx, int max) {
-    for (; idx < 0; idx += max) {
-        idx += max;
-    }
-    return idx % max;
 }
 
 void AdvanceFocus(MainWindow* win) {
@@ -9537,31 +8125,6 @@ static Annotation* GetAnnotionUnderCursor(WindowTab* tab, Annotation* annot, LPA
     return annot;
 }
 
-// Map a Windows virtual key to a portable selection extend (unit, delta).
-// Returns false if the key is not a selection-extend key.
-static bool TextSelectExtendFromVk(WPARAM key, TextSelectUnit& unit, int& delta) {
-    unit = TextSelectUnit::Glyph;
-    delta = 0;
-    switch (key) {
-        case VK_LEFT:
-            delta = -1;
-            return true;
-        case VK_RIGHT:
-            delta = 1;
-            return true;
-        case VK_UP:
-            unit = TextSelectUnit::Line;
-            delta = -1;
-            return true;
-        case VK_DOWN:
-            unit = TextSelectUnit::Line;
-            delta = 1;
-            return true;
-        default:
-            return false;
-    }
-}
-
 // Shift+arrows extend an existing text selection instead of scrolling (#5814).
 static bool TryExtendTextSelectionFromKey(MainWindow* win, WPARAM key) {
     if (!win || !IsShiftPressed() || IsCtrlPressed() || IsAltPressed()) {
@@ -9573,7 +8136,7 @@ static bool TryExtendTextSelectionFromKey(MainWindow* win, WPARAM key) {
     }
     TextSelectUnit unit;
     int delta = 0;
-    if (!TextSelectExtendFromVk(key, unit, delta)) {
+    if (!TextSelectExtendFromVk((int)key, unit, delta)) {
         return false;
     }
     if (!dm->textSelection->ExtendBy(unit, delta)) {
@@ -9657,7 +8220,7 @@ static bool FrameOnKeydown(MainWindow* win, WPARAM key, LPARAM lp) {
 
     // while the keyboard selection caret is up, movement keys move it instead
     // of scrolling the view
-    if (SelectTextWithKeyboardOnKeyDown(win, key)) {
+    if (SelectTextWithKeyboardOnKeyDown(win, (int)key)) {
         return true;
     }
 
@@ -9729,17 +8292,17 @@ static void OnFrameKeyEsc(MainWindow* win) {
     if (AbortFinding(win, true)) {
         return;
     }
-    if (RemoveNotificationsForGroup(win->hwndCanvas, kNotifPersistentWarning)) {
+    if (RemoveNotificationsForGroup(win, kNotifPersistentWarning)) {
         return;
     }
-    if (RemoveNotificationsForGroup(win->hwndCanvas, kNotifPageInfo)) {
+    if (RemoveNotificationsForGroup(win, kNotifPageInfo)) {
         win->pageInfoWanted = false;
         return;
     }
-    if (RemoveNotificationsForGroup(win->hwndCanvas, kNotifCursorPos)) {
+    if (RemoveNotificationsForGroup(win, kNotifCursorPos)) {
         return;
     }
-    if (RemoveNotificationsForGroup(win->hwndCanvas, kNotifZoomOrView)) {
+    if (RemoveNotificationsForGroup(win, kNotifZoomOrView)) {
         return;
     }
     if (win->showSelection) {
@@ -9776,162 +8339,16 @@ static void OnFrameKeyEsc(MainWindow* win) {
     }
 }
 
-static void OnFrameKeyB(MainWindow* win) {
-    auto* ctrl = win->ctrl;
-    bool isSinglePage = IsSingle(ctrl->GetDisplayMode());
-
-    DisplayModel* dm = win->AsFixed();
-    if (dm && !isSinglePage) {
-        bool forward = !IsShiftPressed();
-        int currPage = ctrl->CurrentPageNo();
-        bool isVisible = dm->FirstBookPageVisible();
-        if (forward) {
-            isVisible = dm->LastBookPageVisible();
-        }
-        if (isVisible) {
-            return;
-        }
-
-        DisplayMode newMode = DisplayMode::BookView;
-        if (IsBookView(ctrl->GetDisplayMode())) {
-            newMode = DisplayMode::Facing;
-        }
-        SwitchToDisplayMode(win, newMode, true);
-
-        if (forward && currPage >= ctrl->CurrentPageNo() && (currPage > 1 || newMode == DisplayMode::BookView)) {
-            ctrl->GoToNextPage();
-        } else if (!forward && currPage <= ctrl->CurrentPageNo()) {
-            win->ctrl->GoToPrevPage();
-        }
-    } else if (false && !isSinglePage) {
-        // "e-book view": flip a single page
-        bool forward = !IsShiftPressed();
-        int nextPage = ctrl->CurrentPageNo() + (forward ? 1 : -1);
-        if (ctrl->ValidPageNo(nextPage)) {
-            ctrl->GoToPage(nextPage, false);
-        }
-    } else if (win->presentation) {
-        win->ChangePresentationMode(PM_BLACK_SCREEN);
-    }
-}
-
-static void AddUniquePageNo(Vec<int>& v, int pageNo) {
-    for (auto n : v) {
-        if (n == pageNo) {
-            return;
-        }
-    }
-    VecAppend(v, pageNo);
-}
-
-// create one or more markup annotations from the current text selection.
-// The selection (and the floating selection toolbar) stay so the user can
-// copy the same span or apply another markup without selecting again.
-static Annotation* MakeAnnotationsFromSelection(WindowTab* tab, AnnotCreateArgs* args) {
-    DisplayModel* dm = tab->AsFixed();
-    if (!dm) {
-        return nullptr;
-    }
-    auto* engine = dm->GetEngine();
-    bool supportsAnnots = EngineSupportsAnnotations(engine);
-    MainWindow* win = tab->win;
-    bool ok = supportsAnnots && win->showSelection && tab->selectionOnPage;
-    if (!ok) {
-        return nullptr;
-    }
-    // highlight / underline / squiggly / strike out mark up runs of *text*. A
-    // rectangular selection (Ctrl+drag, Select All) isn't one - marking up its
-    // bounding boxes produced bars over whitespace - so do nothing.
-    bool isTextSelection = dm->textSelection && dm->textSelection->result.len > 0;
-    if (!isTextSelection) {
-        return nullptr;
-    }
-
-    Vec<SelectionOnPage>* s = tab->selectionOnPage;
-    Vec<int> pageNos;
-    for (auto& sel : *s) {
-        int pageNo = sel.pageNo;
-        if (!dm->ValidPageNo(pageNo)) {
-            continue;
-        }
-        AddUniquePageNo(pageNos, pageNo);
-    }
-    if (len(pageNos) == 0) {
-        return nullptr;
-    }
-
-    if (args->setContentToSelection) {
-        bool isTextOnlySelection = false;
-        args->content = GetSelectedTextTemp(tab, StrL("\r\n"), isTextOnlySelection);
-    }
-
-    Annotation* annot = nullptr;
-    Vec<Annotation*> created;
-    // creating the annotation and setting its quad points are separate journal
-    // operations; one gesture must be one undo step (issue #6217)
-    EngineMupdfBeginOperation(engine, "Mark up selection");
-    for (auto pageNo : pageNos) {
-        Vec<RectF> rects;
-        for (auto& sel : *s) {
-            if (pageNo != sel.pageNo) {
-                continue;
-            }
-            VecAppend(rects, sel.rect);
-        }
-        annot = EngineMupdfCreateAnnotation(engine, pageNo, PointF{}, args);
-        if (!annot) {
-            // Roll back annots created earlier in this call so we do not leave
-            // partial multi-page selections as untracked annotations.
-            for (Annotation* a : created) {
-                DeleteAnnotation(a);
-            }
-            EngineMupdfEndOperation(engine);
-            return nullptr;
-        }
-        SetQuadPointsAsRect(annot, rects);
-        annot->bounds = GetBounds(annot);
-        VecAppend(created, annot);
-    }
-    EngineMupdfEndOperation(engine);
-
-    // copy selection to clipboard so that user can use Ctrl-V to set contents
-    if (args->copyToClipboard) {
-        CopySelectionToClipboard(win);
-    }
-    // callers refresh lists and rerender; doing it here too aborted and redid the page render
-    return annot;
-}
-
-// what CmdToggleCursorPosition would switch to. The tip cycles pt -> mm -> in
-// and then closes, so the command palette can't say true / false; naming the
-// next unit here keeps it in step with ToggleCursorPositionInDoc() below
-// next state of the cursor-position tip, for the command palette
-Str NextCursorPositionUnitName(MainWindow* win) {
-    if (!win || !win->AsFixed()) {
-        return {};
-    }
-    if (!GetNotificationForGroup(win->hwndCanvas, kNotifCursorPos)) {
-        return StrL("pt");
-    }
-    if (cursorPosUnit == MeasurementUnit::pt) {
-        return StrL("mm");
-    }
-    if (cursorPosUnit == MeasurementUnit::mm) {
-        return StrL("in");
-    }
-    return StrL("off");
-}
-
-static void ToggleCursorPositionInDoc(MainWindow* win) {
+void ToggleCursorPositionInDoc(MainWindow* win) {
     // "cursor position" tip: make figuring out the current
     // cursor position in cm/in/pt possible (for exact layouting)
     if (!win->AsFixed()) {
         return;
     }
-    auto* notif = GetNotificationForGroup(win->hwndCanvas, kNotifCursorPos);
+    auto* notif = GetNotificationForGroup(win, kNotifCursorPos);
     if (!notif) {
         NotificationCreateArgs args;
-        args.hwndParent = win->hwndCanvas;
+        args.win = win;
         args.groupId = kNotifCursorPos;
         args.shrinkLimit = 0.7f;
         args.timeoutMs = 0;
@@ -9944,7 +8361,7 @@ static void ToggleCursorPositionInDoc(MainWindow* win) {
             cursorPosUnit = MeasurementUnit::in;
         } else if (cursorPosUnit == MeasurementUnit::in) {
             cursorPosUnit = MeasurementUnit::pt;
-            RemoveNotificationsForGroup(win->hwndCanvas, kNotifCursorPos);
+            RemoveNotificationsForGroup(win, kNotifCursorPos);
             return;
         } else {
             ReportIf(true);
@@ -9991,12 +8408,12 @@ static void FrameOnChar(MainWindow* win, WPARAM key, LPARAM info = 0) {
     }
 
     // while keyboard link following is on, type a link's letter hint
-    if (!isCtrl && !isAlt && KeyboardLinkFollowingOnChar(win, key)) {
+    if (!isCtrl && !isAlt && KeyboardLinkFollowingOnChar(win, (int)key)) {
         return;
     }
 
     // while the selection caret is up, 'v' toggles visual mode and 'y' copies
-    if (!isCtrl && !isAlt && SelectTextWithKeyboardOnChar(win, key)) {
+    if (!isCtrl && !isAlt && SelectTextWithKeyboardOnChar(win, (int)key)) {
         return;
     }
 
@@ -10026,7 +8443,7 @@ static void FrameOnChar(MainWindow* win, WPARAM key, LPARAM info = 0) {
             gIsDivideKeyDown = false;
             break;
         case 'b':
-            OnFrameKeyB(win);
+            OnFrameKeyB(win, IsShiftPressed());
             break;
     }
 }
@@ -10108,18 +8525,9 @@ static void OnPanelsSplitterMove(VirtSplitter::MoveEvent* ev) {
     ScheduleUiUpdate(win, kUiRelayout | kUiNoToolbars | kUiPanelsDrag);
 }
 
-static int SidebarExtraDx(MainWindow* win) {
-    int dx = win->sidebarDx;
-    if (dx <= 0 && gSettings) {
-        dx = gSettings->sidebarDx;
-    }
-    if (dx <= 0 && win->sidebarTop) {
-        dx = HwndClientRect(win->sidebarTop->hwnd).dx;
-    }
-    if (dx < kSidebarMinDx) {
-        dx = kSidebarMinDx;
-    }
-    return dx + kSplitterDx;
+// the width the sidebar window has now
+int SidebarNativeDx(MainWindow* win) {
+    return win->sidebarTop ? HwndClientRect(win->sidebarTop->hwnd).dx : 0;
 }
 
 // SidebarWindowSize = grow opts in; by default the window keeps its size (#6205)
@@ -10296,34 +8704,6 @@ constexpr const char* kSelectionPositionStr = "${selectionposition}";
 // https://en.wikipedia.org/wiki/List_of_ISO_3166_country_codes
 // https://en.wikipedia.org/wiki/List_of_ISO_639_language_codes
 
-// first entry is value in gLangCodes, second is ISO 639 lang code
-// I made it manually by looking at trans_lang.go and
-// https://en.wikipedia.org/wiki/List_of_ISO_639_language_codes
-// but not fully and it might be incorrect anyway wrt. to other translation websites
-static const char* gLangsMap = "am\0hy\0by\0be\0ca-xv\0ca\0cz\0cs\0kr\0ko\0vn\0vi\0cn\0zh-CN\0tw\0zh-TW\0";
-static TempStr GetISO639LangCodeFromLangTemp(Str lang) {
-    int idx = SeqStrIndex(gLangsMap, lang);
-    if (idx < 0 || idx % 2 != 0) {
-        return lang;
-    }
-    return SeqStrByIndex(gLangsMap, idx + 1);
-}
-
-// A URL can only carry so much text, and quietly sending less than the user
-// selected looks like the service ignored half the request (discussion #5900).
-static void NotifyUrlSelectionTruncated(WindowTab* tab) {
-    if (!tab || !tab->win) {
-        return;
-    }
-    NotificationCreateArgs args;
-    args.hwndParent = tab->win->hwndCanvas;
-    args.tab = tab;
-    args.warning = true;
-    args.timeoutMs = 5000;
-    args.msg = Tr("Selection was too long for a URL and was shortened.");
-    ShowNotification(args);
-}
-
 static void LaunchBrowserWithSelection(WindowTab* tab, Str urlPattern) {
     if (!tab || !HasPermission(Perm::InternetAccess) || !HasPermission(Perm::CopySelection)) {
         return;
@@ -10460,7 +8840,7 @@ static bool CopyOrCutAnnotationInTab(WindowTab* tab, LPARAM lp, bool cut) {
         // a cut annotation stays on the page until the paste removes it, so
         // without this Ctrl+X looks like it did nothing
         NotificationCreateArgs args;
-        args.hwndParent = tab->win->hwndCanvas;
+        args.win = tab->win;
         args.msg = Tr("Annotation cut. Paste to move it.");
         args.timeoutMs = 3000;
         ShowNotification(args);
@@ -10496,7 +8876,7 @@ static void CopySelectionInTabToClipboard(WindowTab* tab) {
     }
     if (tab->AsFixed()) {
         NotificationCreateArgs args;
-        args.hwndParent = tab->win->hwndCanvas;
+        args.win = tab->win;
         args.msg = Tr("Select content with Ctrl+left mouse button");
         args.timeoutMs = 2000;
         ShowNotification(args);
@@ -10735,91 +9115,6 @@ static void ApplyMenuBarVisibility(MainWindow* win) {
     }
 }
 
-static void AppendLayoutFloats(str::Builder& b, Vec<float>* vals) {
-    if (!vals) {
-        return;
-    }
-    for (float v : *vals) {
-        b.Append(fmt("%g,", v));
-    }
-}
-
-// font, page size, spacing and CSS: what a reload has to re-paginate
-static Str EbookLayoutSnapshot() {
-    str::Builder b;
-    if (!gSettings) {
-        return b.TakeStr();
-    }
-    b.Append(fmt("dpi=%d\n", gSettings->customScreenDPI));
-    EBookUI* g = &gSettings->eBookUI;
-    b.Append(fmt("g|%s|%g|%g|%g|%d|%g|", g->fontName, g->fontSize, g->layoutDx, g->layoutDy,
-                 g->ignoreDocumentCSS ? 1 : 0, g->lineSpacing));
-    AppendLayoutFloats(b, g->margin);
-    b.Append(fmt("|%s\n", g->customCSS));
-    if (gSettings->fileStates) {
-        for (FileState* fs : *gSettings->fileStates) {
-            FileEBookUI* f = fs->eBookUI;
-            if (!f) {
-                continue;
-            }
-            b.Append(fmt("f|%s|%s|%g|%g|%g|%s|%g|", fs->filePath, f->fontName, f->fontSize, f->layoutDx, f->layoutDy,
-                         f->ignoreDocumentCSS, f->lineSpacing));
-            AppendLayoutFloats(b, f->margin);
-            b.Append(fmt("|%s\n", f->customCSS));
-        }
-    }
-    return b.TakeStr();
-}
-
-// reflowable docs, and anything with chapters (MOBI): their page count follows
-// the ebook font / page size / CSS
-static bool LayoutFollowsEbookSettings(EngineBase* engine) {
-    if (!engine) {
-        return false;
-    }
-    if (engine->isReflowable || engine->HasChapters()) {
-        return true;
-    }
-    Kind k = engine->kind;
-    return k == kindEngineMobi || k == kindEngineFb2 || k == kindEnginePdb || k == kindEngineHtml ||
-           k == kindEngineTxt || k == kindEngineEpub;
-}
-
-static void ReloadEbookLayoutDocs() {
-    for (MainWindow* w : gWindows) {
-        Vec<WindowTab*> tabs;
-        for (WindowTab* tab : w->Tabs()) {
-            VecAppend(tabs, tab);
-        }
-        for (WindowTab* tab : tabs) {
-            DisplayModel* dm = tab->AsFixed();
-            EngineBase* engine = dm ? dm->GetEngine() : nullptr;
-            if (!LayoutFollowsEbookSettings(engine)) {
-                continue;
-            }
-            if (tab == w->CurrentTab()) {
-                ReloadDocument(w, false);
-            } else {
-                tab->reloadOnFocus = true;
-            }
-        }
-    }
-}
-
-SettingsApplyState GetSettingsApplyState() {
-    Settings* p = gSettings;
-    SettingsApplyState s;
-    s.useTabs = p->useTabs;
-    s.showMenubar = p->showMenubar;
-    s.showMenubarWithTabs = p->showMenubarWithTabs;
-    s.disableAntiAlias = p->disableAntiAlias;
-    s.chmUseFixedPageUI = p->chmUI.useFixedPageUI;
-    s.markdownUseFixedPageUI = p->markdownUI.useFixedPageUI;
-    s.explorerQuickLook = p->explorerQuickLook;
-    s.ebookLayout = EbookLayoutSnapshot();
-    return s;
-}
-
 // apply settings changes that need explicit handling beyond a settings reload,
 // then re-layout all windows. `before` is a snapshot taken before the change.
 void ApplyChangedSettingsAndRelayout(const SettingsApplyState& before) {
@@ -10874,6 +9169,24 @@ void ApplyChangedSettingsAndRelayout(const SettingsApplyState& before) {
         ReloadEbookLayoutDocs();
     }
 
+    // the chat colors, font and layout are baked into the chat page: rebuild it
+    Str prevStyle = before.aiChatStyle;
+    Str nowStyle = AIChatStyleSnapshot();
+    bool aiChatStyleChanged = !str::Eq(prevStyle, nowStyle);
+    str::Free(prevStyle);
+    str::Free(nowStyle);
+    if (aiChatStyleChanged) {
+        for (MainWindow* w : gWindows) {
+            UpdateAIChatTheme(w);
+        }
+    }
+
+    bool thumbnailsTypeChanged = !str::EqI(before.thumbnailsType, p->thumbnailsType);
+    str::Free(before.thumbnailsType);
+    if (thumbnailsTypeChanged) {
+        OnThumbnailsTypeChanged();
+    }
+
     // UseTabs converts existing windows <-> tabs (closes and reopens windows);
     // post it so it runs after the settings dialog has been torn down
     if (before.useTabs != p->useTabs) {
@@ -10913,42 +9226,12 @@ static void ListPrintersThread(HWND* hwndPtr) {
     uitask::Post(MkFunc0<ListPrintersResult>(ListPrintersShowResult, d));
 }
 
-static void ReopenLastClosedFile(MainWindow* win) {
-    Str path = PopRecentlyClosedDocument();
-    if (len(path) == 0) {
-        return;
-    }
-    LoadArgs args(path, win);
-    LoadDocument(&args);
-}
-
 void CopyFilePath(WindowTab* tab) {
     if (!tab) {
         return;
     }
     Str path = tab->filePath;
     CopyTextToClipboard(path);
-}
-
-// a -zoom value the cmd-line parser understands: a fit mode name or a percentage
-static TempStr ZoomArgTemp(DocController* ctrl) {
-    float zoom = ctrl->GetZoomVirtual();
-    if (kZoomFitPage == zoom) {
-        return StrL("fit page");
-    }
-    if (kZoomFitWidth == zoom) {
-        return StrL("fit width");
-    }
-    if (kZoomFitHeight == zoom) {
-        return StrL("fit height");
-    }
-    if (kZoomFitContent == zoom) {
-        return StrL("fit content");
-    }
-    if (kZoomFitVisible == zoom) {
-        return StrL("fit visible");
-    }
-    return fmt("%g%%", ctrl->GetZoomVirtual(true));
 }
 
 // Copy the current view as the cmd-line args that re-open it:
@@ -10990,10 +9273,10 @@ static void ClearHistoryFinish(ClearHistoryData* d) {
     if (!IsMainWindowValidAndNotClosing(win)) {
         return;
     }
-    RemoveNotificationsForGroup(win->hwndCanvas, kNotifClearHistory);
+    RemoveNotificationsForGroup(win, kNotifClearHistory);
     HwndRepaintNow(win->hwndCanvas);
     TempStr msg2 = fmt(Tr("Cleared history of %d files, deleted thumbnails.").s, d->nFiles);
-    ShowTemporaryNotification(win->hwndCanvas, msg2, kNotif5SecsTimeOut);
+    ShowTemporaryNotification(win, msg2, kNotif5SecsTimeOut);
 }
 
 static void ClearHistoryAsync(ClearHistoryData* d) {
@@ -11026,7 +9309,7 @@ static void ClearHistory(MainWindow* win) {
 
     NotificationCreateArgs args;
     args.groupId = kNotifClearHistory;
-    args.hwndParent = win->hwndCanvas;
+    args.win = win;
     args.timeoutMs = kNotif5SecsTimeOut;
     args.msg = Tr("Clearing history...");
     ShowNotification(args);
@@ -11035,96 +9318,6 @@ static void ClearHistory(MainWindow* win) {
     data->nFiles = nFiles;
     auto fn = MkFunc0<ClearHistoryData>(ClearHistoryAsync, data);
     RunAsync(fn, StrL("ClearHistoryAsync"));
-}
-
-// looks through the file history and removes entries for files that no
-// longer exist on disk. Done synchronously on the main thread for simplicity.
-static void RemoveDeletedFilesFromHistory(MainWindow* win) {
-    if (!win || !FileHistoryStates()) {
-        return;
-    }
-    int nRemoved = 0;
-    Vec<FileState*>* states = FileHistoryStates();
-    // iterate from the end because removing changes indices
-    for (int i = len(*states) - 1; i >= 0; i--) {
-        FileState* fs = (*states)[i];
-        Str path = fs->filePath;
-        if (len(path) == 0) {
-            continue;
-        }
-        // Skip only when we can't tell deleted from "drive is away": an
-        // unplugged USB or offline share. A present removable / mapped
-        // volume with a missing file is safe to drop (fixes #5970).
-        if (!path::IsOnAvailableDrive(path)) {
-            logf("RemoveDeletedFilesFromHistory: skip (volume not present) '%s'\n", path);
-            continue;
-        }
-        if (DocumentPathExists(path)) {
-            continue;
-        }
-        // don't remove a file that's currently open in some tab
-        if (FindTabByFile(path)) {
-            continue;
-        }
-        logf("RemoveDeletedFilesFromHistory: removed '%s'\n", path);
-        DeleteThumbnailForFile(path);
-        // drops the home page layout cache, which points at fs
-        FileHistoryRemove(fs);
-        DeleteFileState(fs);
-        nRemoved++;
-    }
-
-    if (nRemoved > 0) {
-        ScheduleSaveSettings();
-        MaybeRedrawHomePage();
-    }
-    TempStr msg = fmt(Tr("Deleted files removed from history: %d").s, nRemoved);
-    ShowTemporaryNotification(win->hwndCanvas, msg, kNotif5SecsTimeOut);
-}
-
-// Unconditionally delete all local copies of comic-book archives that were
-// cached under <data>/cbx-cache/ when opening them from a network drive.
-// Safe to call with no open document; open documents may still hold a lock
-// on a cache file so some deletes can fail (logged).
-static void DeleteCachedFiles(MainWindow* win) {
-    int nDeleted = 0;
-    int nFailed = 0;
-    TempStr dataDir = GetSumatraDataDirTemp();
-    if (dataDir) {
-        TempStr cacheDir = path::JoinTemp(dataDir, StrL("cbx-cache"));
-        if (path::GetType(cacheDir) == path::Type::Dir) {
-            DirIter di{cacheDir};
-            di.includeFiles = true;
-            di.includeDirs = false;
-            for (DirIterEntry* de : di) {
-                TempStr sizeStr = str::FormatSizeShortTemp(de->size);
-                if (file::Delete(de->filePath)) {
-                    nDeleted++;
-                    logf("DeleteCachedFiles: deleted '%s' (%s)\n", de->filePath, sizeStr);
-                } else {
-                    nFailed++;
-                    logf("DeleteCachedFiles: failed to delete '%s' (%s)\n", de->filePath, sizeStr);
-                }
-            }
-            // remove the (now empty, or residual) cache directory itself
-            if (nFailed == 0) {
-                dir::RemoveAll(cacheDir);
-            }
-        }
-    }
-    logf("DeleteCachedFiles: deleted %d, failed %d\n", nDeleted, nFailed);
-    if (!win || !win->hwndCanvas) {
-        return;
-    }
-    TempStr msg;
-    if (nDeleted == 0 && nFailed == 0) {
-        msg = fmt("%s", Tr("No cached comic book files."));
-    } else if (nFailed == 0) {
-        msg = fmt(Tr("Deleted %d cached comic book files.").s, nDeleted);
-    } else {
-        msg = fmt(Tr("Deleted %d cached comic book files, %d failed.").s, nDeleted, nFailed);
-    }
-    ShowTemporaryNotification(win->hwndCanvas, msg, kNotif5SecsTimeOut);
 }
 
 // CmdDebugCorruptMemory, the only caller, is behind #if IS_DEBUG, so
@@ -11195,8 +9388,6 @@ static ILayout* MakeDebugPixmapNotifContent(HWND hwnd) {
 }
 #endif
 
-constexpr const char* kManualDefaultDocURI = "/SumatraPDF-documentation";
-constexpr const char* kManualVirtualHost = "https://sumatrapdf.manual/";
 constexpr const WCHAR* kManualVirtualHostW = L"https://sumatrapdf.manual/";
 
 static SimpleBrowserWindow* gManualBrowserWindow = nullptr;
@@ -11348,95 +9539,12 @@ static TempStr ManualMimeFromPathTemp(Str path) {
     return mime;
 }
 
-static bool IsManualDocHtmlPage(Str path) {
-    if (len(path) == 0 || !str::EndsWithI(path, StrL(".html"))) {
-        return false;
-    }
-    if (str::EqI(path, StrL("manual.shell.html"))) {
-        return false;
-    }
-    return true;
-}
-
 static TempStr ManualArchiveLookupPathTemp(Str path) {
     TempStr lookupPath = str::DupTemp(path);
     // IDR_EMBEDDED_PAK stores names with backslashes (MakeLZSA convention) but WebView
     // requests use URL-style forward slashes.
     str::TransCharsInPlace(lookupPath, StrL("/"), StrL("\\"));
     return lookupPath;
-}
-
-static const char* kHelpThemeValues[] = {"app", "light", "dark"};
-
-// HelpTheme setting, "app" unless it holds one of the known values
-static Str HelpThemePref() {
-    for (const char* v : kHelpThemeValues) {
-        if (str::EqI(gSettings->helpTheme, Str(v))) {
-            return Str(v);
-        }
-    }
-    return StrL("app");
-}
-
-// theme.js reports a click on the manual's switch via
-// window.__sumatra__.notify("manualTheme", "<system|light|dark>")
-static void ManualOnJsNotify(void*, Str method, Str paramsJson) {
-    if (!str::Eq(method, StrL("manualTheme"))) {
-        return;
-    }
-    // params is a JSON array with one string, e.g. ["dark"]; "system" is what
-    // theme.js calls the follow-the-app option
-    Str v{};
-    if (str::Contains(paramsJson, StrL("\"system\""))) {
-        v = StrL("app");
-    }
-    for (const char* known : kHelpThemeValues) {
-        if (str::Contains(paramsJson, fmt("\"%s\"", Str(known)))) {
-            v = Str(known);
-        }
-    }
-    if (len(v) == 0 || str::Eq(gSettings->helpTheme, v)) {
-        return;
-    }
-    str::ReplaceWithCopy(&gSettings->helpTheme, v);
-    ScheduleSaveSettings();
-}
-
-// The manual's theme switch (docs/theme.js) has a third option that follows the
-// app: announce the app's scheme and the HelpTheme setting before the script
-// runs, and hand the exact window colors to manual.css so "app" mode matches
-// the native window.
-static Str ManualInjectThemeCss(Str html) {
-    TempStr bg = SerializeColorTemp(ThemeWindowBackgroundColor());
-    TempStr fg = SerializeColorTemp(ThemeWindowTextColor());
-    Str scheme = IsLightColor(ThemeWindowBackgroundColor()) ? StrL("light") : StrL("dark");
-    // theme.js calls the follow-the-app option "system"
-    Str pref = HelpThemePref();
-    if (str::Eq(pref, StrL("app"))) {
-        pref = StrL("system");
-    }
-    TempStr script =
-        fmt("<script>window.SumatraAppTheme=\"%s\";window.SumatraManualTheme=\"%s\"</script>", scheme, pref);
-    TempStr css =
-        fmt("<style id=\"sumatra-manual-theme\">"
-            "html[data-theme-pref=\"system\"]{--bg-primary:%s;--bg-elevated:%s;--text-primary:%s;--link-color:%s}"
-            "</style>",
-            bg, bg, fg, fg);
-
-    int scriptAt = str::IndexOfI(html, StrL("<head>"));
-    scriptAt = scriptAt < 0 ? 0 : scriptAt + len(StrL("<head>"));
-    int cssAt = str::IndexOfI(html, StrL("</head>"));
-    if (cssAt < scriptAt) {
-        cssAt = scriptAt;
-    }
-    str::Builder result;
-    result.Reserve(len(html) + len(script) + len(css));
-    result.Append(Str(html.s, scriptAt));
-    result.Append(script);
-    result.Append(Str(html.s + scriptAt, cssAt - scriptAt));
-    result.Append(css);
-    result.Append(Str(html.s + cssAt, len(html) - cssAt));
-    return result.TakeStr();
 }
 
 static bool ManualGetResource(void* ctx, Str path, WebViewResourceResult* res) {
@@ -11502,45 +9610,6 @@ static bool EnsureManualArchiveLoaded() {
     }
     logf("EnsureManualArchiveLoaded(): using IDR_EMBEDDED_PAK, %d files\n", archive->filesCount);
     return true;
-}
-
-static TempStr DocURIToLocalManualUrlTemp(Str docURI) {
-    if (len(docURI) == 0) {
-        docURI = Str(kManualDefaultDocURI);
-    }
-
-    Str fragment = str::SliceFromChar(docURI, '#');
-    Str pathStart = docURI;
-    if (len(pathStart) > 0 && pathStart.s[0] == '/') {
-        pathStart = Str(pathStart.s + 1, pathStart.len - 1);
-    }
-    int pathLen = fragment ? (int)(fragment.s - pathStart.s) : pathStart.len;
-    if (pathLen <= 0) {
-        pathStart = Str(kManualDefaultDocURI + 1);
-        pathLen = pathStart.len;
-        fragment = {};
-    }
-
-    TempStr htmlFile = str::DupTemp(Str(pathStart.s, pathLen));
-    if (!str::EndsWithI(htmlFile, StrL(".html"))) {
-        htmlFile = str::JoinTemp(htmlFile, StrL(".html"));
-    }
-
-    TempStr url = str::JoinTemp(Str(kManualVirtualHost), htmlFile);
-    if (fragment) {
-        url = str::JoinTemp(url, fragment);
-    }
-    return url;
-}
-
-static TempStr DocURIToWebUrlTemp(Str docURI) {
-    if (len(docURI) == 0) {
-        docURI = Str(kManualDefaultDocURI);
-    }
-    if (len(docURI) > 0 && docURI.s[0] == '/') {
-        return fmt("https://www.sumatrapdfreader.org/docs%s", docURI);
-    }
-    return fmt("https://www.sumatrapdfreader.org/docs/%s", docURI);
 }
 
 void LaunchDocumentation(Str docURI) {
@@ -11615,137 +9684,6 @@ bool MaybeLaunchDocumentation(Str url) {
     }
     // remainder is "/<page>" (LaunchDocumentation's docURI convention)
     LaunchDocumentation(url);
-    return true;
-}
-
-static void SetAnnotCreateArgsFromCommand(AnnotCreateArgs& args, CustomCommand* cmd) {
-    args.copyToClipboard = GetCommandBoolArg(cmd, kCmdArgCopyToClipboard, false);
-    args.setContentToSelection = GetCommandBoolArg(cmd, kCmdArgSetContent, false);
-
-    auto* col = GetCommandArg(cmd, kCmdArgColor);
-    if (col && col->colorVal.parsedOk) {
-        args.col = col->colorVal;
-    }
-
-    auto* bgCol = GetCommandArg(cmd, kCmdArgBgColor);
-    if (bgCol && bgCol->colorVal.parsedOk) {
-        args.bgCol = bgCol->colorVal;
-    }
-
-    auto* interiorCol = GetCommandArg(cmd, kCmdArgInteriorColor);
-    if (interiorCol && interiorCol->colorVal.parsedOk) {
-        args.interiorCol = interiorCol->colorVal;
-    }
-
-    if (GetCommandArg(cmd, kCmdArgOpacity)) {
-        args.opacity = GetCommandIntArg(cmd, kCmdArgOpacity, 100);
-        setMinMax(args.opacity, 0, 100);
-    }
-
-    int textSize = GetCommandIntArg(cmd, kCmdArgTextSize, -1);
-    if (textSize >= 0) {
-        // set some reasonable limits
-        setMinMax(textSize, 5, 128);
-        args.textSize = textSize;
-    }
-
-    int borderWidth = GetCommandIntArg(cmd, kCmdArgBorderWidth, -1);
-    if (borderWidth >= 0) {
-        // set some reasonable limits
-        setMinMax(borderWidth, 0, 128);
-        args.borderWidth = borderWidth;
-    }
-
-    int quadding = QuaddingFromName(GetCommandStringArg(cmd, kCmdArgAlignment, {}));
-    if (quadding >= 0) {
-        args.quadding = quadding;
-    }
-}
-
-void SetAnnotCreateArgs(AnnotCreateArgs& args, CustomCommand* cmd) {
-    auto& a = gSettings->annotations;
-    ParsedColor* col = nullptr;
-    ParsedColor* bgCol = nullptr;
-    auto typ = args.annotType;
-    if (typ == AnnotationType::Text) {
-        col = GetParsedColor(a.textIconColor);
-    } else if (typ == AnnotationType::Underline) {
-        col = GetParsedColor(a.underlineColor);
-    } else if (typ == AnnotationType::Highlight) {
-        col = GetParsedColor(a.highlightColor);
-    } else if (typ == AnnotationType::Squiggly) {
-        col = GetParsedColor(a.squigglyColor);
-    } else if (typ == AnnotationType::StrikeOut) {
-        col = GetParsedColor(a.strikeOutColor);
-    } else if (typ == AnnotationType::FreeText) {
-        col = GetParsedColor(a.freeTextColor);
-        bgCol = GetParsedColor(a.freeTextBackgroundColor);
-        if (bgCol && bgCol->parsedOk) {
-            args.bgCol = *bgCol;
-        }
-        args.opacity = a.freeTextOpacity;
-        args.textSize = a.freeTextSize;
-        args.borderWidth = a.freeTextBorderWidth;
-        args.quadding = QuaddingFromName(a.freeTextAlignment);
-    } else if (typ == AnnotationType::Line) {
-        col = GetParsedColor(a.lineColor);
-    } else if (typ == AnnotationType::PolyLine) {
-        col = GetParsedColor(a.polyLineColor);
-    } else if (typ == AnnotationType::Square) {
-        col = GetParsedColor(a.squareColor);
-    } else if (typ == AnnotationType::Circle) {
-        col = GetParsedColor(a.circleColor);
-    } else if (typ == AnnotationType::Polygon) {
-        col = GetParsedColor(a.polygonColor);
-    } else if (typ == AnnotationType::Ink) {
-        col = GetParsedColor(a.inkColor);
-        args.borderWidth = a.inkBorderWidth;
-    } else if (typ == AnnotationType::Stamp) {
-        col = GetParsedColor(a.stampColor);
-    } else if (typ == AnnotationType::Caret) {
-        col = GetParsedColor(a.caretColor);
-    } else if (typ == AnnotationType::FileAttachment) {
-        col = GetParsedColor(a.fileAttachmentColor);
-    } else if (typ == AnnotationType::Redact) {
-        // a redaction mark has no color to pick: it's the black box that
-        // replaces the text. MuPDF's default is what we want
-    } else {
-        logf("SetAnnotCreateArgs: unexpected type %d for default prefs color\n", (int)typ);
-        // ReportIf(true);
-    }
-    if (col && col->parsedOk) {
-        args.col = *col;
-    }
-
-    // a command's arguments (e.g. Shift+A's "openedit", or a color) override
-    // the settings; ones it doesn't give keep them (#6197). Test the arguments,
-    // not `cmd->id != cmd->origId`: a colliding Shortcuts entry gets a generated
-    // id even without arguments (#5869).
-    if (cmd && cmd->firstArg) {
-        SetAnnotCreateArgsFromCommand(args, cmd);
-    }
-}
-
-// Pick the center of the visible part of the current page when a command has
-// no usable canvas point, as happens after clicking an annotation-toolbar button.
-static bool SetPointToVisiblePage(DisplayModel* dm, Point& pt, int& pageNo) {
-    pageNo = dm->FirstVisiblePageNo();
-    if (!dm->ValidPageNo(pageNo)) {
-        pageNo = dm->CurrentPageNo();
-    }
-    if (!dm->ValidPageNo(pageNo)) {
-        return false;
-    }
-    PageInfo* pi = dm->GetPageInfo(pageNo);
-    Size viewport = dm->GetViewPort().Size();
-    Rect visible = pi->pageOnScreen.Intersect(Rect{0, 0, viewport.dx, viewport.dy});
-    if (visible.IsEmpty()) {
-        visible = pi->pageOnScreen;
-    }
-    if (visible.IsEmpty()) {
-        return false;
-    }
-    pt = Point(visible.x + (visible.dx / 2), visible.y + (visible.dy / 2));
     return true;
 }
 
@@ -11902,34 +9840,6 @@ static void PasteImageFromClipboard(MainWindow* win) {
     }
 }
 
-static void TocItemToText(str::Builder& s, TocItem* item, int level) {
-    while (item) {
-        if (item->title) {
-            for (int i = 0; i < level; i++) {
-                s.AppendChar('\t');
-            }
-            s.Append(item->title);
-            s.AppendChar('\n');
-        }
-        if (item->child) {
-            int nextLevel = item->title ? level + 1 : level;
-            TocItemToText(s, item->child, nextLevel);
-        }
-        item = item->next;
-    }
-}
-
-// for toggle commands that accept an optional "state" bool arg (issue #5067):
-// returns false if the command asked for a state that already matches the
-// current one (so the toggle should be skipped); true otherwise (no explicit
-// state given, or the requested state differs and a flip is needed)
-static bool ShouldToggle(CustomCommand* cmd, bool curState) {
-    if (!GetCommandArg(cmd, kCmdArgState)) {
-        return true; // no explicit state: always toggle
-    }
-    return GetCommandBoolArg(cmd, kCmdArgState, !curState) != curState;
-}
-
 // shows a sidebar view in a panel, or hides the panel showing it
 static void ToggleSidebarViewCmd(MainWindow* win, CustomCommand* cmd, SidebarView v) {
     bool shown = IsSidebarViewShown(win, v);
@@ -11943,163 +9853,10 @@ static void ToggleSidebarViewCmd(MainWindow* win, CustomCommand* cmd, SidebarVie
     ShowSidebarView(win, v);
 }
 
-// The image file the current tab is showing, or empty when it isn't showing
-// one. The image editor takes a path rather than reaching into the tab itself.
-static Str CurrentImageTabPathTemp(MainWindow* win) {
-    if (!win) {
-        return {};
-    }
-    WindowTab* tab = win->CurrentTab();
-    if (!tab || len(tab->filePath) == 0) {
-        return {};
-    }
-    if (tab->GetEngineType() != kindEngineImage) {
-        return {};
-    }
-    return tab->filePath;
-}
-
-// Run the print dialog from the message loop rather than from whatever loop
-// delivered the WM_COMMAND. TranslateAcceleratorW sends it from inside a win32k
-// user-mode callback, and menu commands come from the menu's modal loop, so
-// calling PrintCurrentFile() directly nests the modal dialog inside one of
-// those. That matters more than it used to: on Windows 11 PrintDlgExW shows the
-// out-of-process unified print dialog and blocks on it with
-// CoWaitForMultipleHandles, and it has been seen to never return - the dialog
-// vanishes and the app hangs with PrintDlgExW still on the stack.
-static void PrintCurrentFileDeferred(MainWindow* win) {
-    // the window can be closed between posting this and running it
-    if (!IsMainWindowValidAndNotClosing(win)) {
-        return;
-    }
-    PrintCurrentFile(win);
-}
-
-static void PrintSelectionDeferred(MainWindow* win) {
-    if (!IsMainWindowValidAndNotClosing(win)) {
-        return;
-    }
-    PrintCurrentFile(win, false, true);
-}
-
-// A gesture that writes to the document as it goes (a resize drag writes the
-// annotation on every mouse move) should still be a single undo step, so it
-// holds one journal operation open from start to end. Both calls are safe to
-// make when there is nothing open, which keeps the many ways a gesture can end
-// (mouse up, Esc, the annotation deleted, the document closed) from leaking it.
-void BeginPdfEditOperation(MainWindow* win, const char* name) {
-    if (!win || win->pdfEditOperationActive) {
-        return;
-    }
-    DisplayModel* dm = win->AsFixed();
-    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
-    if (!engine || !EngineSupportsAnnotations(engine)) {
-        return;
-    }
-    EngineMupdfBeginOperation(engine, name);
-    win->pdfEditOperationActive = true;
-}
-
-void EndPdfEditOperation(MainWindow* win) {
-    if (!win || !win->pdfEditOperationActive) {
-        return;
-    }
-    win->pdfEditOperationActive = false;
-    DisplayModel* dm = win->AsFixed();
-    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
-    if (engine) {
-        EngineMupdfEndOperation(engine);
-    }
-}
-
 // Step the document's edit history. MuPDF restores the objects; every wrapper,
 // selection and cached rendering that pointed at the old state has to go.
-static void UndoRedoInTab(WindowTab* tab, bool redo) {
-    if (!tab) {
-        return;
-    }
-    MainWindow* win = tab->win;
-    DisplayModel* dm = tab->AsFixed();
-    if (!win || !dm) {
-        return;
-    }
-    EngineBase* engine = dm->GetEngine();
-    if (!engine || !EngineSupportsAnnotations(engine)) {
-        return;
-    }
-    bool can = redo ? EngineMupdfCanRedo(engine) : EngineMupdfCanUndo(engine);
-    if (!can) {
-        return;
-    }
-
-    // an in-flight placement or drag would write to what we are about to undo
-    CancelAnnotationPlacement(win);
-    CancelDrag(win);
-    SetSelectedAnnotation(tab, nullptr);
-    if (gRenderCache) {
-        gRenderCache->AbortRendering(dm);
-    }
-
-    Vec<Annotation*> removed;
-    bool ok = redo ? EngineMupdfRedo(engine, removed) : EngineMupdfUndo(engine, removed);
-    for (Annotation* a : removed) {
-        DetachAnnotationFromUI(a);
-        DeleteAnnotation(a);
-    }
-    // the wrapper deletes above mark the document modified; the journal knows better
-    EngineMupdfRefreshModifiedState(engine);
-    DeleteOldSelectionInfo(win, true);
-    RefreshAnnotationLists(tab);
-    NotifyAnnotationsChanged(tab);
-    ToolbarUpdateStateForWindow(win, true);
-    MainWindowRerender(win, true);
-    if (!ok) {
-        ShowWarningNotification(win->hwndCanvas, redo ? Tr("Nothing to redo") : Tr("Nothing to undo"),
-                                kNotif5SecsTimeOut);
-    }
-}
-
-static void ApplyRedactionsInTab(WindowTab* tab) {
-    if (!tab) {
-        return;
-    }
-    MainWindow* win = tab->win;
-    DisplayModel* dm = tab->AsFixed();
-    if (!win || !dm) {
-        return;
-    }
-    EngineBase* engine = dm->GetEngine();
-    if (!engine || !EngineSupportsAnnotations(engine)) {
-        return;
-    }
-
-    CancelAnnotationPlacement(win);
-    CancelDrag(win);
-
-    if (!EngineHasRedactMarks(engine)) {
-        ShowTemporaryNotification(win->hwndCanvas, Tr("No redaction marks to apply"));
-        return;
-    }
-    if (gRenderCache) {
-        gRenderCache->AbortRendering(dm);
-    }
-
-    Vec<Annotation*> deleted;
-    bool ok = EngineMupdfApplyRedactions(engine, deleted);
-    for (Annotation* a : deleted) {
-        DetachAnnotationFromUI(a);
-        DeleteAnnotation(a);
-    }
-    DeleteOldSelectionInfo(win, true);
-    RefreshAnnotationLists(tab);
-    ToolbarUpdateStateForWindow(win, true);
-    if (!ok) {
-        ShowWarningNotification(win->hwndCanvas, Tr("Failed to apply redactions"), kNotif5SecsTimeOut);
-        return;
-    }
-    MainWindowRerender(win);
-    ShowTemporaryNotification(win->hwndCanvas, Tr("Redactions applied."), kNotif5SecsTimeOut);
-}
+// orig disables Undo / Redo instead of saying why nothing happens
+void UndoRedoUnavailable(MainWindow*, bool) {}
 
 static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     int cmdId = LOWORD(wp);
@@ -12142,8 +9899,7 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
     if (cmdId == CmdFileHistory && CanAccessDisk()) {
         Str filePath = GetCommandStringArg(cmd, kCmdArgFilePath, {});
         if (len(filePath) > 0) {
-            LoadArgs args(filePath, win);
-            LoadDocument(&args);
+            LoadDocument(win, filePath);
         }
         return 0;
     }
@@ -12391,14 +10147,26 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             RunCommandPalette(win, mode, 0);
         } break;
 
-        case CmdCommandPaletteTOC:
+        case CmdNavigateTableOfContents:
             // alias for `CmdCommandPalette %`: open the palette in TOC mode
             RunCommandPalette(win, Str(kPalettePrefixTOC), 0);
             break;
 
-        case CmdCommandPaletteFavorites:
+        case CmdNavigateFavorites:
             // alias for `CmdCommandPalette $`: open the palette in favorites mode
             RunCommandPalette(win, Str(kPalettePrefixFavorites), 0);
+            break;
+
+        case CmdNavigateTabs:
+            RunCommandPalette(win, Str(kPalettePrefixTabs), 0);
+            break;
+
+        case CmdNavigateHistory:
+            RunCommandPalette(win, Str(kPalettePrefixFileHistory), 0);
+            break;
+
+        case CmdQuickEditSettings:
+            RunCommandPalette(win, Str(kPalettePrefixBoolSettings), 0);
             break;
 
         case CmdAIChatWithClaudeCode:
@@ -12491,7 +10259,7 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
 
         case CmdListPrinters: {
             NotificationCreateArgs nargs;
-            nargs.hwndParent = win->hwndCanvas;
+            nargs.win = win;
             nargs.msg = Tr("Collecting list of printers");
             ShowNotification(nargs);
             auto* data = new HWND(win->hwndCanvas);
@@ -12637,6 +10405,10 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
 
         case CmdToggleMangaMode:
             ToggleMangaMode(win);
+            break;
+
+        case CmdToggleAutoRotateWidePages:
+            ToggleAutoRotateWidePages();
             break;
 
         case CmdToggleUniformPageWidth:
@@ -12795,9 +10567,11 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             break;
         }
 
-        case CmdSignDocument:
-            ShowSignDocumentDialog(win);
+        case CmdSignDocument: {
+            bool certify = cmd && GetCommandBoolArg(cmd, kCmdArgCertify, false);
+            ShowSignDocumentDialog(win, {}, false, certify ? kPdfCertifyNoChanges : 0);
             break;
+        }
 
         case CmdToggleMenuBar: {
             if (ShouldToggle(cmd, gSettings->showMenubar)) {
@@ -12897,10 +10671,9 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             if (!win->IsDocLoaded()) {
                 return 0;
             }
-            bool isCont = IsContinuous(win->ctrl->GetDisplayMode());
             int currentPos = GetScrollPos(win->hwndCanvas, SB_VERT);
             SendMessageW(win->hwndCanvas, WM_VSCROLL, kSbHalfPageUp, 0);
-            if (isCont && GetScrollPos(win->hwndCanvas, SB_VERT) == currentPos) {
+            if (GetScrollPos(win->hwndCanvas, SB_VERT) == currentPos) {
                 win->ctrl->GoToPrevPage(true);
                 OnDocumentVerticalScrollIntent(win, false);
             }
@@ -12981,10 +10754,9 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             if (!win->IsDocLoaded()) {
                 return 0;
             }
-            bool isCont = IsContinuous(win->ctrl->GetDisplayMode());
             int currentPos = GetScrollPos(win->hwndCanvas, SB_VERT);
             SendMessageW(win->hwndCanvas, WM_VSCROLL, kSbHalfPageDown, 0);
-            if (isCont && GetScrollPos(win->hwndCanvas, SB_VERT) == currentPos) {
+            if (GetScrollPos(win->hwndCanvas, SB_VERT) == currentPos) {
                 win->ctrl->GoToNextPage();
                 OnDocumentVerticalScrollIntent(win, true);
             }
@@ -13193,7 +10965,7 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
                 notifMsg = str::DupTemp(StrL("PDF preview logging disabled."));
             }
             NotificationCreateArgs nargs;
-            nargs.hwndParent = win->hwndCanvas;
+            nargs.win = win;
             nargs.msg = notifMsg;
             nargs.timeoutMs = 8000;
             ShowNotification(nargs);
@@ -13207,6 +10979,14 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             ShowAdvancedSettingsDialog(win);
             break;
 
+        case CmdRunPDFScript:
+            ShowPDFScriptDialog(win);
+            break;
+
+        case CmdConfigureRestrictedUse:
+            ShowConfigureRestrictedUseDialog(win);
+            break;
+
         case CmdOpenSettingsFile:
             OpenSettingsFileInEditor();
             break;
@@ -13216,7 +10996,7 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             break;
 
         case CmdSendByEmail:
-            SendAsEmailAttachment(tab, win->hwndFrame);
+            SendAsEmailAttachment(tab);
             break;
 
         case CmdProperties: {
@@ -13591,7 +11371,7 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
         case CmdDebugShowNotif: {
             {
                 NotificationCreateArgs args;
-                args.hwndParent = win->hwndCanvas;
+                args.win = win;
                 args.groupId = kNotifPersistentWarning;
                 args.msg = StrL("This is a second notification\nMy friend.");
                 args.warning = false;
@@ -13600,7 +11380,7 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             }
             {
                 NotificationCreateArgs args;
-                args.hwndParent = win->hwndCanvas;
+                args.win = win;
                 args.groupId = kNotifAdHoc;
                 args.msg = StrL("This is a second notification\nMy friend.");
                 args.warning = false;
@@ -13610,7 +11390,7 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
 
             {
                 NotificationCreateArgs args;
-                args.hwndParent = win->hwndCanvas;
+                args.win = win;
                 args.msg = StrL("This is a notification");
                 args.groupId = kNotifAdHoc;
                 args.warning = true;
@@ -13620,7 +11400,7 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
 
             {
                 NotificationCreateArgs args;
-                args.hwndParent = win->hwndCanvas;
+                args.win = win;
                 args.groupId = kNotifAdHoc;
                 args.warning = false;
                 args.timeoutMs = 0;
@@ -13839,9 +11619,11 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
                 SetAnnotCreateArgs(args, cmd);
                 if (MakeAnnotationsFromSelection(tab, &args)) {
                     // not selected: that would take the next press, which is
-                    // meant to select more text
-                    StopSelectTextWithKeyboard(win);
-                    DeleteOldSelectionInfo(win, true);
+                    // meant to select more text. A keyboard caret stays put.
+                    if (!KeepCaretAfterMarkup(win)) {
+                        StopSelectTextWithKeyboard(win);
+                        DeleteOldSelectionInfo(win, true);
+                    }
                     RefreshAnnotationLists(tab);
                     MainWindowRerender(win);
                     ToolbarUpdateStateForWindow(win, true);
@@ -14016,7 +11798,7 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             str::Free(data);
             if (!image) {
                 NotificationCreateArgs nargs;
-                nargs.hwndParent = win->hwndCanvas;
+                nargs.win = win;
                 nargs.timeoutMs = 3000;
                 nargs.msg = fmt(Tr("Couldn't load image '%s'").s, path::GetBaseNameTemp(path));
                 ShowNotification(nargs);
@@ -14067,8 +11849,12 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
     }
     // The text selection has done its job: it would sit on top of the markup
     // annotation it just made and keep the selection toolbar open over it.
-    StopSelectTextWithKeyboard(win);
-    DeleteOldSelectionInfo(win, true);
+    // Keyboard caret mode stays on, at the free end of that markup.
+    bool keptCaret = AnnotationIsTextMarkup(lastCreatedAnnot->type) && KeepCaretAfterMarkup(win);
+    if (!keptCaret) {
+        StopSelectTextWithKeyboard(win);
+        DeleteOldSelectionInfo(win, true);
+    }
     RefreshAnnotationLists(tab);
     // Drop the cached page bitmap. SetSelectedAnnotation only ScheduleRepaint
     // (selection handles); without this the new annot is invisible until a
@@ -14278,10 +12064,6 @@ void RelayoutCaption(MainWindow* win) {
     BindSlot(win->capTabsRow2, nullptr, nullptr, false);
     dh.End();
     UpdateTabWidth(win);
-    if (IsRunningOnWine()) {
-        logf("RelayoutCaption: captionRect=(%d,%d,%d,%d) twoRow=%d hasFileTabs=%d\n", win->captionRect.x,
-             win->captionRect.y, win->captionRect.dx, win->captionRect.dy, (int)twoRow, (int)hasFileTabs);
-    }
 }
 
 enum class CaptionSysButtonKind {
@@ -14683,22 +12465,7 @@ static LRESULT CustomCaptionFrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
             }
             // painting the non-client area ourselves turns off DWM frame rendering:
             // the maximized window's overhang then counts as visible (#6259)
-            if (!IsRunningOnWine()) {
-                break;
-            }
-            Vec<Rect> strips;
-            GetFrameNcStrips(win, strips);
-            HDC hdc = len(strips) > 0 ? GetWindowDC(hwnd) : nullptr;
-            if (hdc) {
-                HBRUSH br = CreateSolidBrush(ThemeControlBackgroundColor());
-                for (Rect& rc : strips) {
-                    HdcFillRect(hdc, rc, br);
-                }
-                DeleteObject(br);
-                ReleaseDC(hwnd, hdc);
-            }
-            *callDef = false;
-            return 0;
+            break;
         }
 
         case WM_PAINT: {
@@ -14787,10 +12554,6 @@ static LRESULT CustomCaptionFrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
 
         case WM_NCCALCSIZE: {
             RECT* r = wp == TRUE ? &((NCCALCSIZE_PARAMS*)lp)->rgrc[0] : (RECT*)lp;
-            if (IsRunningOnWine()) {
-                logf("WM_NCCALCSIZE: before=(%ld,%ld,%ld,%ld) zoomed=%d\n", r->left, r->top, r->right, r->bottom,
-                     (int)IsZoomed(hwnd));
-            }
             bool isFullScreen = win->isFullScreen || win->presentation;
             if (IsZoomed(hwnd) && !isFullScreen) {
                 // The maximized outer frame extends beyond the work area. Global
@@ -14813,21 +12576,12 @@ static LRESULT CustomCaptionFrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                     r->right -= frameX;
                     r->bottom -= frameY;
                 }
-            } else if (!isFullScreen && IsRunningOnWine()) {
-                // keep 1px non-client area at top so DWM preserves content
-                // during resize (returning 0 makes DWM clear the surface)
-                r->top += 1;
             } else if (!isFullScreen) {
                 // keep the standard side / bottom borders, DWM draws them as invisible
                 // resize borders; the caption is ours
                 int top = r->top;
                 DefWindowProcW(hwnd, msg, wp, lp);
                 r->top = top;
-            }
-            if (IsRunningOnWine()) {
-                logf("WM_NCCALCSIZE: after=(%ld,%ld,%ld,%ld) clientDy=%ld cyFrame=%d cyCaption=%d\n", r->left, r->top,
-                     r->right, r->bottom, r->bottom - r->top, GetSystemMetrics(SM_CYFRAME),
-                     GetSystemMetrics(SM_CYCAPTION));
             }
             *callDef = false;
             return 0;
@@ -15575,7 +13329,7 @@ TempStr PageInfoOverlayResultTemp(Str pathTwoPages, Str pathOnePage, int* exitCo
     }
 
     TogglePageInfoHelper(win);
-    NotificationWnd* wnd = GetNotificationForGroup(win->hwndCanvas, kNotifPageInfo);
+    NotificationWnd* wnd = GetNotificationForGroup(win, kNotifPageInfo);
     if (!wnd) {
         return fail(StrL("ERROR no-overlay"));
     }
@@ -15603,7 +13357,7 @@ TempStr PageInfoOverlayResultTemp(Str pathTwoPages, Str pathOnePage, int* exitCo
     if (!win->IsDocLoaded() || win->ctrl->PageCount() != 1) {
         return fail(StrL("ERROR one-page-load"));
     }
-    wnd = GetNotificationForGroup(win->hwndCanvas, kNotifPageInfo);
+    wnd = GetNotificationForGroup(win, kNotifPageInfo);
     if (!wnd) {
         return fail(StrL("ERROR overlay-gone"));
     }
@@ -15798,159 +13552,6 @@ static bool InstanceInit() {
     return true;
 }
 
-static void SendMyselfDDE(Str cmdA, HWND targetHwnd) {
-    TempWStr cmd = ToWStrTemp(cmdA);
-    if (targetHwnd) {
-        // try WM_COPYDATA first, as that allows targetting a specific window
-        size_t cbData = (len(cmd) + 1) * sizeof(WCHAR);
-        COPYDATASTRUCT cds = {kCopyDataDdeW, (DWORD)cbData, (void*)cmd.s};
-        LRESULT res = SendMessageW(targetHwnd, WM_COPYDATA, 0, (LPARAM)&cds);
-        if (res) {
-            return;
-        }
-        // fall-through to DDEExecute if wasn't handled
-    }
-    DDEExecute(kSumatraDdeServer, kSumatraDdeTopic, cmd);
-}
-
-// Returns true if the only thing the caller wants is to open a file (no
-// goto-page, no forward search, no view overrides, etc.). In that case we
-// can use the cheaper kCopyDataOpen fast path instead of building a DDE
-// grammar string and blocking the caller in SendMessageW while the
-// receiver loads the document.
-static bool IsSimpleOpenCase(const Flags& i, bool isFirstWin) {
-    if (!isFirstWin) {
-        return true; // extras only apply to the first window
-    }
-    if (i.namedDest || i.pageNumber > 0) {
-        return false;
-    }
-    if (i.startView != DisplayMode::Automatic || i.startZoom != kInvalidZoom) {
-        return false;
-    }
-    if (i.startScroll.x != -1 && i.startScroll.y != -1) {
-        return false;
-    }
-    if (i.forwardSearchOrigin && i.forwardSearchLine) {
-        return false;
-    }
-    if (i.search) {
-        return false;
-    }
-    if (i.enterPresentation || i.enterFullScreen) {
-        return false;
-    }
-    return true;
-}
-
-// Send just the path + newWindow flag to an already-running SumatraPDF via
-// WM_COPYDATA. Receiver (OnCopyData) handles it asynchronously so this
-// SendMessageW returns fast. Returns true if the message was handled.
-static bool SendOpenFileToExistingInstance(HWND targetHwnd, Str fullPath, u32 newWindow) {
-    size_t pathLen = strlen(fullPath.s);
-    size_t cbData = sizeof(SumatraOpenCopyData) + pathLen + 1;
-    SumatraOpenCopyData* payload = (SumatraOpenCopyData*)malloc(cbData);
-    if (!payload) {
-        return false;
-    }
-    payload->newWindow = newWindow;
-    memcpy(payload + 1, fullPath.s, pathLen + 1);
-    COPYDATASTRUCT cds = {kCopyDataOpen, (DWORD)cbData, payload};
-    LRESULT res = SendMessageW(targetHwnd, WM_COPYDATA, 0, (LPARAM)&cds);
-    free(payload);
-    return res != 0;
-}
-
-static bool SendOpenFilesToExistingInstance(HWND targetHwnd, StrVec& paths, u32 newWindow) {
-    size_t cbData = sizeof(SumatraOpenManyCopyData);
-    for (Str path : paths) {
-        cbData += path.len + 1;
-    }
-    if (cbData > MAXDWORD) {
-        return false;
-    }
-
-    u8* payload = (u8*)malloc(cbData);
-    if (!payload) {
-        return false;
-    }
-    auto* data = (SumatraOpenManyCopyData*)payload;
-    data->newWindow = newWindow;
-    data->pathCount = (u32)len(paths);
-    u8* dst = payload + sizeof(*data);
-    for (Str path : paths) {
-        memcpy(dst, path.s, path.len);
-        dst += path.len;
-        *dst++ = 0;
-    }
-    COPYDATASTRUCT cds = {kCopyDataOpenMany, (DWORD)cbData, payload};
-    LRESULT res = SendMessageW(targetHwnd, WM_COPYDATA, 0, (LPARAM)&cds);
-    free(payload);
-    return res != 0;
-}
-
-// delegate file opening to a previously running instance by sending a DDE message
-static void OpenUsingDDE(HWND targetHwnd, Str path, Flags& i, bool isFirstWin) {
-    TempStr fullPath = path::NormalizeTemp(path);
-
-    u32 newWindow = 0;
-    if (i.inNewWindow) {
-        // 2 forces opening a new window
-        newWindow = 2;
-    }
-
-    // Common case: Explorer double-clicks a file while SumatraPDF is already
-    // running (reuseInstance). Use the simpler kCopyDataOpen format; the
-    // receiver loads async so Explorer's child SumatraPDF process can exit
-    // instantly instead of blocking on the file load.
-    if (targetHwnd && !i.reuseDdeInstance && IsSimpleOpenCase(i, isFirstWin)) {
-        if (SendOpenFileToExistingInstance(targetHwnd, fullPath, newWindow)) {
-            return;
-        }
-        // fall through to the DDE grammar path if WM_COPYDATA wasn't handled
-    }
-
-    str::Builder cmd;
-    cmd.Append(fmt("[Open(\"%s\", %d, 1, 0)]", fullPath, newWindow));
-    if (i.namedDest && isFirstWin) {
-        cmd.Append(fmt("[GotoNamedDest(\"%s\", \"%s\")]", fullPath, i.namedDest));
-    } else if (i.pageNumber > 0 && isFirstWin) {
-        cmd.Append(fmt("[GotoPage(\"%s\", %d)]", fullPath, i.pageNumber));
-    }
-    if ((i.startView != DisplayMode::Automatic || i.startZoom != kInvalidZoom ||
-         i.startScroll.x != -1 && i.startScroll.y != -1) &&
-        isFirstWin) {
-        Str viewModeStr = DisplayModeToString(i.startView);
-        cmd.Append(fmt("[SetView(\"%s\", \"%s\", %.2f, %d, %d)]", fullPath, viewModeStr, i.startZoom, i.startScroll.x,
-                       i.startScroll.y));
-    }
-    if (i.forwardSearchOrigin && i.forwardSearchLine) {
-        TempStr srcPath = path::NormalizeTemp(i.forwardSearchOrigin);
-        cmd.Append(fmt("[ForwardSearch(\"%s\", \"%s\", %d, 0, 0, 1)]", fullPath, srcPath, i.forwardSearchLine));
-    }
-    if (i.search) {
-        // TODO: quote if i.search has '"' in it
-        cmd.Append(fmt("[Search(\"%s\",\"%s\")]", fullPath, i.search));
-    }
-    if ((i.enterPresentation || i.enterFullScreen) && isFirstWin) {
-        Str name = i.enterPresentation ? StrL("Presentation") : StrL("FullScreen");
-        cmd.Append(fmt("[%s(\"%s\")]", name, fullPath));
-    }
-
-    if (i.reuseDdeInstance) {
-        targetHwnd = nullptr; // force DDEExecute
-    }
-    SendMyselfDDE(ToStr(cmd), targetHwnd);
-}
-
-// enters presentation or fullscreen, leaving the other one first
-void SwitchToFullScreen(MainWindow* win, bool presentation) {
-    if (presentation ? win->isFullScreen : win->presentation) {
-        ExitFullScreen(win);
-    }
-    EnterFullScreen(win, presentation);
-}
-
 static void FlagsEnterFullscreen(const Flags& flags, MainWindow* win) {
     if (!win || !win->IsDocLoaded()) {
         return;
@@ -16104,7 +13705,7 @@ static void SetTabState(WindowTab* tab, TabState* state) {
 
 static void RestoreMissingTabOnStartup(MainWindow* win, TabState* state, bool deferTabUpdate) {
     logf("RestoreTabOnStartup: file not found '%s', creating placeholder tab\n", state->filePath);
-    FileHistoryMarkFileInexistent(state->filePath, true);
+    FileHistoryDemote(state->filePath, true);
     WindowTab* tab = new WindowTab(win);
     tab->SetFilePath(state->filePath);
     tab->tabState = state;
@@ -16130,111 +13731,6 @@ static void RestoreTabOnStartup(MainWindow* win, TabState* state, bool lazyLoad,
     if (!LoadDocument(&args)) {
         RestoreMissingTabOnStartup(win, state, deferTabUpdate);
     }
-}
-
-static bool SetupPluginMode(Flags& i) {
-    if (!IsWindow(i.hwndPluginParent) || len(i.fileNames) == 0) {
-        return false;
-    }
-
-    gPluginURL = Str(i.pluginURL);
-    if (len(gPluginURL) == 0) {
-        gPluginURL = Str(i.fileNames[0]);
-    }
-
-    // don't save preferences for plugin windows (and don't allow fullscreen mode)
-    // TODO: Perm::DiskAccess is required for saving viewed files and printing and
-    //       Perm::InternetAccess is required for crash reports
-    // (they can still be disabled through sumatrapdfrestrict.ini or -restrict)
-    RestrictPolicies(Perm::SavePreferences | Perm::FullscreenAccess);
-
-    i.reuseDdeInstance = i.exitWhenDone = false;
-    gSettings->reuseInstance = false;
-    // don't allow tabbed navigation
-    gSettings->useTabs = false;
-    // always display the toolbar when embedded (as there's no menubar in that case)
-    gSettings->showToolbar = true;
-    // never allow esc as a shortcut to quit
-    gSettings->escToExit = false;
-    // never show the sidebar by default
-    gSettings->showToc = false;
-    if (DisplayMode::Automatic == gSettings->defaultDisplayModeEnum) {
-        // if the user hasn't changed the default display mode,
-        // display documents as single page/continuous/fit width
-        // (similar to Adobe Reader, Google Chrome and how browsers display HTML)
-        gSettings->defaultDisplayModeEnum = DisplayMode::Continuous;
-        gSettings->defaultZoomFloat = kZoomFitWidth;
-    }
-    // use fixed page UI for all document types (so that the context menu always
-    // contains all plugin specific entries and the main window is never closed)
-    gSettings->chmUI.useFixedPageUI = true;
-
-    // extract some command line arguments from the URL's hash fragment where available
-    // see http://www.adobe.com/devnet/acrobat/pdfs/pdf_open_parameters.pdf#nameddest=G4.1501531
-    int hashIdx = i.pluginURL ? str::IndexOfChar(i.pluginURL, '#') : -1;
-    if (hashIdx >= 0) {
-        TempStr args = str::DupTemp(Str(i.pluginURL.s + hashIdx + 1));
-        str::TransCharsInPlace(args, StrL("#"), StrL("&"));
-        StrVec parts;
-        Split(&parts, args, StrL("&"), true);
-        for (int k = 0; k < len(parts); k++) {
-            Str part = parts[k];
-            Str pageArg = part;
-            int pageNo;
-            if (str::TrimPrefixI(pageArg, StrL("page=")) && !str::IsNull(str::Parse(pageArg, "%d%$", &pageNo))) {
-                i.pageNumber = pageNo;
-            } else if ((str::TrimPrefixI(part, StrL("nameddest=")) || !str::ContainsChar(part, '=')) && part) {
-                // "nameddest=foo" or a bare fragment with no '='
-                i.namedDest = str::Dup(part);
-            }
-        }
-    }
-    return true;
-}
-
-// Minimal redeclaration of the shell's IVirtualDesktopManager (Windows 10 1607+),
-// to tell whether a window is on the user's current virtual desktop. We use a
-// distinct name (and don't include <shobjidl.h>) to avoid clashing with the SDK
-// declaration; the vtable layout matches so COM calls dispatch correctly. Lets
-// reusing an existing instance avoid yanking focus to another desktop (#5630).
-struct ISumatraVirtualDesktopManager : public IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE IsWindowOnCurrentVirtualDesktop(HWND topLevelWindow, BOOL* onCurrentDesktop) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetWindowDesktopId(HWND topLevelWindow, GUID* desktopId) = 0;
-    virtual HRESULT STDMETHODCALLTYPE MoveWindowToDesktop(HWND topLevelWindow, REFGUID desktopId) = 0;
-};
-
-// {AA509086-5CA9-4C25-8F95-589D3C07B48A}
-static const GUID kClsidVirtualDesktopManager = {0xAA509086,
-                                                 0x5CA9,
-                                                 0x4C25,
-                                                 {0x8F, 0x95, 0x58, 0x9D, 0x3C, 0x07, 0xB4, 0x8A}};
-// {A5CD92FF-29BE-454C-8D04-D42879C3B837}
-static const GUID kIidVirtualDesktopManager = {0xA5CD92FF,
-                                               0x29BE,
-                                               0x454C,
-                                               {0x8D, 0x04, 0xD4, 0x28, 0x79, 0xC3, 0xB8, 0x37}};
-
-// returns nullptr on Windows without virtual desktops (e.g. Win7) or on failure.
-// COM is already initialized (AutoOleUninitialize in WinMain) by the time we call this.
-static ISumatraVirtualDesktopManager* CreateVirtualDesktopManager() {
-    ISumatraVirtualDesktopManager* mgr = nullptr;
-    CoCreateInstance(kClsidVirtualDesktopManager, nullptr, CLSCTX_ALL, kIidVirtualDesktopManager, (void**)&mgr);
-    return mgr;
-}
-
-// true if hwnd is on the user's current virtual desktop. Defaults to true when
-// we can't tell (no manager on Win7, or the query fails), preserving the old
-// "reuse the first instance window" behavior.
-static bool IsWindowOnCurrentDesktop(ISumatraVirtualDesktopManager* vdm, HWND hwnd) {
-    if (!vdm || !hwnd) {
-        return true;
-    }
-    BOOL onCurrent = FALSE;
-    HRESULT hr = vdm->IsWindowOnCurrentVirtualDesktop(hwnd, &onCurrent);
-    if (FAILED(hr)) {
-        return true;
-    }
-    return onCurrent != FALSE;
 }
 
 // Finds a window of a previously running instance to reuse. Prefers a window on
@@ -16418,6 +13914,11 @@ static bool MaybeTranslateAccelerator(MSG& msg) {
         if (gIgnoreRepeatKey && msg.wParam == gIgnoreRepeatKey) {
             gIgnoreRepeatKey = 0;
         }
+        // releasing Shift finishes a keyboard selection; the highlighter turns it
+        // into a highlight the way a mouse-up does
+        if (msg.wParam == VK_SHIFT || msg.wParam == VK_LSHIFT || msg.wParam == VK_RSHIFT) {
+            SelectTextWithKeyboardOnKeyUp(FindMainWindowByHwnd(msg.hwnd), (int)msg.wParam);
+        }
     } else if (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) {
         if (gIgnoreRepeatKey && msg.wParam == gIgnoreRepeatKey) {
             // bit 30: key was already down (auto-repeat), not a new press
@@ -16464,7 +13965,7 @@ static bool MaybeTranslateAccelerator(MSG& msg) {
         if (AnnotationPlacementOnKeyDown(win, key)) {
             return true;
         }
-        if (ReadingAutoScrollOnKey(win, key)) {
+        if (ReadingAutoScrollOnKey(win, (int)key, IsCtrlPressed(), IsShiftPressed(), IsAltPressed())) {
             return true;
         }
     }
@@ -16480,7 +13981,7 @@ static bool MaybeTranslateAccelerator(MSG& msg) {
     // accelerators ('a' = highlight, 'n' = next page, …). Ctrl/Alt/Shift
     // shortcuts still work (Shift+F toggles the mode off). Issue #6019.
     if (msg.message == WM_KEYDOWN && !IsCtrlPressed() && !IsAltPressed() && !IsShiftPressed()) {
-        if (KeyboardLinkFollowingCapturesKey(FindMainWindowByHwnd(msg.hwnd), msg.wParam)) {
+        if (KeyboardLinkFollowingCapturesKey(FindMainWindowByHwnd(msg.hwnd), (int)msg.wParam)) {
             return false;
         }
     }
@@ -16620,68 +14121,16 @@ static void ShutdownCommon() {
     UninstallCrashHandler();
 }
 
-static void ReplaceColor(ParsedColor& col, Str maybeColor) {
-    ParsedColor c;
-    ParseColor(c, maybeColor);
-    if (c.parsedOk) {
-        SetColorText(col, SerializeColorTemp(c.col));
+// -window-pos stands in for the remembered position: code that has to know
+// the window's shape before it's on screen reads it from here
+// (EbookLayoutAspectForWindow), and a remembered maximized state would
+// otherwise ignore the rectangle we were given
+void ApplyWindowPosFlag(const Flags& i) {
+    if (i.windowPos.IsEmpty()) {
+        return;
     }
-}
-
-static void UpdateSettings(const Flags& i) {
-    if (!i.windowPos.IsEmpty()) {
-        // -window-pos stands in for the remembered position: code that has to
-        // know the window's shape before it's on screen reads it from here
-        // (EbookLayoutAspectForWindow), and a remembered maximized state would
-        // otherwise ignore the rectangle we were given
-        gSettings->windowPos = i.windowPos;
-        gSettings->windowState = WIN_STATE_NORMAL;
-    }
-    if (i.inverseSearchCmdLine) {
-        str::ReplaceWithCopy(&gSettings->inverseSearchCmdLine, i.inverseSearchCmdLine);
-        gSettings->enableTeXEnhancements = true;
-    }
-    if (i.invertColors) {
-        SetDocumentColorsFollowTheme(DocumentColorsFollowTheme::Smart);
-    }
-
-    Str arg;
-    Str param;
-    for (int n = 0; n < len(i.globalPrefArgs); n++) {
-        arg = i.globalPrefArgs[n];
-        if (str::EqI(arg, StrL("-esc-to-exit"))) {
-            gSettings->escToExit = true;
-        } else if (str::EqI(arg, StrL("-bgcolor")) || str::EqI(arg, StrL("-bg-color"))) {
-            // -bgcolor is for backwards compat (was used pre-1.3)
-            // -bg-color is for consistency
-            param = i.globalPrefArgs[++n];
-            ReplaceColor(gSettings->mainWindowBackground, param);
-        } else if (str::EqI(arg, StrL("-set-color-range"))) {
-            param = i.globalPrefArgs[++n];
-            ReplaceColor(gSettings->fixedPageUI.textColor, param);
-            param = i.globalPrefArgs[++n];
-            ReplaceColor(gSettings->fixedPageUI.backgroundColor, param);
-        } else if (str::EqI(arg, StrL("-fwdsearch-offset"))) {
-            param = i.globalPrefArgs[++n];
-            gSettings->forwardSearch.highlightOffset = ParseInt(param);
-            gSettings->enableTeXEnhancements = true;
-        } else if (str::EqI(arg, StrL("-fwdsearch-width"))) {
-            param = i.globalPrefArgs[++n];
-            gSettings->forwardSearch.highlightWidth = ParseInt(param);
-            gSettings->enableTeXEnhancements = true;
-        } else if (str::EqI(arg, StrL("-fwdsearch-color"))) {
-            param = i.globalPrefArgs[++n];
-            ReplaceColor(gSettings->forwardSearch.highlightColor, param);
-            gSettings->enableTeXEnhancements = true;
-        } else if (str::EqI(arg, StrL("-fwdsearch-permanent"))) {
-            param = i.globalPrefArgs[++n];
-            gSettings->forwardSearch.highlightPermanent = ParseInt(param);
-            gSettings->enableTeXEnhancements = true;
-        } else if (str::EqI(arg, StrL("-manga-mode"))) {
-            param = i.globalPrefArgs[++n];
-            gSettings->comicBookUI.cbxMangaMode = str::EqI(StrL("true"), param) || str::Eq(StrL("1"), param);
-        }
-    }
+    gSettings->windowPos = i.windowPos;
+    gSettings->windowState = WIN_STATE_NORMAL;
 }
 
 // we're in installer mode if the name of the executable
@@ -16792,7 +14241,7 @@ static bool IsLibsumatrapdfAvRaceError(DWORD err) {
 // Windows Application Control (WDAC / AppLocker / Smart App Control) refused
 // LoadLibrary — file is on disk but policy blocks execution. e.g. debug report
 // 8c09d3b87000001 with err=4551 ("An Application Control policy has blocked this file.").
-// Older SDKs / MinGW lack these Smart App Control / System Integrity error codes.
+// Older SDKs lack these Smart App Control / System Integrity error codes.
 #ifndef ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION
 constexpr DWORD ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION = 4551L;
 #endif
@@ -17017,7 +14466,7 @@ static void LogLibsumatrapdfLoadFailureDiagnostics(Str selfDir, Str buildDir, i6
 }
 
 static bool LoadLibsumatrapdf(bool showErrorDialog) {
-    // Static-linked builds (mingw wine cross-build, MSVC SumatraPDF-static) do
+    // Static-linked builds (SumatraPDF-static) do
     // not embed/delay-load libsumatrapdf.dll — MuPDF is already in the exe image.
     // HasEmbeddedLibsumatrapdf() is false when IDR_EMBEDDED_PAK has no libsumatrapdf.dll entry.
     if (!HasEmbeddedLibsumatrapdf()) {
@@ -17567,51 +15016,6 @@ static void LayoutAndFocusOnStartup(MainWindow* win) {
     NotifySessionRestoreFinished();
 }
 
-static int WineDpiFromEnv() {
-    static Str scaleVars[] = {StrL("GDK_SCALE"), StrL("QT_SCALE_FACTOR"), StrL("ELM_SCALE")};
-    int bestDpi = 0;
-    for (Str var : scaleVars) {
-        Str val = Str(getenv(var.s));
-        if (len(val) == 0) {
-            continue;
-        }
-        float scale = (float)atof(val.s);
-        if (scale < 1.f) {
-            continue;
-        }
-        int dpi = (int)lroundf(96.f * scale);
-        bestDpi = std::max(dpi, bestDpi);
-    }
-    return bestDpi;
-}
-
-static void LogWineDpiInfo() {
-    if (!IsRunningOnWine()) {
-        return;
-    }
-    HDC screenDC = GetDC(nullptr);
-    int screenDpi = screenDC ? GetDeviceCaps(screenDC, LOGPIXELSX) : 0;
-    if (screenDC) {
-        ReleaseDC(nullptr, screenDC);
-    }
-    uint monitorDpiX = 0, monitorDpiY = 0;
-    HMONITOR mon = MonitorFromWindow(nullptr, MONITOR_DEFAULTTOPRIMARY);
-    HRESULT hr = E_FAIL;
-    if (mon && DynGetDpiForMonitor) {
-        hr = DynGetDpiForMonitor(mon, 0, &monitorDpiX, &monitorDpiY);
-    }
-    int envDpi = WineDpiFromEnv();
-    if (envDpi > 0) {
-        DpiSetWineOverride(envDpi);
-    }
-    logf(
-        "WineDpi: screenDpi=%d monitorDpi=(%u,%u) GetDpiForMonitor hr=0x%lx envDpi=%d overrideDpi=%d "
-        "SM_CYCAPTION=%d SM_CYFRAME=%d SM_CXPADDEDBORDER=%d screen=(%d,%d)\n",
-        screenDpi, monitorDpiX, monitorDpiY, (unsigned long)hr, envDpi, DpiGetForHwnd(HWND_DESKTOP),
-        GetSystemMetrics(SM_CYCAPTION), GetSystemMetrics(SM_CYFRAME), GetSystemMetrics(SM_CXPADDEDBORDER),
-        GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-}
-
 // in mupdf_load_system_font.c
 extern "C" void destroy_system_font_list();
 
@@ -17647,7 +15051,7 @@ int fz_redirect_io_to_existing_console();
 // must match premake5.lua
 #define FZ_ENABLE_JS 1
 #define FZ_ENABLE_PDF 1
-#define FZ_ENABLE_BARCODE 0
+#define FZ_ENABLE_BARCODE 1
 #define FZ_VERSION "1.28.5"
 
 using MutoolFunc = int (*)(int argc, char* argv[]);
@@ -17917,6 +15321,8 @@ Run the command from cmd.exe instead, e.g.:
                 goto Exit;
             }
             fz_redirect_io_to_existing_console();
+            // the tools need the base14 fonts from the embedded archive
+            InstallEmbeddedFontLoader();
             res = toolFuncs[idx](argc, argv);
             goto Exit;
         }
@@ -17959,15 +15365,10 @@ static void LogOsInfo() {
     bool gotUbr = ReadRegDWORD(HKEY_LOCAL_MACHINE, key, StrL("UBR"), ubr);
     logf(
         "os: version=%u.%u.%d (%s) product='%s' display='%s' ubr=%s%d "
-        "process=%dbit os=%dbit arm=%d cores=%d wine=%d\n",
+        "process=%dbit os=%dbit arm=%d cores=%d\n",
         ver.dwMajorVersion, ver.dwMinorVersion, build, gotVersion ? OsNameFromVerTemp(ver) : StrL("unknown"), product,
         displayVersion, gotUbr ? StrL("") : StrL("?"), (int)ubr, IsProcess64() ? 64 : 32, IsOs64() ? 64 : 32,
-        (int)IsArmBuild(), CpuCoreCount(), (int)IsRunningOnWine());
-}
-
-static TempStr GetFileSizeAsStrTemp(Str path) {
-    i64 fileSize = file::GetSize(path);
-    return str::FormatFileSizeTemp(fileSize);
+        (int)IsArmBuild(), CpuCoreCount());
 }
 
 static void GetProgramInfo(str::Builder& b) {
@@ -17986,9 +15387,7 @@ static void GetProgramInfo(str::Builder& b) {
     b.Append(fmt("WebView2: %s\n", len(wv2Ver) > 0 ? wv2Ver : StrL("not installed")));
     TempStr signer = GetExecutableSignerTemp(exePath);
     b.Append(fmt("Signer: %s\n", signer ? signer : StrL("(not signed)")));
-    if (len(gBuiltOn) > 0) {
-        b.Append(fmt("BuiltOn: %s\n", gBuiltOn));
-    }
+    b.Append(fmt("BuiltOn: %s\n", BuiltOnDate()));
     Str exeType = IsDllBuild() ? StrL("dll") : StrL("static");
     Str instType = IsRunningInPortableMode() ? StrL("portable") : StrL("installed");
     b.Append(fmt("ExeType: %s, %s\n", exeType, instType));
@@ -18052,30 +15451,10 @@ static void ShowCrashHandlerMessage() {
 // where InstallCrashHandler() writes the .dmp, in the crash arena
 static Str gCrashDumpPath;
 
-// serialized settings, minus FileStates; lives in the crash arena so the
-// minidump comment can use it without allocating
-static Str gSettingsFile;
-
-void CrashHandlerSetSettings(Str settings) {
-    Arena* a = CrashHandlerArena();
-    if (!a) {
-        return;
-    }
-    gSettingsFile = {};
-    if (len(settings) == 0) {
-        return;
-    }
-    gSettingsFile = str::Dup(a, settings);
-    // The file is UTF-8 BOM + CRLF. This comment is LF text; a BOM or CR
-    // here shows up as a blank line after every settings line.
-    str::TrimPrefix(gSettingsFile, StrL(kUtf8Bom));
-    str::NormalizeNewlinesToLFInPlace(gSettingsFile);
-}
-
 // Message from MuPDF's uncaught-throw abort (error.c). Looked up at crash time
 // so we do not need a hard link for every tool that builds CrashHandlerNoOp.
 // libsumatrapdf.dll (or the static main module) exports fz_last_uncaught_error.
-static const char* LookupUncaughtMupdfError() {
+const char* LookupUncaughtMupdfError() {
     using Fn = const char* (*)();
     HMODULE modules[2] = {
         GetModuleHandleW(L"libsumatrapdf.dll"),
@@ -18094,32 +15473,6 @@ static const char* LookupUncaughtMupdfError() {
         }
     }
     return nullptr;
-}
-
-static void AppendUncaughtMupdfError(Arena* a, str::Builder& b) {
-    const char* msg = LookupUncaughtMupdfError();
-    if (!msg || !msg[0]) {
-        return;
-    }
-    // High-visibility: a crash with nothing interesting on the stack (the
-    // intentional null-write) still needs to explain the real failure
-    // (MuPDF throw with no fz_try).
-    b.Append(str::Format(a, "Uncaught MuPDF error: %s\n\n", Str(msg)));
-}
-
-static void AppendLogAndSettings(str::Builder& b) {
-    b.Append(StrL("\n-------- Log -----------------\n\n"));
-    if (gLogBuf) {
-        b.Append(ToStr(*gLogBuf));
-    } else {
-        b.Append(StrL("(no log - crashed before initializing logging)\n"));
-    }
-    if (len(gSettingsFile) == 0) {
-        return;
-    }
-    b.Append(StrL("\n--- settings ---\n"));
-    b.Append(gSettingsFile);
-    b.Append(StrL("\n"));
 }
 
 // The .dmp we write alongside this already has the stacks, the modules and the
@@ -18160,10 +15513,6 @@ static Str GetCrashComment(Arena* a, Str condStr, Str fileLine, bool isCrash) {
     }
     AppendLogAndSettings(b);
     return ToStr(b);
-}
-
-static void OnCrashBegin() {
-    gReducedLogging = true;
 }
 
 // FileStates are the largest part and we don't need them in a crash report
@@ -18300,9 +15649,9 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     if (ExeHasNameOfStoreInstaller()) {
         InstallSumatraCrashHandler(false);
         logf("Running store installer\n");
-        flags.installer.install = true;
+        flags.install = true;
         flags.silent = true;
-        flags.installer.storeInstaller = true;
+        flags.storeInstaller = true;
         gCli = &flags;
         int ret = RunInstaller();
         uitask::Destroy();
@@ -18342,7 +15691,6 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
         // TODO: only if AttachConsole() succeeds?
         gLogToConsole = true;
     }
-    LogWineDpiInfo();
     {
         // the cursor is on the monitor the user launched from. GetForegroundWindow
         // / HWND_DESKTOP report the *primary* monitor, which made the first
@@ -18357,12 +15705,11 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
         }
     }
 
-    bool isInstaller = flags.installer.install || flags.installer.runInstallNow || flags.installer.fastInstall ||
-                       IsInstallerAndNamedAsSuch();
-    if (flags.installer.justExtractFiles) {
+    bool isInstaller = flags.install || flags.runInstallNow || flags.fastInstall || IsInstallerAndNamedAsSuch();
+    if (flags.justExtractFiles) {
         isInstaller = false;
     }
-    bool isUninstaller = flags.installer.uninstall;
+    bool isUninstaller = flags.uninstall;
     bool noLogHere = isInstaller || isUninstaller;
 
     if (gCli->silent) {
@@ -18411,7 +15758,7 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     }
 #endif
 
-    if (flags.installer.showHelp && IsInstallerButNotInstalled()) {
+    if (flags.showHelp && IsInstallerButNotInstalled()) {
         ShowInstallerHelp();
         HandleRedirectedConsoleOnShutdown();
         return 0;
@@ -18420,7 +15767,7 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     if (flags.updateSelfTo) {
         logf(" flags.updateSelfTo: '%s'\n", flags.updateSelfTo);
         RedirectIOToExistingConsole();
-        UpdateSelfTo(flags.updateSelfTo);
+        UpdateSelfTo(flags.updateSelfTo, flags.sleepMs);
         if (flags.exitWhenDone) {
             fastExit = !gIsDebugBuild;
             goto Exit;
@@ -18475,17 +15822,18 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
         exitCode = RunInstaller();
         // exit immediately. for some reason exit handlers try to
         // pull in libsumatrapdf.dll which we don't have access to in the installer
+        ScheduleDeleteTempInstaller();
         ::ExitProcess(exitCode);
     }
 
     // when not a single self-contained exe, a missing sibling libsumatrapdf.dll means
     // we're really the installer; run it (matches pre-single-exe behavior)
-    if (!gSingleExe && ForceRunningAsInstaller() && !flags.dumpExif && !flags.dumpChm && !flags.engineDump &&
-        !flags.unitTests) {
+    if (!gSingleExe && ForceRunningAsInstaller() && !flags.dumpExif && !flags.dumpChm && !flags.unitTests) {
         logf("forcing running as an installer\n");
         exitCode = RunInstaller();
         // exit immediately. for some reason exit handlers try to
         // pull in libsumatrapdf.dll which we don't have access to in the installer
+        ScheduleDeleteTempInstaller();
         ::ExitProcess(exitCode);
     }
 
@@ -18511,7 +15859,7 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     // ParseFlags skips flag parsing when argv[1] is a mutool name (poster, …),
     // so poster’s own -x never sets justExtractFiles; MaybeRunMutool still runs
     // for tools after we load the DLL below.
-    if (flags.installer.justExtractFiles) {
+    if (flags.justExtractFiles) {
         bool attached = RedirectIOToExistingConsole();
         auto printExtractErr = [attached](Str msg) {
             logf("%s\n", msg);
@@ -18526,7 +15874,7 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
             return 1;
         }
         exitCode = 0;
-        if (!ExtractInstallerFiles(gCli->installer.installDir)) {
+        if (!ExtractInstallerFiles(gCli->installDir)) {
             Str err = gFirstError ? gFirstError : StrL("failed to extract files");
             printExtractErr(err);
             LogLastError();
@@ -18551,12 +15899,6 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
         return 0;
     }
 #endif
-
-    if (flags.engineDump) {
-        void EngineDump(const Flags& flags);
-        EngineDump(flags);
-        return 0;
-    }
 
     if (flags.dumpExif) {
         gLogToConsole = false;
@@ -18604,6 +15946,7 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     gRenderCache = new RenderCache();
     gFindTabByEngine = FindTabByEngineForCache;
     gCurrentTabForCache = CurrentTabForCache;
+    InstallLayoutNotifHooks();
 
     // TODO: for reasons I don't understand, this must be called before LoadSettings()
     DarkModeInit();
@@ -18717,7 +16060,7 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
         }
     }
 
-    if (flags.printDialog || flags.stressTestPath || gPluginMode || gForTesting) {
+    if (flags.printDialog || flags.stressTestPath || flags.configureRestrictedUse || gPluginMode || gForTesting) {
         // TODO: pass print request through to previous instance?
     } else if (flags.reuseDdeInstance || flags.dde) {
         existingHwnd = FindWindowW(kFrameClassName, nullptr);
@@ -18788,8 +16131,8 @@ ContinueOpenWindow:
     gInitialSessionData = gSettings->sessionData;
     gSettings->sessionData = new Vec<SessionData*>();
 
-    restoreSession =
-        SettingsRestoreSession() && (len(*gInitialSessionData) > 0) && !NeedsWindowEmbeddingHacks() && !flags.quickLook;
+    restoreSession = SettingsRestoreSession() && (len(*gInitialSessionData) > 0) && !NeedsWindowEmbeddingHacks() &&
+                     !flags.quickLook && !flags.configureRestrictedUse;
     if (!SettingsUseTabs() && (existingInstanceHwnd != nullptr)) {
         // do not restore a session if tabs are disabled and SumatraPDF is already running
         // TODO: maybe disable restoring if tabs are disabled?
@@ -18809,6 +16152,9 @@ ContinueOpenWindow:
     }
 
     if (restoreSession) {
+        // each window goes back to the virtual desktop it was on (#6271)
+        ISumatraVirtualDesktopManager* vdm = CreateVirtualDesktopManager();
+        MainWindow* winOnCurrentDesktop = nullptr;
         for (SessionData* data : *gInitialSessionData) {
             // create window hidden to avoid flashing the about page
             win = CreateAndShowMainWindow(data, false);
@@ -18877,6 +16223,10 @@ ContinueOpenWindow:
                 ReloadDocument(win, false);
             }
             ShowMainWindow(win, data->windowState);
+            MoveWindowToVirtualDesktop(vdm, win->hwndFrame, data->virtualDesktopId);
+            if (IsWindowOnCurrentDesktop(vdm, win->hwndFrame)) {
+                winOnCurrentDesktop = win;
+            }
             // Docs were loaded while the frame was hidden (normal windowPos size).
             // After maximize / fullscreen, force DisplayModel to match the
             // final canvas so scroll isn't stuck on the pre-show viewport
@@ -18887,6 +16237,15 @@ ContinueOpenWindow:
                 win->canvasRc = {};
                 win->UpdateCanvasSize();
             }
+        }
+        if (vdm) {
+            vdm->Release();
+        }
+        // the last window shown took the foreground; if it went to another
+        // desktop, a window that stayed gets it and the cmd-line files instead
+        if (winOnCurrentDesktop && winOnCurrentDesktop != win) {
+            win = winOnCurrentDesktop;
+            SetForegroundWindow(win->hwndFrame);
         }
     }
 
@@ -18921,7 +16280,9 @@ ContinueOpenWindow:
             continue;
         }
         if (flags.printDialog) {
-            PrintCurrentFile(win, flags.exitWhenDone);
+            // one dialog per file, one after another: only the classic one is modal
+            PrintUI ui = len(flags.fileNames) > 1 ? PrintUI::Classic : PrintUI::Auto;
+            PrintCurrentFile(win, flags.exitWhenDone, false, ui);
         }
     }
     if (tabToSelect) {
@@ -18969,6 +16330,9 @@ ContinueOpenWindow:
         if (!win) {
             goto Exit;
         }
+    }
+    if (flags.configureRestrictedUse) {
+        ShowConfigureRestrictedUseDialog(win);
     }
     if (flags.quickLook && win) {
         win->isQuickLook = true;

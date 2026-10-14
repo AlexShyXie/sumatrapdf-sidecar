@@ -41,3 +41,11 @@ bool IsShowingMenuBarRebar(MainWindow*);
 bool HandleMenuBarCommand(MainWindow*, int cmdId);
 bool ActivateMenuBarByAccel(MainWindow*, WCHAR accel);
 void UpdateCustomMenuBarMenuSelect(MainWindow*, WPARAM, LPARAM);
+
+struct MenuAccelText {
+    Str display;
+    int underlineOff = -1;
+    int underlineLen = 0;
+};
+
+MenuAccelText ParseMenuAccelTextTemp(Str s);

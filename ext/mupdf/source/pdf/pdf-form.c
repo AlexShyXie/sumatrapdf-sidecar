@@ -2013,6 +2013,41 @@ void pdf_signature_set_value(fz_context *ctx, pdf_document *doc, pdf_obj *field,
 		pdf_dict_put(ctx, t, PDF_NAME(Type), PDF_NAME(TransformParams));
 		pdf_dict_put(ctx, t, PDF_NAME(V), PDF_NAME(1_2));
 
+		/* SumatraPDF: PDF 2.0 "lock document after signing": the field's
+		 * /Lock /P goes into the transform too. */
+		{
+			pdf_obj *lp = pdf_dict_getp(ctx, field, "Lock/P");
+			if (lp)
+				pdf_dict_put(ctx, t, PDF_NAME(P), lp);
+		}
+
+		/* SumatraPDF: a certifying signature. The field's /SumatraCertify
+		 * holds the DocMDP permission (1..3). It has to be written here:
+		 * once the unsaved signature is stored below, later edits go into
+		 * a new xref section and the signature would not cover them. */
+		{
+			int perm = pdf_to_int(ctx, pdf_dict_gets(ctx, field, "SumatraCertify"));
+			if (perm >= 1 && perm <= 3)
+			{
+				pdf_obj *root = pdf_dict_get(ctx, pdf_trailer(ctx, doc), PDF_NAME(Root));
+				pdf_obj *m = pdf_new_dict(ctx, doc, 4);
+				pdf_obj *mt, *perms;
+				pdf_array_insert_drop(ctx, o, m, 0);
+				pdf_dict_put(ctx, m, PDF_NAME(Type), PDF_NAME(SigRef));
+				pdf_dict_put(ctx, m, PDF_NAME(TransformMethod), PDF_NAME(DocMDP));
+				pdf_dict_put(ctx, m, PDF_NAME(Data), root);
+				mt = pdf_dict_put_dict(ctx, m, PDF_NAME(TransformParams), 3);
+				pdf_dict_put(ctx, mt, PDF_NAME(Type), PDF_NAME(TransformParams));
+				pdf_dict_put_int(ctx, mt, PDF_NAME(P), perm);
+				pdf_dict_put(ctx, mt, PDF_NAME(V), PDF_NAME(1_2));
+				perms = pdf_dict_get(ctx, root, PDF_NAME(Perms));
+				if (!perms)
+					perms = pdf_dict_put_dict(ctx, root, PDF_NAME(Perms), 1);
+				pdf_dict_put(ctx, perms, PDF_NAME(DocMDP), indv);
+			}
+			pdf_dict_dels(ctx, field, "SumatraCertify");
+		}
+
 		/* Record details within the document structure so that contents
 		* and byte_range can be updated with their correct values at
 		* saving time */
@@ -2235,6 +2270,13 @@ void pdf_annot_event_page_invisible(fz_context *ctx, pdf_annot *annot)
 	annot_execute_action(ctx, annot, "AA/PI");
 }
 
+/* SumatraPDF: the pdf_js_event_* results come back NULL when out of memory */
+static void throw_if_js_oom(fz_context *ctx, int oom)
+{
+	if (oom)
+		fz_throw(ctx, FZ_ERROR_SYSTEM, "out of memory reading a JavaScript event result");
+}
+
 int pdf_field_event_keystroke(fz_context *ctx, pdf_document *doc, pdf_obj *field, pdf_keystroke_event *evt)
 {
 	pdf_js *js = doc->js;
@@ -2245,7 +2287,9 @@ int pdf_field_event_keystroke(fz_context *ctx, pdf_document *doc, pdf_obj *field
 		{
 			pdf_js_event_init_keystroke(js, field, evt);
 			pdf_execute_js_action(ctx, doc, field, "AA/K/JS", action);
-			return pdf_js_event_result_keystroke(js, evt);
+			int rc = pdf_js_event_result_keystroke(js, evt);
+			throw_if_js_oom(ctx, rc && (!evt->newChange || !evt->newValue));
+			return rc;
 		}
 	}
 	evt->newChange = fz_strdup(ctx, evt->change);
@@ -2280,7 +2324,9 @@ char *pdf_field_event_format(fz_context *ctx, pdf_document *doc, pdf_obj *field)
 			const char *value = pdf_field_value(ctx, field);
 			pdf_js_event_init(js, field, value, 1);
 			pdf_execute_js_action(ctx, doc, field, "AA/F/JS", action);
-			return pdf_js_event_value(js);
+			char *formatted = pdf_js_event_value(js);
+			throw_if_js_oom(ctx, !formatted);
+			return formatted;
 		}
 	}
 	return NULL;
@@ -2298,7 +2344,9 @@ int pdf_field_event_validate(fz_context *ctx, pdf_document *doc, pdf_obj *field,
 		{
 			pdf_js_event_init(js, field, value, 1);
 			pdf_execute_js_action(ctx, doc, field, "AA/V/JS", action);
-			return pdf_js_event_result_validate(js, newvalue);
+			int rc = pdf_js_event_result_validate(js, newvalue);
+			throw_if_js_oom(ctx, rc && !*newvalue);
+			return rc;
 		}
 	}
 	return 1;
@@ -2322,6 +2370,7 @@ void pdf_field_event_calculate(fz_context *ctx, pdf_document *doc, pdf_obj *fiel
 				if (pdf_js_event_result(js))
 				{
 					new_value = pdf_js_event_value(js);
+					throw_if_js_oom(ctx, !new_value);
 					if (strcmp(old_value, new_value))
 						pdf_set_field_value(ctx, doc, field, new_value, 0);
 				}

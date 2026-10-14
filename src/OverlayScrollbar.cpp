@@ -7,12 +7,12 @@
 
 #include "Theme.h"
 #include "OverlayScrollbar.h"
+#include "OverlayScrollbarCommon.h"
 
 constexpr const WCHAR* kOverlayScrollbarClass = L"SUMATRA_OVERLAY_SCROLLBAR";
 
 static bool gScrollbarClassRegistered = false;
 
-bool gOverlayScrollbarSuppressThick = false;
 // if true, draw small filled triangles instead of chevrons
 static bool gThickArrows = true;
 
@@ -23,63 +23,13 @@ static Point gLastMousePos = {-1, -1};
 static constexpr UINT_PTR kMouseTrackTimerID = 100;
 static constexpr int kMouseTrackIntervalMs = 50;
 
-// Derive scrollbar colors from current theme
-static Color ThemeTrackColor() {
-    Color bg = ThemeControlBackgroundColor();
-    return bg;
+// the names ng uses for these, so the code below is the same in both
+bool IsAlwaysThickMode(OverlayScrollbar* sb) {
+    return sb->mode == OverlayScrollbar::Mode::Thick;
 }
 
-static Color ThemeThumbColor() {
-    Color bg = ThemeControlBackgroundColor();
-    return AccentColor(bg, 100);
-}
-
-static Color ThemeThumbHoverColor() {
-    Color bg = ThemeControlBackgroundColor();
-    return AccentColor(bg, 140);
-}
-
-static constexpr int kMinThumbSize = 20;
-static constexpr u8 kAlphaThin = 180;
-static constexpr u8 kAlphaThick = 220;
-
-using State = OverlayScrollbar::State;
-
-static bool IsThick(OverlayScrollbar* sb) {
-    return sb->state == State::SmartThick || sb->state == State::AlwaysThick;
-}
-
-static bool IsVisible(OverlayScrollbar* sb) {
-    return sb->state == State::SmartThin || sb->state == State::SmartThick || sb->state == State::AlwaysThick;
-}
-
-// scrollbar is active: shown or auto-hidden but ready to appear
-static bool IsActive(OverlayScrollbar* sb) {
-    return sb->state != State::Hidden;
-}
-
-static int ScaledWidth(OverlayScrollbar* sb, bool thick) {
-    return thick ? sb->thickWidth : sb->thinWidth;
-}
-
-static bool IsVert(OverlayScrollbar* sb) {
-    return sb->type == OverlayScrollbar::Type::Vert;
-}
-
-// Get the track rect in client coords of the scrollbar window
-static Rect GetTrackRect(OverlayScrollbar* sb) {
-    Rect rc = HwndClientRect(sb->hwnd);
-    int arrowSize = 0;
-    int gap = 0;
-    if (IsThick(sb)) {
-        arrowSize = IsVert(sb) ? rc.dx : rc.dy;
-        gap = DpiScale(2);
-    }
-    int total = arrowSize + gap;
-    if (IsVert(sb)) {
-        return {0, total, rc.dx, rc.dy - (2 * total)};
-    }
-    return {total, 0, rc.dx - (2 * total), rc.dy};
+Rect ClientRect(OverlayScrollbar* sb) {
+    return HwndClientRect(sb->hwnd);
 }
 
 // Calculate thumb rect within the track
@@ -107,24 +57,6 @@ static Rect GetThumbRect(OverlayScrollbar* sb) {
         return {track.x, track.y + thumbOffset, track.dx, thumbLen};
     }
     return {track.x + thumbOffset, track.y, thumbLen, track.dy};
-}
-
-static Rect GetArrowTopRect(OverlayScrollbar* sb) {
-    Rect rc = HwndClientRect(sb->hwnd);
-    int arrowSize = IsVert(sb) ? rc.dx : rc.dy;
-    if (IsVert(sb)) {
-        return {0, 0, rc.dx, arrowSize};
-    }
-    return {0, 0, arrowSize, rc.dy};
-}
-
-static Rect GetArrowBottomRect(OverlayScrollbar* sb) {
-    Rect rc = HwndClientRect(sb->hwnd);
-    int arrowSize = IsVert(sb) ? rc.dx : rc.dy;
-    if (IsVert(sb)) {
-        return {0, rc.dy - arrowSize, rc.dx, arrowSize};
-    }
-    return {rc.dx - arrowSize, 0, arrowSize, rc.dy};
 }
 
 static void SendScrollMsg(OverlayScrollbar* sb, UINT scrollMsg, WPARAM wp) {
@@ -416,7 +348,7 @@ static void MakeLayeredWindowTransparent(HWND hwnd) {
     UpdateLayeredWindow(hwnd, nullptr, nullptr, nullptr, nullptr, nullptr, 0, &blend, ULW_ALPHA);
 }
 
-static void SetState(OverlayScrollbar* sb, State newState) {
+void SetState(OverlayScrollbar* sb, State newState) {
     if (sb->state == newState) {
         return;
     }
@@ -443,34 +375,11 @@ static void SetState(OverlayScrollbar* sb, State newState) {
     }
 }
 
-static void ShowScrollbarWindow(OverlayScrollbar* sb, bool thick) {
-    // Don't revert to thin while user is dragging the thumb
-    if (sb->isDragging && !thick) {
-        return;
-    }
-    if (sb->mode == OverlayScrollbar::Mode::Thick) {
-        SetState(sb, State::AlwaysThick);
-    } else {
-        SetState(sb, thick ? State::SmartThick : State::SmartThin);
-    }
-}
-
-static void HideScrollbarWindow(OverlayScrollbar* sb) {
-    // Don't hide while user is dragging the thumb
-    if (sb->isDragging) {
-        return;
-    }
-    if (sb->mode == OverlayScrollbar::Mode::Thick) {
-        return; // never hide in Thick mode
-    }
-    SetState(sb, State::SmartInvisible);
-}
-
 // Restart the thin-bar auto-hide countdown (showAfterScrollMs). SetState only
 // arms the timer on a state transition, so continuous scroll while already
 // SmartThin would otherwise let the earlier mouse-stop / first-reveal timer
 // fire and hide the bar mid-scroll.
-static void RestartSmartThinAutoHide(OverlayScrollbar* sb) {
+void RestartSmartThinAutoHide(OverlayScrollbar* sb) {
     if (!sb->hwnd || sb->state != State::SmartThin) {
         return;
     }
@@ -893,26 +802,6 @@ void OverlayScrollbarSetInfo(OverlayScrollbar* sb, const SCROLLINFO* si, bool re
     }
 }
 
-// Show the thin smart overlay after scroll activity (mouse wheel, keys, etc.).
-// Unlike mouse-move tracking, this does not require cursor motion (#5859).
-void OverlayScrollbarNotifyScroll(OverlayScrollbar* sb) {
-    if (!sb || !IsActive(sb) || sb->isDragging) {
-        return;
-    }
-    if (sb->mode == OverlayScrollbar::Mode::Thick) {
-        return;
-    }
-    // Leave thick-from-proximity alone; only (re)show the thin indicator.
-    if (IsThick(sb)) {
-        return;
-    }
-    if (sb->state != State::SmartThin) {
-        ShowScrollbarWindow(sb, false);
-    } else {
-        RestartSmartThinAutoHide(sb);
-    }
-}
-
 void OverlayScrollbarGetInfo(OverlayScrollbar* sb, SCROLLINFO* si) {
     if (!sb) {
         return;
@@ -1029,27 +918,4 @@ void OverlayScrollbarShow(OverlayScrollbar* sb, bool show) {
     OverlayScrollbarUpdatePos(sb);
     ShowScrollbarHwnd(sb);
     PaintScrollbar(sb);
-}
-
-// Change the scrollbar mode (Smart vs Thick)
-void OverlayScrollbarSetMode(OverlayScrollbar* sb, OverlayScrollbar::Mode mode) {
-    if (!sb || sb->mode == mode) {
-        return;
-    }
-    sb->mode = mode;
-    if (!IsActive(sb)) {
-        return;
-    }
-    // transition to the appropriate state for the new mode
-    if (mode == OverlayScrollbar::Mode::Thick) {
-        SetState(sb, State::AlwaysThick);
-    } else {
-        // Smart mode: start as thin, will auto-hide
-        SetState(sb, State::SmartThin);
-    }
-}
-
-// returns true if scrollbar is visible (thin, thick, or always thick)
-bool IsOverlayScrollbarVisible(OverlayScrollbar* sb) {
-    return sb && IsVisible(sb);
 }

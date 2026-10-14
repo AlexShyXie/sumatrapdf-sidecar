@@ -1,4 +1,6 @@
 import { Socket, createConnection } from "node:net";
+import { IS_WIN } from "./host.ts";
+import { macControlRequest, registerControlPath } from "./mac-control.ts";
 import { ensureModifierKeysUp, killAndWait, testWindowPos } from "./winapi.ts";
 import { drainProcStderr, SLOW_BUILD_FACTOR } from "./util.ts";
 
@@ -111,6 +113,24 @@ export enum ControlCommand {
   TestFrameNcStrips = 114,
   TestMergePdf = 115,
   TestWheelWhileClosing = 116,
+  // ng only: the menu model. "history" is the recent-file rows as "id=N text=...".
+  TestMainMenu = 117,
+  // ng only. Orig's 101/102 are StartPerfLog/StopPerfLog; ng reused those
+  // numbers, so this input command is 121 there.
+  TestInput = 121,
+  // ng only: frame state, including the in-frame notification text.
+  TestUiState = 122,
+  // ng only. Must stay 125: ng's wire id, and 127 is TestContextMenuAt.
+  TestToolWindow = 125,
+  // ng only: page context menu at a canvas point.
+  TestContextMenuAt = 127,
+  // the installer's KillProcWithId on a process id: asks a SumatraPDF to quit,
+  // terminates whatever is left
+  TestQuitProcess = 130,
+  // Rename File (F2) to a path, without its dialog
+  TestRenameFile = 131,
+  // holds background chapter layout (1) or lets it run (0)
+  TestChapterLayoutHold = 133,
 }
 
 export type ControlArg = number | string | Uint8Array | ControlArg[];
@@ -296,7 +316,12 @@ function decodeArg(r: PacketReader): ControlArg | undefined {
   throw new Error(`unknown control argument type ${type}`);
 }
 
+// A named pipe on Windows; elsewhere a unix domain socket, <name> being its
+// path or, without a "/", /tmp/<name>.sock (see SumatraControl.cpp).
 function pipePath(pipeName: string): string {
+  if (!IS_WIN) {
+    return pipeName.includes("/") ? pipeName : `/tmp/${pipeName}.sock`;
+  }
   return pipeName.startsWith("\\\\.\\pipe\\") ? pipeName : `\\\\.\\pipe\\${pipeName}`;
 }
 
@@ -305,7 +330,9 @@ async function readExactly(socket: Socket, len: number): Promise<Buffer> {
   let total = 0;
   while (total < len) {
     const chunk = socket.read(len - total) as Buffer | null;
-    if (chunk) {
+    // Bun can return an empty buffer when nothing is readable yet. Treating
+    // that as data spins and never flushes the request we just wrote.
+    if (chunk && chunk.length > 0) {
       chunks.push(chunk);
       total += chunk.length;
       continue;
@@ -404,6 +431,7 @@ export class ControlClient {
     while (Date.now() < deadline) {
       try {
         const socket = await connectSocket(path);
+        registerControlPath(path);
         return new ControlClient(socket);
       } catch (e) {
         lastErr = e;
@@ -414,6 +442,11 @@ export class ControlClient {
   }
 
   async request(cmd: ControlCommand, args: ControlArg[] = []): Promise<ControlArg[]> {
+    // The node socket's read loop spins on macOS once a second connection is
+    // also talking. Window messages already use that connection; use it here too.
+    if (!IS_WIN) {
+      return macControlRequest(cmd, args);
+    }
     if (this.socket.destroyed) {
       throw new Error("control pipe closed");
     }
@@ -504,8 +537,19 @@ export class ControlClient {
   // What the home page's keyboard navigation is doing: the selected entry, how
   // many entries the search box currently leaves, and whether it has the focus.
   // Wait on this after sending a key rather than sleeping.
-  async homeSelection(mode?: "list" | "thumbnails"): Promise<HomeSelection> {
-    const res = await this.request(ControlCommand.TestHomeSelection, mode ? [mode] : []);
+  async homeSelection(mode?: "list" | "thumbnails", winIdx = 0): Promise<HomeSelection> {
+    // a window index follows the view-mode string when that is present, and
+    // is the only argument otherwise. Window 0 is the historical request.
+    const args: (string | number)[] = [];
+    if (mode) {
+      args.push(mode);
+      if (winIdx) {
+        args.push(winIdx);
+      }
+    } else if (winIdx) {
+      args.push(winIdx);
+    }
+    const res = await this.request(ControlCommand.TestHomeSelection, args);
     const code = typeof res[0] === "number" ? res[0] : -1;
     const raw = String(res[1] ?? "").trim();
     if (code !== 0) {
@@ -675,6 +719,29 @@ export class ControlClient {
     if (code !== 0) {
       throw new Error(`TestHiddenTabGoToPage failed: ${raw || code}`);
     }
+  }
+
+  // Rename File (F2) of the current document to dstPath, without the dialog
+  async setChapterLayoutHold(hold: boolean): Promise<void> {
+    const res = await this.request(ControlCommand.TestChapterLayoutHold, [hold ? 1 : 0]);
+    const code = typeof res[0] === "number" ? res[0] : -1;
+    if (code !== 0) {
+      throw new Error(`TestChapterLayoutHold failed: ${String(res[1] ?? "").trim() || code}`);
+    }
+  }
+
+  async renameFile(dstPath: string): Promise<void> {
+    const res = await this.request(ControlCommand.TestRenameFile, [dstPath]);
+    const code = typeof res[0] === "number" ? res[0] : -1;
+    if (code !== 0) {
+      throw new Error(`TestRenameFile failed: ${String(res[1] ?? "").trim() || code}`);
+    }
+  }
+
+  // stops another process the way the installer does; true once it is gone
+  async quitProcess(pid: number): Promise<boolean> {
+    const res = await this.request(ControlCommand.TestQuitProcess, [pid]);
+    return typeof res[0] === "number" && res[0] === 0;
   }
 
   async selectionSurvivesRenumber(
@@ -859,4 +926,24 @@ if (import.meta.main) {
   }
   const res = await runControlCommand(exe, cmd, args);
   console.log(JSON.stringify(res));
+}
+
+// Polls the home page until it is ready and `pred` holds; `what` names the failure.
+export async function waitForHome(
+  client: ControlClient,
+  pred: (h: HomeSelection) => boolean,
+  what: string,
+  timeoutMs = 8000,
+): Promise<HomeSelection> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const last = await client.homeSelection();
+    if (last.ready && pred(last)) {
+      return last;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`${what} (last: ${last.raw})`);
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
 }

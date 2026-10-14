@@ -25,13 +25,9 @@
 #include "Theme.h"
 #include "DarkMode.h"
 #include "TabGroupsManage.h"
+#include "AppHelpersCommon.h"
 
 constexpr int kPadding = 8;
-
-enum class TabGroupDialogMode {
-    Save,
-    Open,
-};
 
 struct TabGroupsListBoxModel : ListBoxModel {
     Vec<TabGroup*> groups;
@@ -163,21 +159,6 @@ void TabGroupsWnd::OpenTabGroup() {
     // post WM_CLOSE instead of DestroyWindow so we return from the
     // listbox double-click callback before the dialog is torn down
     PostMessageW(hwnd, WM_CLOSE, 0, 0);
-}
-
-static void FreeTabGroup(TabGroup* group) {
-    if (!group) {
-        return;
-    }
-    str::Free(group->name);
-    if (group->tabFiles) {
-        for (auto* tf : *group->tabFiles) {
-            str::Free(tf->path);
-            free(tf);
-        }
-        delete group->tabFiles;
-    }
-    free(group);
 }
 
 void TabGroupsWnd::UpdateDeleteButton() {
@@ -388,7 +369,7 @@ bool TabGroupsWnd::Create(MainWindow* winIn, TabGroupDialogMode modeIn) {
     return true;
 }
 
-static void ShowTabGroupsDialog(MainWindow* win, TabGroupDialogMode mode) {
+void ShowTabGroupsDialog(MainWindow* win, TabGroupDialogMode mode) {
     for (auto* w : gTabGroupsWnds) {
         if (w->win == win && w->mode == mode) {
             if (w->hwnd && IsWindow(w->hwnd)) {
@@ -410,12 +391,4 @@ static void ShowTabGroupsDialog(MainWindow* win, TabGroupDialogMode mode) {
         return;
     }
     VecAppend(gTabGroupsWnds, wnd);
-}
-
-void ShowSaveTabGroupDialog(MainWindow* win) {
-    ShowTabGroupsDialog(win, TabGroupDialogMode::Save);
-}
-
-void ShowOpenTabGroupDialog(MainWindow* win) {
-    ShowTabGroupsDialog(win, TabGroupDialogMode::Open);
 }

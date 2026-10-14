@@ -47,6 +47,20 @@ relative to `ext/mupdf`, so `-p1` from inside that directory.
 | `0044-svg-unsized-image` | `<image>` with no width/height uses the raster's pixel size; a percentage `<svg>` with no viewBox adopts that size (#6266) |
 | `0045-console-utf8-via-writeconsolew` | UTF-8 to a Windows console through `WriteConsoleW`; the CRT failed the write on a DBCS code page (#6276) |
 | `0046-grep-keep-page-of-pending-line` | `grep` read a text page the search had already dropped (#6276) |
+| `0047-jpeg-xl-pdf` | JPEG XL images and PDF `/JXLDecode` via jxldec (`src/mupdf/load-jxl.cpp`) |
+| `0048-pdf-compress-enum` | `compress=flate` and `compress=brotli` reach the enum; a non-boolean used to be taken as success |
+| `0049-merge-catch-bad-write-options` | `merge -O` reports an unknown option instead of aborting with no `fz_try` |
+| `0050-rearrange-pages-keep-old-parent-tree` | `pdf_rearrange_pages` keeps the old structure `/ParentTree` alive while it is still read; Merge PDF on a tagged PDF used freed memory |
+| `0051-js-execute-contain-errors` | `pdf_js_execute` reports an error instead of rethrowing it on the JS context, which has no `fz_try` on a render thread |
+| `0052-js-event-results-no-throw` | `pdf_js_event_*` results return NULL when out of memory and the `pdf-form.c` callers throw on their own context |
+| `0053-pdf-sign-docmdp-certify` | a signature field with `/SumatraCertify` 1..3 signs as a certifying signature: DocMDP `/Reference` and catalog `/Perms` written inside the signed section; a field's `/Lock /P` (PDF 2.0 lock after signing) is copied into the FieldMDP transform (discussion #6315) |
+| `0054-epub-linear-no-last` | EPUB spine items with `linear="no"` (footnotes, endnotes) are paged after the reading order, not where they sit in the spine; XHTML manifest items no itemref names are paged after those, so links reach them (#5803) |
+| `0055-svg-data-uri-parameters` | SVG image data URIs accept media-type parameters before `;base64` (#6322) |
+| `0056-html-svg-percent-size` | SVG percentage dimensions resolve against the HTML page viewport (#6324) |
+| `0057-scalable-image-device-size` | SVG / display-list images rasterize at the zoomed size instead of a fixed 96 dpi; fixed-layout EPUB pages were blurry (#6330) |
+| `0058-unwrap-display-list-image` | `fz_unwrap_display_list_image`: the one raster an SVG draws, so Save Image / copy keep its bytes and resolution (#6330) |
+| `0059-svg-text-path` | SVG `<textPath>` places glyphs along the referenced path; such text used to pile up at the origin (#6332) |
+| `0060-pdf-update-object-keeps-stream` | `pdf_update_object` carries a stream over when the entry moves to a new xref section; a stream added in the session lost its data on a `garbage=3` save |
 
 That is the whole list: `ext/mupdf` is byte-for-byte `1.28.5` plus these
 patches, and nothing else.

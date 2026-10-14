@@ -1,0 +1,342 @@
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
+   License: GPLv3 */
+
+// ng: orig's src/tests/Sumatra_ut.cpp is also the unit test driver
+// (RunAppUnitTests). src/tools/test_util.cpp is the driver here, so this file
+// keeps only the test bodies. ParseTip_UnitTests and SvgTextIcon_UnitTests are
+// left out: they need VirtCtrl / SvgIcons (step 12).
+
+#include "base/Base.h"
+#include "base/CmdLineArgs.h"
+#include "base/File.h"
+
+#include "gui/UIModels.h"
+
+#include "Settings.h"
+#include "DocController.h"
+#include "DocProperties.h"
+#include "EngineBase.h"
+#include "AppSettings.h"
+#include "DisplayMode.h"
+#include "Flags.h"
+#include "Commands.h"
+#include "AIChatCommon.h"
+#include "SystemFonts.h"
+
+#if OS_LINUX || OS_DARWIN
+extern "C" {
+#include <mupdf/fitz.h>
+#if OS_LINUX
+void install_load_linux_font_funcs(fz_context* ctx);
+#else
+void install_load_mac_font_funcs(fz_context* ctx);
+#endif
+}
+#endif
+
+// must be last to over-write assert()
+#include "base/tests/UtAssert.h"
+
+// in src/shared/tests/SumatraCommon_ut.cpp
+void BenchRangeTest();
+void versioncheck_test();
+void hexstrTest();
+void colorTest();
+void parseCommandsTest();
+void DocPropertiesTest();
+void ParseFileArgsTest();
+void RestrictedUseConfigTest();
+
+void CachedObjects_UnitTests();
+void CommandPaletteModel_UnitTests();
+void ImageReader_UnitTests();
+bool RenderCache_UnitTestCookieUnlocked();
+
+#if OS_POSIX && !OS_WASM
+static void AIChatProcessTest() {
+    u8 rnd1[16];
+    u8 rnd2[16];
+    memset(rnd1, 0xff, sizeof(rnd1));
+    memset(rnd2, 0, sizeof(rnd2));
+    TempStr id1 = AIChatFormatSessionIdTemp(rnd1);
+    TempStr id2 = AIChatFormatSessionIdTemp(rnd2);
+    utassert(len(id1) == 36);
+    utassert(id1.s[8] == '-' && id1.s[13] == '-' && id1.s[18] == '-' && id1.s[23] == '-');
+    utassert(id1.s[14] == '4');
+    utassert(str::Contains(StrL("89ab"), Str(id1.s + 19, 1)));
+    utassert(!str::Eq(id1, id2));
+
+    StrVec candidates;
+    TempStr shell = AIChatFindExecutableTemp(candidates, StrL("sh"), StrL("sh"));
+    utassert(len(shell) > 0);
+
+    TempStr payload = StrL("portable process: \\\"ok\\\"");
+    TempStr shellCmd = fmt("printf '%%s' %s", QuoteCmdLineArgTemp(payload));
+    TempStr cmdLine = fmt("%s -c %s", QuoteCmdLineArgTemp(shell), QuoteCmdLineArgTemp(shellCmd));
+    AIChatProcessLaunchResult launch;
+    utassert(AIChatLaunchProcessWithStdoutPipe(cmdLine, {}, &launch));
+    utassert(launch.ok);
+    utassert(launch.processId > 0);
+
+    str::Builder output;
+    AIChatReadPipeToEnd(launch.hReadPipe, output);
+    launch.hReadPipe = nullptr;
+    utassert(AIChatWaitForProcess(launch.hProcess, 1000));
+    AIChatCloseProcess(&launch.hProcess, false);
+    utassert(str::Eq(ToStr(output), payload));
+
+    cmdLine = fmt("%s -c %s", QuoteCmdLineArgTemp(shell), QuoteCmdLineArgTemp(StrL("sleep 1")));
+    utassert(AIChatLaunchProcessWithStdoutPipe(cmdLine, {}, &launch));
+    utassert(!AIChatWaitForProcess(launch.hProcess, 0));
+    AIChatTerminateProcess(launch.hProcess);
+    AIChatCloseProcess(&launch.hProcess, false);
+}
+#endif
+
+#if OS_DARWIN
+// Body text in a markdown file is CSS sans-serif, which loads a system face.
+static void OpenMarkdownWithSystemFonts(fz_context* ctx) {
+    TempStr bare = GetTempFilePathTemp(StrL("sumd"));
+    utassert(bare.s);
+    TempStr mdPath = fmt("%s.md", bare);
+    utassert(file::WriteFile(mdPath, StrL("# Hello\n\nplain **bold** and `code`.\n")));
+
+    fz_document* doc = nullptr;
+    int nPages = 0;
+    int failed = 0;
+    fz_var(doc);
+    fz_var(nPages);
+    fz_var(failed);
+    fz_try(ctx) {
+        fz_register_document_handlers(ctx);
+        doc = fz_open_document(ctx, CStrTemp(mdPath));
+        fz_layout_document(ctx, doc, 450, 600, 12);
+        nPages = fz_count_pages(ctx, doc);
+    }
+    fz_always(ctx) {
+        fz_drop_document(ctx, doc);
+    }
+    fz_catch(ctx) {
+        failed = 1;
+    }
+    file::Delete(mdPath);
+    file::Delete(bare);
+    utassert(!failed);
+    utassert(nPages > 0);
+}
+#endif
+
+#if OS_LINUX || OS_DARWIN
+static void PlatformSystemFontTest() {
+    fz_context* ctx = fz_new_context(nullptr, nullptr, FZ_STORE_UNLIMITED);
+    utassert(ctx);
+#if OS_LINUX
+    install_load_linux_font_funcs(ctx);
+    fz_font* font = fz_load_system_font(ctx, "sans-serif", 0, 0, 0);
+    utassert(font);
+    fz_drop_font(ctx, font);
+#else
+    install_load_mac_font_funcs(ctx);
+    fz_font* font = fz_load_system_font(ctx, "Helvetica", 0, 0, 0);
+    utassert(font);
+    utassert(fz_encode_character(ctx, font, 'A') > 0);
+    fz_drop_font(ctx, font);
+    font = fz_load_system_font(ctx, "sans-serif", 1, 1, 0);
+    utassert(font);
+    fz_drop_font(ctx, font);
+    font = fz_load_system_font(ctx, "serif", 0, 1, 0);
+    utassert(font);
+    fz_drop_font(ctx, font);
+    font = fz_load_system_font(ctx, "monospace", 1, 0, 0);
+    utassert(font);
+    fz_drop_font(ctx, font);
+    OpenMarkdownWithSystemFonts(ctx);
+#endif
+    font = fz_load_system_font(ctx, "SumatraMissingFont-7FA26D", 0, 0, 1);
+    utassert(!font);
+    fz_drop_context(ctx);
+}
+#endif
+
+#if OS_WIN || OS_LINUX || defined(__APPLE__)
+static void SystemFontNamesTest() {
+    StrVec names;
+    GetInstalledFontNames(names);
+    utassert(len(names) > 0);
+    for (int i = 1; i < len(names); i++) {
+        utassert(!StrLessNoCase(names[i], names[i - 1]));
+        utassert(!str::EqI(names[i], names[i - 1]));
+    }
+}
+#endif
+
+#if OS_WIN
+static void ParseCommandLineTest() {
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), L"SumatraPDF.exe -install -no-desktop-shortcut", i);
+        utassert(i.install);
+        utassert(i.noDesktopShortcut);
+        utassert(0 == len(i.fileNames));
+    }
+
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), L"SumatraPDF.exe -start-perf-log -log-perf-file c:\\tmp\\perf.txt foo.pdf", i);
+        utassert(i.startPerfLog);
+        utassert(str::Eq(i.perfLogFile, StrL("c:\\tmp\\perf.txt")));
+        utassert(1 == len(i.fileNames));
+    }
+
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), L"SumatraPDF.exe -bench foo.pdf", i);
+        utassert(2 == len(i.pathsToBenchmark));
+        utassert(str::Eq(StrL("foo.pdf"), i.pathsToBenchmark[0]));
+        utassert(len(i.pathsToBenchmark[1]) == 0);
+    }
+
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), L"SumatraPDF.exe -bench foo.pdf -fwdsearch-width 5", i);
+        utassert(len(i.globalPrefArgs) == 2);
+        Str s = i.globalPrefArgs[0];
+        utassert(str::Eq(s, StrL("-fwdsearch-width")));
+        s = i.globalPrefArgs[1];
+        utassert(str::Eq(s, StrL("5")));
+        utassert(2 == len(i.pathsToBenchmark));
+        utassert(str::Eq(StrL("foo.pdf"), i.pathsToBenchmark[0]));
+        utassert(len(i.pathsToBenchmark[1]) == 0);
+    }
+
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), L"SumatraPDF.exe -bench bar.pdf loadonly", i);
+        utassert(2 == len(i.pathsToBenchmark));
+        utassert(str::Eq(StrL("bar.pdf"), i.pathsToBenchmark[0]));
+        utassert(str::Eq(StrL("loadonly"), i.pathsToBenchmark[1]));
+    }
+
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), L"SumatraPDF.exe -bench bar.pdf 1 -set-color-range 0x123456 #abCDef", i);
+        utassert(len(i.globalPrefArgs) == 3);
+        utassert(2 == len(i.pathsToBenchmark));
+        utassert(str::Eq(StrL("bar.pdf"), i.pathsToBenchmark[0]));
+        utassert(str::Eq(StrL("1"), i.pathsToBenchmark[1]));
+    }
+
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), L"SumatraPDF.exe -bench bar.pdf 1-5,3   -bench some.pdf 1,3,8-34", i);
+        utassert(4 == len(i.pathsToBenchmark));
+        utassert(str::Eq(StrL("bar.pdf"), i.pathsToBenchmark[0]));
+        utassert(str::Eq(StrL("1-5,3"), i.pathsToBenchmark[1]));
+        utassert(str::Eq(StrL("some.pdf"), i.pathsToBenchmark[2]));
+        utassert(str::Eq(StrL("1,3,8-34"), i.pathsToBenchmark[3]));
+    }
+
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), L"SumatraPDF.exe -presentation -bgcolor 0xaa0c13 foo.pdf -invert-colors bar.pdf", i);
+        utassert(true == i.enterPresentation);
+        utassert(true == i.invertColors);
+        utassert(2 == len(i.fileNames));
+        utassert(0 == i.fileNames.Find(StrL("foo.pdf")));
+        utassert(1 == i.fileNames.Find(StrL("bar.pdf")));
+    }
+
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), L"SumatraPDF.exe -bg-color 0xaa0c13 -invertcolors rosanna.pdf", i);
+        utassert(true == i.invertColors);
+        utassert(1 == len(i.fileNames));
+        utassert(0 == i.fileNames.Find(StrL("rosanna.pdf")));
+    }
+
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), LR"(SumatraPDF.exe "foo \" bar \\.pdf" un\"quoted.pdf)", i);
+        utassert(2 == len(i.fileNames));
+        utassert(0 == i.fileNames.Find(StrL(R"(foo " bar \\.pdf)")));
+        utassert(1 == i.fileNames.Find(StrL(R"(un"quoted.pdf)")));
+    }
+
+    {
+        Flags i;
+        ParseFlags(
+            GetPermArena(),
+            L"SumatraPDF.exe -page 37 -view continuousfacing -zoom fitcontent -scroll 45,1234         -reuse-instance",
+            i);
+        utassert(0 == len(i.fileNames));
+        utassert(i.pageNumber == 37);
+        utassert(i.startView == DisplayMode::ContinuousFacing);
+        utassert(i.startZoom == kZoomFitContent);
+        utassert(i.startScroll.x == 45 && i.startScroll.y == 1234);
+    }
+
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), LR"(SumatraPDF.exe -view "single page" -zoom 237.45 -scroll -21,-1)", i);
+        utassert(0 == len(i.fileNames));
+        utassert(i.startView == DisplayMode::SinglePage);
+        utassert(i.startZoom == 237.45f);
+        utassert(i.startScroll.x == -21 && i.startScroll.y == -1);
+    }
+
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), L"SumatraPDF.exe -zoom 35%", i);
+        utassert(0 == len(i.fileNames));
+        utassert(i.startZoom == 35.f);
+    }
+
+    {
+        Flags i;
+        ParseFlags(GetPermArena(), L"SumatraPDF.exe -zoom fit-content", i);
+        utassert(i.startZoom == kZoomFitContent);
+        utassert(0 == len(i.fileNames));
+    }
+}
+
+#endif
+
+static void PageAspectViewTest() {
+    DisplayMode mode = DisplayMode::Automatic;
+    float zoom = kInvalidZoom;
+    utassert(GetPageAspectView(RectF(0, 0, 800, 600), &mode, &zoom));
+    utassert(mode == DisplayMode::SinglePage);
+    utassert(zoom == kZoomFitPage);
+    utassert(GetPageAspectView(RectF(0, 0, 600, 800), &mode, &zoom));
+    utassert(mode == DisplayMode::Continuous);
+    utassert(zoom == kZoomFitWidth);
+    utassert(!GetPageAspectView(RectF(), &mode, &zoom));
+}
+
+void SumatraPDF_UnitTests() {
+    RestrictedUseConfigTest();
+    CachedObjects_UnitTests();
+    CommandPaletteModel_UnitTests();
+    ImageReader_UnitTests();
+    utassert(RenderCache_UnitTestCookieUnlocked());
+#if OS_POSIX && !OS_WASM
+    AIChatProcessTest();
+#endif
+#if OS_LINUX || OS_DARWIN
+    PlatformSystemFontTest();
+#endif
+#if OS_WIN || OS_LINUX || defined(__APPLE__)
+    SystemFontNamesTest();
+#endif
+    DocPropertiesTest();
+    PageAspectViewTest();
+    parseCommandsTest();
+    colorTest();
+    BenchRangeTest();
+#if OS_WIN
+    ParseCommandLineTest();
+    ParseFileArgsTest();
+#endif
+    versioncheck_test();
+    hexstrTest();
+}

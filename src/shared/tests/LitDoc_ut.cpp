@@ -1,0 +1,221 @@
+/* Copyright 2026 the SumatraPDF project authors (see AUTHORS file).
+   License: GPLv3 */
+
+#include "base/Base.h"
+
+#include "LitDoc.h"
+
+#include "base/tests/UtAssert.h"
+
+constexpr int kHdrLen = 40;
+constexpr int kNPieces = 5;
+constexpr int kPieceLen = 16;
+constexpr int kSecHdrLen = 56;
+constexpr int kDirOff = kHdrLen + (kNPieces * kPieceLen) + kSecHdrLen;
+constexpr int kDirectoryHeaderLen = 32;
+constexpr int kChunkHeaderLen = 48;
+
+// little-endian writer over a zero-filled buffer
+struct LeWriter {
+    u8* d;
+    int cap = 0;
+    int off = 0;
+
+    void Need(int n) { ReportIf(off < 0 || n < 0 || off + n > cap); }
+    void Zeros(int n) {
+        Need(n);
+        off += n;
+    }
+    void U8(u8 v) {
+        Need(1);
+        d[off++] = v;
+    }
+    void U16(u16 v) {
+        U8((u8)v);
+        U8((u8)(v >> 8));
+    }
+    void U32(u32 v) {
+        U16((u16)v);
+        U16((u16)(v >> 16));
+    }
+    void U64(u64 v) {
+        U32((u32)v);
+        U32((u32)(v >> 32));
+    }
+    void Bytes(const char* s, int n) {
+        Need(n);
+        memcpy(d + off, s, (size_t)n);
+        off += n;
+    }
+    void EncInt(u32 v) {
+        u8 tmp[8];
+        int n = 0;
+        do {
+            tmp[n++] = (u8)(v & 0x7f);
+            v >>= 7;
+        } while (v);
+        for (int i = n - 1; i > 0; i--) {
+            U8(tmp[i] | 0x80);
+        }
+        U8(tmp[0]);
+    }
+    void Entry(Str name, u32 section, u32 offset, u32 size) {
+        EncInt(len(name));
+        Bytes(name.s, len(name));
+        EncInt(section);
+        EncInt(offset);
+        EncInt(size);
+    }
+};
+
+static Str MkLitBuf(int fileLen, int hdrLen, int nPieces, int secHdrLen) {
+    u8* d = AllocArray<u8>(fileLen);
+    LeWriter w{d, fileLen};
+    w.Bytes("ITOLITLS", 8);
+    w.U32(1);
+    w.U32((u32)hdrLen);
+    w.U32((u32)nPieces);
+    w.U32((u32)secHdrLen);
+    ReportIf(w.off > hdrLen);
+    return Str((char*)d, fileLen);
+}
+
+static void LitMustReject(Str lit) {
+    Str epub = LitToEpubConvert(lit);
+    utassert(str::IsNull(epub));
+    str::Free(epub);
+    str::Free(lit);
+}
+
+// hdrLen near INT_MAX: hdrLen + nPieces*16 used to wrap to a negative offset
+static Str MkLitHdrLenWrap() {
+    return MkLitBuf(kHdrLen, 0x7ffffff0, kNPieces, 0);
+}
+
+// secondary-header pos = 0x7fffffff: pos+8 used to overflow the loop bound
+static Str MkLitPosOverflow() {
+    constexpr int kShortSecHdrLen = 16;
+    constexpr int kFileLen = kHdrLen + (kNPieces * kPieceLen) + kShortSecHdrLen;
+    Str s = MkLitBuf(kFileLen, kHdrLen, kNPieces, kShortSecHdrLen);
+    LeWriter w{(u8*)s.s, len(s)};
+    w.off = kHdrLen + (kNPieces * kPieceLen) + 4;
+    w.U32(0x7fffffff);
+    return s;
+}
+
+// directory offset/length whose signed i64 sum wraps past the file size
+static Str MkLitDirRangeWrap() {
+    constexpr int kFileLen = kHdrLen + (kNPieces * kPieceLen) + kSecHdrLen;
+    Str s = MkLitBuf(kFileLen, kHdrLen, kNPieces, kSecHdrLen);
+    u8* d = (u8*)s.s;
+    LeWriter w{d, kFileLen};
+    w.off = kHdrLen + kPieceLen; // piece 1
+    w.U64(0x7ffffffff0000000ull);
+    w.U64(0x10000010ull);
+    w.off = kHdrLen + (kNPieces * kPieceLen);
+    w.U32(0);
+    w.U32(8); // pos of ITSF
+    w.Bytes("ITSF", 4);
+    w.U32(4);
+    return s;
+}
+
+static void WriteLitDirectory(LeWriter& w, int dirOff, int chunkSize, int freeSpace, u32 contentOff) {
+    w.off = kHdrLen + kPieceLen;
+    w.U64(dirOff);
+    w.U64(kDirectoryHeaderLen + chunkSize);
+
+    w.off = kHdrLen + (kNPieces * kPieceLen);
+    w.U32(0);
+    w.U32(8);
+    w.Bytes("ITSF", 4);
+    w.U32(4);
+    w.Zeros(8);
+    w.U32(contentOff);
+    w.U32(0);
+
+    w.off = dirOff;
+    w.Bytes("IFCM", 4);
+    w.U32(0);
+    w.U32(chunkSize);
+    w.Zeros(12);
+    w.U32(1);
+    w.Bytes("AOLL", 4);
+    w.U32(freeSpace);
+    w.off = dirOff + kDirectoryHeaderLen + kChunkHeaderLen;
+}
+
+// ITSF contentOffset = 0x80000000 used to narrow to a negative int
+static Str MkLitContentOffsetNeg() {
+    constexpr int kChunkSize = 128;
+    constexpr int kDirLen = kDirectoryHeaderLen + kChunkSize;
+    constexpr int kFileLen = kDirOff + kDirLen; // 336
+
+    Str s = MkLitBuf(kFileLen, kHdrLen, kNPieces, kSecHdrLen);
+    u8* d = (u8*)s.s;
+    LeWriter w{d, kFileLen};
+    WriteLitDirectory(w, kDirOff, kChunkSize, 54, 0x80000000);
+    w.Entry(StrL("::DataSpace/NameList"), 0, 0, 4);
+    d[kDirOff + kDirLen - 2] = 1; // nEntries
+    return s;
+}
+
+// /manifest in section 1 with offset INT_MAX: offset+size used to wrap
+static Str MkLitSectionOffsetWrap() {
+    constexpr int kChunkSize = 256;
+    constexpr int kDirLen = kDirectoryHeaderLen + kChunkSize; // 288
+    constexpr int kContentOff = kDirOff + kDirLen;            // 464
+    constexpr int kFileLen = kContentOff + 64;                // 528
+
+    Str s = MkLitBuf(kFileLen, kHdrLen, kNPieces, kSecHdrLen);
+    u8* d = (u8*)s.s;
+    LeWriter w{d, kFileLen};
+    WriteLitDirectory(w, kDirOff, kChunkSize, 132, kContentOff);
+    w.Entry(StrL("::DataSpace/NameList"), 0, 0, 16);
+    w.Entry(StrL("::DataSpace/Storage/X/Content"), 0, 32, 4);
+    w.Entry(StrL("/manifest"), 1, 0x7fffffff, 2);
+    d[kDirOff + kDirLen - 2] = 3;
+
+    // NameList: 2 sections "A" and "X"
+    w.off = kContentOff;
+    w.U16(0);
+    w.U16(2);
+    w.U16(1);
+    w.U16('A');
+    w.U16(0);
+    w.U16(1);
+    w.U16('X');
+    w.U16(0);
+    w.off = kContentOff + 32;
+    w.Bytes("ABCD", 4);
+    return s;
+}
+
+// directory nameLen = INT_MAX: pos+nameLen used to wrap past dataEnd
+static Str MkLitNameLenWrap() {
+    Str s = MkLitContentOffsetNeg();
+    u8* d = (u8*)s.s;
+    constexpr int kEntry = kDirOff + kDirectoryHeaderLen + kChunkHeaderLen;
+    LeWriter w{d, len(s)};
+    w.off = kEntry;
+    w.EncInt(0x7fffffff);
+    w.off = 144; // valid contentOffset so ParseHeader reaches the directory
+    w.U32(0);
+    return s;
+}
+
+#if IS_DEBUG
+bool LitDoc_UnitTestManifest();
+#endif
+
+void LitDoc_UnitTests() {
+#if IS_DEBUG
+    utassert(LitDoc_UnitTestManifest());
+#endif
+    LitMustReject(MkLitHdrLenWrap());
+    LitMustReject(MkLitPosOverflow());
+    LitMustReject(MkLitDirRangeWrap());
+    LitMustReject(MkLitContentOffsetNeg());
+    LitMustReject(MkLitSectionOffsetWrap());
+    LitMustReject(MkLitNameLenWrap());
+}

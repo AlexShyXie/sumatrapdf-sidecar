@@ -10,7 +10,8 @@
 
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { ControlCommand } from "./control.ts";
-import { cmdId, runStandalone, tmpPath } from "./util.ts";
+import { IS_MAC } from "./host.ts";
+import { cmdId, runStandalone, tmpPath, USE_NG, removeTestCert, runPowerShell } from "./util.ts";
 import { killAndWait, launchControlled, sendCommand } from "./win-automation.ts";
 import {
   enumChildWindows,
@@ -31,13 +32,8 @@ const BST_CHECKED = 1;
 // dn | date | text name — no labels, no graphic name
 const kNoLabelsFlags = 2 | 4 | 8;
 
-function ps(script: string): { ok: boolean; out: string } {
-  const r = Bun.spawnSync(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]);
-  return { ok: r.exitCode === 0, out: r.stdout.toString() + r.stderr.toString() };
-}
-
 function makeTestCert(): string | null {
-  const created = ps(`
+  const created = runPowerShell(`
     $rsa = [System.Security.Cryptography.RSA]::Create(2048)
     $req = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
       '${kCertSubject}', $rsa,
@@ -60,17 +56,6 @@ function makeTestCert(): string | null {
     return null;
   }
   return thumb.toUpperCase();
-}
-
-function removeTestCert(thumbprint: string): void {
-  ps(`
-    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('My','CurrentUser')
-    $store.Open('ReadWrite')
-    foreach ($c in $store.Certificates.Find('FindByThumbprint', '${thumbprint}', $false)) {
-      $store.Remove($c)
-    }
-    $store.Close()
-  `);
 }
 
 function writePlainPdf(path: string): void {
@@ -163,20 +148,18 @@ export async function testit(): Promise<void> {
   const { proc, client, frame } = await launchControlled([pdf]);
   try {
     await client.waitForRenderIdle();
-    const pid = getWindowPid(frame);
     sendCommand(frame, cmdId("CmdSignDocument"));
-    const dlg = await waitFor("Sign Document dialog", () =>
-      findTopWindow(pid, "SumatraWgDefaultWinClass", "Sign Document"),
-    );
-
-    let boxes = new Map<string, number>();
-    for (const deadline = Date.now() + 3000; Date.now() < deadline;) {
-      boxes = checkboxTexts(dlg);
-      if ([...boxes.keys()].some((t) => /labels/i.test(t))) {
-        break;
-      }
-      await sleep(100);
+    // macOS has no HWND for the dialog. The checks below read it over control.
+    let dlg = 0;
+    if (!IS_MAC) {
+      const pid = getWindowPid(frame);
+      dlg = await waitFor("Sign Document dialog", () =>
+        USE_NG
+          ? findTopWindow(pid, "GpuiSystemMonitor", "Sign Document")
+          : findTopWindow(pid, "SumatraWgDefaultWinClass", "Sign Document"),
+      );
     }
+
     const want = [
       [/labels/i, "Show labels"],
       [/^show name$/i, "Show name"],
@@ -184,18 +167,63 @@ export async function testit(): Promise<void> {
       [/date/i, "Show date"],
       [/graphic/i, "Show name as graphic"],
     ] as const;
-    for (const [re, label] of want) {
-      const hwnd = [...boxes.entries()].find(([t]) => re.test(t))?.[1];
-      if (!hwnd) {
-        throw new Error(`issue-5963: missing '${label}' checkbox; have: ${[...boxes.keys()].join(", ")}`);
+    if (USE_NG) {
+      let raw = "";
+      for (const deadline = Date.now() + 3000; Date.now() < deadline;) {
+        const res = await client.request(ControlCommand.TestToolWindow, ["sign-checks"]);
+        raw = String(res[1] ?? "");
+        if (/labels/i.test(raw)) {
+          break;
+        }
+        await sleep(100);
       }
-      if (!isChecked(hwnd)) {
-        throw new Error(`issue-5963: '${label}' should be checked by default`);
+      const checks = new Map<string, boolean>();
+      for (const line of raw.split("\n")) {
+        const m = /^(.*)=([01])$/.exec(line.trim());
+        if (m) {
+          checks.set(m[1], m[2] === "1");
+        }
+      }
+      for (const [re, label] of want) {
+        const hit = [...checks.entries()].find(([t]) => re.test(t));
+        if (!hit) {
+          throw new Error(`issue-5963: missing '${label}' checkbox; have: ${[...checks.keys()].join(", ")}`);
+        }
+        if (!hit[1]) {
+          throw new Error(`issue-5963: '${label}' should be checked by default`);
+        }
+      }
+    } else {
+      let boxes = new Map<string, number>();
+      for (const deadline = Date.now() + 3000; Date.now() < deadline;) {
+        boxes = checkboxTexts(dlg);
+        if ([...boxes.keys()].some((t) => /labels/i.test(t))) {
+          break;
+        }
+        await sleep(100);
+      }
+      for (const [re, label] of want) {
+        const hwnd = [...boxes.entries()].find(([t]) => re.test(t))?.[1];
+        if (!hwnd) {
+          throw new Error(`issue-5963: missing '${label}' checkbox; have: ${[...boxes.keys()].join(", ")}`);
+        }
+        if (!isChecked(hwnd)) {
+          throw new Error(`issue-5963: '${label}' should be checked by default`);
+        }
       }
     }
     console.log("  Sign Document offers appearance checkboxes, all on by default ✓");
-    postMessage(dlg, WM_CLOSE, 0, 0);
+    if (IS_MAC) {
+      await client.request(ControlCommand.TestToolWindow, ["close", "signdocument"]);
+    } else {
+      postMessage(dlg, WM_CLOSE, 0, 0);
+    }
     await sleep(200);
+
+    if (IS_MAC) {
+      console.log("SKIP issue-5963 sign: the test certificate is created in the Windows certificate store");
+      return;
+    }
 
     const thumb = makeTestCert();
     if (!thumb) {

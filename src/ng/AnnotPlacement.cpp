@@ -1,0 +1,595 @@
+/* Copyright 2026 the SumatraPDF project authors (see AUTHORS file).
+   License: GPLv3 */
+
+// ng: orig's AnnotPlacement.cpp - the modes a CmdCreateAnnot* command enters
+// when it has no point to place the annotation at: the cursor becomes a cross,
+// a hint notification says what to do, and the next click (or drag, or set of
+// strokes) says where. Same kinds, same keys, same previews. What differs is
+// the cursor off Windows (gpui has no cursor from an image, so every mode uses
+// Crosshair where orig draws the annotation's SVG icon into one) and that the
+// preview is painted by the gpui canvas instead of into the canvas HDC.
+
+#include "gui/GpuiBridge.h"
+#include "VirtKeys.h"
+
+#include "gui/Dpi.h"
+#include "gui/UIModels.h"
+
+#include "Settings.h"
+#include "AppSettings.h"
+#include "DisplayMode.h"
+#include "Annotation.h"
+#include "DocController.h"
+#include "EngineBase.h"
+#include "base/GuessFileType.h"
+#include "EngineAll.h"
+#include "TextSelection.h"
+#include "DisplayModel.h"
+#include "Theme.h"
+#include "Translations.h"
+#include "Commands.h"
+#include "Notifications.h"
+#include "SumatraPDF.h"
+#include "MainWindow.h"
+#include "WindowTab.h"
+#include "Toolbar.h"
+#include "Selection.h"
+#include "SelectTextKeyboard.h"
+#include "gui/AppShell.h"
+#include "gui/DocCanvas.h"
+#include "AnnotEditToolbar.h"
+#include "AnnotTextPopup.h"
+#include "AnnotPlacement.h"
+#include "AnnotPlacementCommon.h"
+
+#include "SumatraLog.h"
+
+// ng: orig measures the placeholder with GDI+ Arial (Helvetica's metrics).
+// There is no portable text measurement outside a paint, so the box is as wide
+// as the average Helvetica advance makes it.
+constexpr float kFreeTextAvgAdvance = 0.5f;
+// the preview and the selection markers, orig's colors
+constexpr Color kPreviewBlue = MkRgb(0, 80, 200);
+constexpr Color kPreviewWhite = 0xffffff;
+
+// Size, in page units, of a box that fits the annotation's text.
+SizeF FreeTextPlacementPageSize(const AnnotCreateArgs& args) {
+    float fontSize = (float)FreeTextFontSize(args);
+    float pad = FreeTextPadding(args);
+    Str text = FreeTextPlacementContent(args);
+    float dx = (float)len(text) * fontSize * kFreeTextAvgAdvance;
+    dx = (dx * kFreeTextWidthSlack) + (2 * pad) + 2.f;
+    int nLines = 1;
+    for (int i = 0; i < len(text); i++) {
+        nLines += text.s[i] == '\n' ? 1 : 0;
+    }
+    float dy = ((float)nLines * kFreeTextLineHeight * fontSize) + (2 * pad);
+    return {dx, dy};
+}
+
+// orig's SetPlacementCursor: the note and the ink tool have a cursor made from
+// their SVG icon, every other mode a cross
+// ng: the icon cursors exist on Windows only (see "gpui gaps": no cursor from
+// an image); elsewhere all modes use the cross
+void SetPlacementCursor(MainWindow* win) {
+    switch (KindOf(win)) {
+        case AnnotPlacementKind::Text:
+            if (CanvasSetNativeCursor(win, NativeCursor::TextAnnotationPlacement)) {
+                return;
+            }
+            break;
+        case AnnotPlacementKind::Ink:
+            if (CanvasSetNativeCursor(win, NativeCursor::InkAnnotationPlacement)) {
+                return;
+            }
+            break;
+        default:
+            break;
+    }
+    CanvasSetCursor(win, (int)gp::CursorKind::Crosshair);
+}
+
+// orig posts WM_COMMAND with kAnnotationPlacementCommandCode; here the command
+// path takes the same two flags as arguments
+// what placement asks of the window system; gpui tracks focus and the pressed
+// button itself, so only the command and the cursor do anything here
+void PlacementFocusFrame(MainWindow*) {}
+
+void PlacementCaptureMouse(MainWindow*) {}
+
+void PlacementReleaseMouse(MainWindow*) {}
+
+void ReleasePlacementCapture(MainWindow*) {}
+
+void RestoreCanvasCursor(MainWindow* win) {
+    CanvasSetCursor(win, (int)gp::CursorKind::Arrow);
+}
+
+void PlacementRunCreateCmd(MainWindow* win, int cmdId, Point pt) {
+    ExecuteAnnotCreateCmd(win, cmdId, true, pt);
+}
+
+void StartAnnotationPlacement(MainWindow* win, int cmdId) {
+    DisplayModel* dm = win ? win->AsFixed() : nullptr;
+    WindowTab* tab = win ? win->CurrentTab() : nullptr;
+    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
+    AnnotPlacementKind kind = PlacementKindFromCommand(cmdId);
+    if (!win || !tab || !engine || !EngineSupportsAnnotations(engine) || kind == AnnotPlacementKind::None) {
+        return;
+    }
+
+    // placement owns Esc; the editor of the annotation just created would take it
+    if (IsEditingFreeTextInPlace(win)) {
+        EndFreeTextInPlaceEdit(true);
+    }
+    if (IsEditingAnnotContents(win)) {
+        EndAnnotContentsEdit(true);
+    }
+
+    EndCurrentPlacement(win);
+
+    AnnotPlacement& p = win->annotPlacement;
+    p.Reset();
+    p.kind = kind;
+    p.cmdId = cmdId;
+    p.circle = OrigCommandId(cmdId) == CmdCreateAnnotCircle;
+    if (IsPointPlacementKind(kind)) {
+        p.pos = win->dragPrevPos;
+    }
+    if (kind == AnnotPlacementKind::FreeText) {
+        // rect holds the preview box size (page units); the position comes
+        // from the cursor
+        AnnotCreateArgs args;
+        FreeTextPlacementArgs(cmdId, args);
+        SizeF size = FreeTextPlacementPageSize(args);
+        p.rect = {0, 0, size.dx, size.dy};
+    }
+
+    // the highlighter works on a keyboard selection; other modes take the pointer
+    if (!(kind == AnnotPlacementKind::Highlighter && SelectTextWithKeyboardActive(win))) {
+        StopSelectTextWithKeyboard(win);
+        DeleteOldSelectionInfo(win, true);
+    }
+    if (tab->selectedAnnotation) {
+        SetSelectedAnnotation(tab, nullptr);
+    }
+    win->annotationUnderCursor = nullptr;
+
+    // edit PDF toolbar buttons are disabled for the duration of the mode
+    ToolbarUpdateStateForWindow(win, false);
+
+    NotificationCreateArgs args;
+    args.win = win;
+    args.msg = PlacementNotification(kind, p.circle, cmdId);
+    args.timeoutMs = kNotifNoTimeout;
+    args.groupId = NotifGroupForKind(kind);
+    args.warning = true;
+    args.tab = tab;
+    ShowNotification(args);
+
+    SetPlacementCursor(win);
+    logf("StartAnnotationPlacement: kind %d, cmd %d\n", (int)kind, cmdId);
+    win->RedrawAll(true);
+}
+
+bool AnnotationPlacementOnMouseMove(MainWindow* win, Point pt, bool isShift, bool lButtonDown) {
+    if (!IsPlacingAnnotation(win) || KindOf(win) == AnnotPlacementKind::Highlighter) {
+        return false;
+    }
+    DisplayModel* dm = win->AsFixed();
+    if (!dm) {
+        return true;
+    }
+    if (win->annotationUnderCursor) {
+        win->annotationUnderCursor = nullptr;
+        if (IsPlacingPointAnnotation(win)) {
+            win->RedrawAll(true);
+        }
+    }
+    SetPlacementCursor(win);
+
+    AnnotPlacement& p = win->annotPlacement;
+    switch (p.kind) {
+        case AnnotPlacementKind::Ink:
+            if (p.mouseDown && lButtonDown) {
+                AppendInkPoint(win, dm, pt);
+            }
+            break;
+        case AnnotPlacementKind::Shape:
+            if (p.pageNo > 0) {
+                if (p.mouseDown) {
+                    Point start = dm->CvtToScreen(p.pageNo, p.start);
+                    if (IsDragDistance(pt.x, start.x, pt.y, start.y)) {
+                        p.didDrag = true;
+                    }
+                }
+                if (pt != p.end || isShift != p.constrain) {
+                    p.end = pt;
+                    p.constrain = isShift;
+                    win->RedrawAll(true);
+                }
+            }
+            break;
+        case AnnotPlacementKind::Line:
+            if (p.pageNo > 0) {
+                Point start = dm->CvtToScreen(p.pageNo, p.start);
+                Point end = isShift ? SnapLineEndpoint(start, pt) : pt;
+                // Compare the snapped point: toggling Shift without moving the
+                // pointer must still update the preview.
+                if (end != p.end) {
+                    p.end = end;
+                    win->RedrawAll(true);
+                }
+            }
+            break;
+        case AnnotPlacementKind::PolyLine:
+            if (len(p.points) > 0) {
+                Point last = dm->CvtToScreen(p.pageNo, p.points[len(p.points) - 1]);
+                Point end = isShift ? SnapLineEndpoint(last, pt) : pt;
+                if (end != p.end) {
+                    p.end = end;
+                    win->RedrawAll(true);
+                }
+            }
+            break;
+        case AnnotPlacementKind::Text:
+        case AnnotPlacementKind::FreeText:
+        case AnnotPlacementKind::Stamp:
+        case AnnotPlacementKind::Caret:
+        case AnnotPlacementKind::FileAttachment: {
+            bool previewMoved = HasPreview(p.kind) && pt != p.pos;
+            p.pos = pt;
+            if (previewMoved) {
+                win->RedrawAll(true);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    return true;
+}
+
+bool AnnotationPlacementOnKeyDown(MainWindow* win, int vkey) {
+    if (!win || CanvasCtrlPressed() || CanvasShiftPressed()) {
+        return false;
+    }
+    if (vkey == VK_RETURN && IsPlacingInkAnnotation(win)) {
+        return FinishInkAnnotationPlacement(win);
+    }
+    if ((vkey == VK_SPACE || vkey == VK_RETURN) && IsPlacingPolyLineAnnotation(win)) {
+        return FinishPolyLineAnnotationPlacement(win);
+    }
+    if (vkey == VK_RETURN && KindOf(win) == AnnotPlacementKind::Highlighter) {
+        return CancelAnnotationPlacement(win);
+    }
+    return false;
+}
+
+// --- the previews -----------------------------------------------------------
+
+static void PaintMarker(gp::PaintCtx* ctx, Point p) {
+    int size = std::max(DpiScale(6), 4);
+    int half = size / 2;
+    Rect r{p.x - half, p.y - half, size, size};
+    CanvasFillRects(ctx, &r, 1, kPreviewWhite, 0xff, 1);
+    CanvasDrawRect(ctx, r, kPreviewBlue, 1.5f);
+}
+
+static void PaintPointPlacement(MainWindow* win, gp::PaintCtx* ctx, DisplayModel* dm) {
+    AnnotPlacementKind kind = KindOf(win);
+    bool preview = kind == AnnotPlacementKind::Stamp || kind == AnnotPlacementKind::Caret ||
+                   kind == AnnotPlacementKind::FileAttachment;
+    if (!preview || !dm) {
+        return;
+    }
+    AnnotPlacement& p = win->annotPlacement;
+    Point pt = p.pos;
+    int pageNo = dm->GetPageNoByPoint(pt);
+    if (!dm->ValidPageNo(pageNo) || !dm->PageVisible(pageNo)) {
+        return;
+    }
+    PointF pagePt = dm->CvtFromScreen(pt, pageNo);
+    RectF pageRect;
+    if (kind == AnnotPlacementKind::Stamp) {
+        pageRect = {pagePt.x, pagePt.y, kStampAnnotDefaultDx, kStampAnnotDefaultDy};
+    } else if (kind == AnnotPlacementKind::Caret) {
+        pageRect = {pagePt.x, pagePt.y - (kCaretAnnotDefaultDy / 2.f), kCaretAnnotDefaultDx, kCaretAnnotDefaultDy};
+    } else {
+        pageRect = {pagePt.x, pagePt.y, kFileAttachmentAnnotDefaultDx, kFileAttachmentAnnotDefaultDy};
+    }
+    Rect r = PlacementPreviewScreenRect(dm, pageNo, pt, pagePt, pageRect);
+    if (r.IsEmpty()) {
+        return;
+    }
+
+    if (kind == AnnotPlacementKind::Stamp) {
+        Color red = 0xc82828; // 200, 40, 40
+        CanvasFillRects(ctx, &r, 1, red, 40, 0);
+        CanvasDrawRect(ctx, r, red, (float)std::max(DpiScale(2), 1));
+        float fontDy = std::max((float)r.dy * 0.45f, 8.f);
+        Size ts = CanvasMeasureText(ctx, StrL("DRAFT"), fontDy);
+        Point at{r.x + ((r.dx - ts.dx) / 2), r.y + ((r.dy - ts.dy) / 2)};
+        CanvasDrawText(ctx, StrL("DRAFT"), at, red, fontDy);
+        return;
+    }
+    if (kind == AnnotPlacementKind::Caret) {
+        Color blue = MkRgb(0, 80, 200);
+        float w = (float)std::max(DpiScale(2), 1);
+        int xMid = r.x + (r.dx / 2);
+        CanvasDrawLine(ctx, Point{r.x, r.y + r.dy}, Point{xMid, r.y}, blue, w);
+        CanvasDrawLine(ctx, Point{xMid, r.y}, Point{r.x + r.dx, r.y + r.dy}, blue, w);
+        return;
+    }
+    // MuPDF's default FileAttachment is a 16x16 yellow PushPin icon
+    Color yellow = 0xdcb414; // 220, 180, 20
+    CanvasFillRects(ctx, &r, 1, yellow, 80, 0);
+    CanvasDrawRect(ctx, r, yellow, 1);
+    Color dark = 0x282828;
+    int cx = r.x + (r.dx / 2);
+    int head = std::max(r.dx / 5, 2);
+    CanvasDrawEllipse(ctx, Rect{cx - head, r.y + head, head * 2, head * 2}, dark, 1);
+    CanvasDrawLine(ctx, Point{cx, r.y + (head * 3)}, Point{cx, r.y + r.dy - head}, dark, 1);
+}
+
+// White "paper" with the text drawn on it, the size of the annotation that a
+// click will create.
+static void PaintFreeTextPlacement(MainWindow* win, gp::PaintCtx* ctx, DisplayModel* dm) {
+    if (KindOf(win) != AnnotPlacementKind::FreeText) {
+        return;
+    }
+    AnnotPlacement& p = win->annotPlacement;
+    Rect r = FreeTextPlacementScreenRect(win, dm);
+    if (r.IsEmpty()) {
+        return;
+    }
+
+    AnnotCreateArgs args;
+    FreeTextPlacementArgs(p.cmdId, args);
+    float scale = (float)r.dy / p.rect.dy;
+    float pad = FreeTextPadding(args) * scale;
+    float fontDy = std::max((float)FreeTextFontSize(args) * scale, 4.f);
+    Color textCol = args.col.parsedOk ? args.col.col : 0x000000;
+    Color bgCol = args.bgCol.parsedOk ? args.bgCol.col : 0xffffff;
+
+    CanvasFillRects(ctx, &r, 1, bgCol, 0xff, 0);
+    float bw = args.borderWidth > 0 ? std::max((float)args.borderWidth * scale, 1.f) : 1.f;
+    CanvasDrawRect(ctx, r, textCol, bw);
+
+    Str content = FreeTextPlacementContent(args);
+    Size ts = CanvasMeasureText(ctx, content, fontDy);
+    int x = r.x + (int)pad;
+    if (args.quadding == kQuaddingCenter) {
+        x = r.x + ((r.dx - ts.dx) / 2);
+    } else if (args.quadding == kQuaddingRight) {
+        x = r.x + r.dx - (int)pad - ts.dx;
+    }
+    CanvasDrawText(ctx, content, Point{x, r.y + ((r.dy - ts.dy) / 2)}, textCol, fontDy);
+}
+
+static void PaintLinePlacement(MainWindow* win, gp::PaintCtx* ctx, DisplayModel* dm) {
+    AnnotPlacement& p = win->annotPlacement;
+    int pageNo = p.pageNo;
+    if (!IsPlacingLineAnnotation(win) || !dm->ValidPageNo(pageNo) || !dm->PageVisible(pageNo)) {
+        return;
+    }
+    Point start = dm->CvtToScreen(pageNo, p.start);
+    CanvasDrawLine(ctx, start, p.end, kPreviewBlue, (float)std::max(DpiScale(2), 1));
+    PaintMarker(ctx, start);
+}
+
+static void PaintPolyLinePlacement(MainWindow* win, gp::PaintCtx* ctx, DisplayModel* dm) {
+    AnnotPlacement& p = win->annotPlacement;
+    int pageNo = p.pageNo;
+    if (!IsPlacingPolyLineAnnotation(win) || len(p.points) == 0 || !dm->ValidPageNo(pageNo) ||
+        !dm->PageVisible(pageNo)) {
+        return;
+    }
+    float w = (float)std::max(DpiScale(2), 1);
+    Point previous = dm->CvtToScreen(pageNo, p.points[0]);
+    for (int i = 1; i < len(p.points); i++) {
+        Point current = dm->CvtToScreen(pageNo, p.points[i]);
+        CanvasDrawLine(ctx, previous, current, kPreviewBlue, w);
+        PaintMarker(ctx, previous);
+        previous = current;
+    }
+    CanvasDrawLine(ctx, previous, p.end, kPreviewBlue, w);
+    PaintMarker(ctx, previous);
+}
+
+static void PaintShapePlacement(MainWindow* win, gp::PaintCtx* ctx, DisplayModel* dm) {
+    AnnotPlacement& p = win->annotPlacement;
+    int pageNo = p.pageNo;
+    if (!IsPlacingShapeAnnotation(win) || !dm->ValidPageNo(pageNo) || !dm->PageVisible(pageNo)) {
+        return;
+    }
+    Rect rect = ShapePlacementScreenRect(p, dm);
+    if (rect.IsEmpty()) {
+        return;
+    }
+    float w = (float)std::max(DpiScale(2), 1);
+    if (p.circle) {
+        CanvasDrawEllipse(ctx, rect, kPreviewBlue, w);
+    } else {
+        CanvasDrawRect(ctx, rect, kPreviewBlue, w);
+    }
+    PaintMarker(ctx, dm->CvtToScreen(pageNo, p.start));
+}
+
+static void PaintInkPlacement(MainWindow* win, gp::PaintCtx* ctx, DisplayModel* dm) {
+    AnnotPlacement& p = win->annotPlacement;
+    int pageNo = p.pageNo;
+    if (!IsPlacingInkAnnotation(win) || !dm->ValidPageNo(pageNo) || !dm->PageVisible(pageNo) || len(p.points) == 0) {
+        return;
+    }
+    // the stroke the ink button's drop-down is set to make: its color at its
+    // opacity, as wide as the saved stroke will be at this zoom
+    Color col = GetParsedColor(gSettings->annotations.inkColor, kInkDefaultColor);
+    float width = (float)std::max(DpiScale(2), 1);
+    int bw = gSettings->annotations.inkBorderWidth;
+    if (bw > 0) {
+        width = std::max(1.f, (float)bw * PxPerPagePt(dm, pageNo));
+    }
+    int pointIdx = 0;
+    for (int count : p.strokeCounts) {
+        if (count <= 0 || pointIdx >= len(p.points)) {
+            continue;
+        }
+        Point previous;
+        for (int i = 0; i < count && pointIdx < len(p.points); i++) {
+            Point pt = dm->CvtToScreen(pageNo, p.points[pointIdx++]);
+            if (i > 0) {
+                CanvasDrawLine(ctx, previous, pt, col, width);
+            } else if (count == 1) {
+                int dotSize = std::max(DpiScale(3), 2);
+                Rect r{pt.x - dotSize / 2, pt.y - dotSize / 2, dotSize, dotSize};
+                CanvasFillRects(ctx, &r, 1, col, GetAlpha(col) == 0 ? 0xff : GetAlpha(col), 0);
+            }
+            previous = pt;
+        }
+    }
+}
+
+void PaintAnnotationPlacement(MainWindow* win, gp::PaintCtx* ctx, DisplayModel* dm) {
+    if (!win || !dm || !IsPlacingAnnotation(win)) {
+        return;
+    }
+    PaintPointPlacement(win, ctx, dm);
+    PaintFreeTextPlacement(win, ctx, dm);
+    PaintLinePlacement(win, ctx, dm);
+    PaintPolyLinePlacement(win, ctx, dm);
+    PaintShapePlacement(win, ctx, dm);
+    PaintInkPlacement(win, ctx, dm);
+}
+
+// orig compares GetCursor() to IDC_CROSS or the SVG cursor. ng records the
+// cursor it asked for: the note and the ink tool are native cursors on
+// Windows, everything else is the cross.
+bool PlacementDumpCursor(MainWindow* win, AnnotPlacementKind kind, bool active) {
+    if (!win || !active) {
+        return false;
+    }
+    if (kind == AnnotPlacementKind::Text && win->nativeCursor == NativeCursor::TextAnnotationPlacement) {
+        return true;
+    }
+    if (kind == AnnotPlacementKind::Ink && win->nativeCursor == NativeCursor::InkAnnotationPlacement) {
+        return true;
+    }
+    return win->canvasCursor == (int)gp::CursorKind::Crosshair;
+}
+
+// Same lines as orig's AnnotationPlacementStateTemp. Tests match on the name.
+TempStr AnnotationPlacementStateTemp(MainWindow* win) {
+    str::Builder out;
+    out.Append(PointPlacementDumpLineTemp(win, AnnotPlacementKind::Text, StrL("textPlacement"), true));
+    out.Append(PointPlacementDumpLineTemp(win, AnnotPlacementKind::FreeText, StrL("freeTextPlacement"), false));
+    out.Append(PointPlacementDumpLineTemp(win, AnnotPlacementKind::Stamp, StrL("stampPlacement"), false));
+    out.Append(PointPlacementDumpLineTemp(win, AnnotPlacementKind::Caret, StrL("caretPlacement"), false));
+    out.Append(
+        PointPlacementDumpLineTemp(win, AnnotPlacementKind::FileAttachment, StrL("fileAttachmentPlacement"), false));
+
+    if (!win) {
+        out.Append(StrL("freeTextPreview rect=0,0,0,0\n"));
+        out.Append(
+            StrL("linePlacement active=0 notification=0 cursor=0 started=0 cmd=0 page=-1 start=0,0 end=0,0 "
+                 "message=\n"));
+        out.Append(
+            StrL("polyLinePlacement active=0 notification=0 cursor=0 points=0 cmd=0 page=-1 end=0,0 "
+                 "message=\n"));
+        out.Append(
+            StrL("shapePlacement active=0 notification=0 cursor=0 circle=0 mouseDown=0 dragged=0 constrain=0 "
+                 "cmd=0 page=-1 preview=0,0,0,0 message=\n"));
+        out.Append(
+            StrL("inkPlacement active=0 notification=0 cursor=0 mouseDown=0 strokes=0 points=0 cmd=0 page=-1 "
+                 "message=\n"));
+        out.Append(StrL("highlighterPlacement active=0 notification=0 cmd=0 message=\n"));
+        return ToStrTemp(out);
+    }
+
+    AnnotPlacement& p = win->annotPlacement;
+    {
+        // tests click the frame; the preview is stored in canvas pixels
+        Rect preview;
+        if (KindOf(win) == AnnotPlacementKind::FreeText) {
+            float s = CanvasScale(win);
+            if (s <= 0.f) {
+                s = 1.f;
+            }
+            preview = FreeTextPlacementScreenRect(win, win->AsFixed());
+            preview.x += (int)((float)win->canvasRc.x / s + 0.5f);
+            preview.y += (int)((float)win->canvasRc.y / s + 0.5f);
+        }
+        out.Append(fmt("freeTextPreview rect=%d,%d,%d,%d\n", preview.x, preview.y, preview.dx, preview.dy));
+    }
+    bool line = IsPlacingLineAnnotation(win);
+    bool poly = IsPlacingPolyLineAnnotation(win);
+    bool shape = IsPlacingShapeAnnotation(win);
+    bool ink = IsPlacingInkAnnotation(win);
+    {
+        NotificationWnd* notif = line ? GetNotificationForGroup(win, kNotifLineAnnotationPlacement) : nullptr;
+        Str message = NotificationGetMessageTemp(notif);
+        bool cursor = PlacementDumpCursor(win, AnnotPlacementKind::Line, line);
+        bool started = line && p.pageNo > 0;
+        PointF start = line ? p.start : PointF{};
+        Point end = line ? p.end : Point{};
+        // tests click the frame; the end is stored in canvas pixels
+        if (line) {
+            float s = CanvasScale(win);
+            if (s <= 0.f) {
+                s = 1.f;
+            }
+            end.x += (int)((float)win->canvasRc.x / s + 0.5f);
+            end.y += (int)((float)win->canvasRc.y / s + 0.5f);
+        }
+        out.Append(
+            fmt("linePlacement active=%d notification=%d cursor=%d started=%d cmd=%d page=%d start=%g,%g "
+                "end=%d,%d message=%s\n",
+                line ? 1 : 0, notif ? 1 : 0, cursor ? 1 : 0, started ? 1 : 0, line ? p.cmdId : 0, line ? p.pageNo : -1,
+                start.x, start.y, end.x, end.y, message));
+    }
+    {
+        NotificationWnd* notif = poly ? GetNotificationForGroup(win, kNotifPolyLineAnnotationPlacement) : nullptr;
+        Str message = NotificationGetMessageTemp(notif);
+        bool cursor = PlacementDumpCursor(win, AnnotPlacementKind::PolyLine, poly);
+        Point end = poly ? p.end : Point{};
+        out.Append(
+            fmt("polyLinePlacement active=%d notification=%d cursor=%d points=%d cmd=%d page=%d end=%d,%d "
+                "message=%s\n",
+                poly ? 1 : 0, notif ? 1 : 0, cursor ? 1 : 0, poly ? len(p.points) : 0, poly ? p.cmdId : 0,
+                poly ? p.pageNo : -1, end.x, end.y, message));
+    }
+    {
+        NotificationWnd* notif = shape ? GetNotificationForGroup(win, kNotifShapeAnnotationPlacement) : nullptr;
+        Str message = NotificationGetMessageTemp(notif);
+        bool cursor = PlacementDumpCursor(win, AnnotPlacementKind::Shape, shape);
+        Rect preview;
+        DisplayModel* dm = win->AsFixed();
+        if (shape && dm && dm->ValidPageNo(p.pageNo)) {
+            preview = ShapePlacementScreenRect(p, dm);
+        }
+        out.Append(
+            fmt("shapePlacement active=%d notification=%d cursor=%d circle=%d mouseDown=%d dragged=%d "
+                "constrain=%d cmd=%d page=%d preview=%d,%d,%d,%d message=%s\n",
+                shape ? 1 : 0, notif ? 1 : 0, cursor ? 1 : 0, shape && p.circle ? 1 : 0, shape && p.mouseDown ? 1 : 0,
+                shape && p.didDrag ? 1 : 0, shape && p.constrain ? 1 : 0, shape ? p.cmdId : 0, shape ? p.pageNo : -1,
+                preview.x, preview.y, preview.dx, preview.dy, message));
+    }
+    {
+        NotificationWnd* notif = ink ? GetNotificationForGroup(win, kNotifInkAnnotationPlacement) : nullptr;
+        Str message = NotificationGetMessageTemp(notif);
+        bool cursor = PlacementDumpCursor(win, AnnotPlacementKind::Ink, ink);
+        out.Append(
+            fmt("inkPlacement active=%d notification=%d cursor=%d mouseDown=%d strokes=%d points=%d cmd=%d "
+                "page=%d message=%s\n",
+                ink ? 1 : 0, notif ? 1 : 0, cursor ? 1 : 0, ink && p.mouseDown ? 1 : 0, ink ? len(p.strokeCounts) : 0,
+                ink ? len(p.points) : 0, ink ? p.cmdId : 0, ink ? p.pageNo : -1, message));
+    }
+    {
+        bool on = KindOf(win) == AnnotPlacementKind::Highlighter;
+        NotificationWnd* notif = on ? GetNotificationForGroup(win, kNotifHighlighterPlacement) : nullptr;
+        Str message = NotificationGetMessageTemp(notif);
+        out.Append(fmt("highlighterPlacement active=%d notification=%d cmd=%d message=%s\n", on ? 1 : 0, notif ? 1 : 0,
+                       on ? p.cmdId : 0, message));
+    }
+    return ToStrTemp(out);
+}

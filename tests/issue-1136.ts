@@ -9,8 +9,9 @@
 // control has focus) rather than pixels, so it doesn't depend on the drawing.
 import { copyFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { ROOT, cmdId, runStandalone, tmpPath } from "./util";
-import { sendMessage, setCursorPos, sleep } from "./winapi";
+import { ControlCommand, type ControlClient, waitForHome } from "./control.ts";
+import { ROOT, USE_NG, cmdId, runStandalone, tmpPath } from "./util";
+import { sendMessage, setCursorPos } from "./winapi";
 import {
   findCanvas,
   findChildByClass,
@@ -19,8 +20,6 @@ import {
   waitForTitle,
   killAndWait,
 } from "./win-automation";
-import type { ControlClient, HomeSelection } from "./control.ts";
-
 const WM_KEYDOWN = 0x0100;
 const WM_CHAR = 0x0102;
 const VK_RETURN = 0x0d;
@@ -51,32 +50,21 @@ function makeAppDir(name: string): string {
 // Target the control that owns the behavior and finish handling one key before
 // checking its effect. Looking up focus and then posting left a race where focus
 // changed before the queued key arrived, so the key was silently lost.
-function key(target: number, vk: number): void {
+async function key(client: ControlClient, target: number, vk: number): Promise<void> {
+  // ng draws the search box in the frame, so a posted WM_KEYDOWN has no Edit
+  if (USE_NG) {
+    await client.request(ControlCommand.TestInput, ["key", vk, 0, 0, 0]);
+    return;
+  }
   sendMessage(target, WM_KEYDOWN, vk, 0);
 }
 
-// Waits for the home page to report the state a key was supposed to produce.
-// Polling the app beats sleeping after each key: a key posted while the focus
-// is still moving lands on the wrong window and is silently lost, which is what
-// made this test flaky ("focus did not move", or the wrong file opened).
-async function waitForHome(
-  client: ControlClient,
-  pred: (h: HomeSelection) => boolean,
-  what: string,
-  timeoutMs = 8000,
-): Promise<HomeSelection> {
-  const deadline = Date.now() + timeoutMs;
-  let last: HomeSelection | null = null;
-  for (;;) {
-    last = await client.homeSelection();
-    if (last.ready && pred(last)) {
-      return last;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`issue-1136: ${what} (last: ${last.raw})`);
-    }
-    await sleep(50);
+async function typeChar(client: ControlClient, target: number, ch: string): Promise<void> {
+  if (USE_NG) {
+    await client.request(ControlCommand.TestInput, ["char", ch.charCodeAt(0), 0, 0, 0]);
+    return;
   }
+  sendMessage(target, WM_CHAR, ch.charCodeAt(0), 0);
 }
 
 async function withHomePage(
@@ -99,8 +87,8 @@ async function withHomePage(
       (h) => h.entries === nFiles && h.searchBox && h.sel === 0 && !h.searchFocus,
       "home page never reached its initial selection",
     );
-    const searchEdit = findChildByClass(canvas, "Edit");
-    if (!searchEdit) {
+    const searchEdit = USE_NG ? 0 : findChildByClass(canvas, "Edit");
+    if (!USE_NG && !searchEdit) {
       throw new Error("issue-1136: home-page search edit not found");
     }
     await fn(frame, canvas, searchEdit, client);
@@ -114,11 +102,11 @@ export async function testit(): Promise<void> {
   // arrows move the selection and Enter opens it. The first entry is selected
   // at startup, so two Rights land on the third document
   await withHomePage("enter", async (frame, canvas, _searchEdit, client) => {
-    key(canvas, VK_RIGHT);
+    await key(client, canvas, VK_RIGHT);
     await waitForHome(client, (h) => h.sel === 1, "Right did not move the selection to the second entry");
-    key(canvas, VK_RIGHT);
+    await key(client, canvas, VK_RIGHT);
     await waitForHome(client, (h) => h.sel === 2, "Right did not move the selection to the third entry");
-    key(canvas, VK_RETURN);
+    await key(client, canvas, VK_RETURN);
     const title = await waitForTitle(frame, (t) => t.includes("doc-02.pdf"));
     if (!title.includes("doc-02.pdf")) {
       throw new Error(`Enter did not open the selected file, title: '${title}'`);
@@ -128,28 +116,28 @@ export async function testit(): Promise<void> {
   // Up from the first row goes to the search box, Down there comes back to the
   // list; then filtering re-selects the first (only) match, so Enter opens it
   await withHomePage("search", async (frame, canvas, searchEdit, client) => {
-    key(canvas, VK_UP);
+    await key(client, canvas, VK_UP);
     await waitForHome(client, (h) => h.searchFocus, "Up from the first row did not focus the search box");
-    key(searchEdit, VK_DOWN);
+    await key(client, searchEdit, VK_DOWN);
     await waitForHome(client, (h) => !h.searchFocus, "Down did not move the focus back to the list");
 
     // move off the first entry, then filter down to a single different file:
     // the selection must reset to it
-    key(canvas, VK_RIGHT);
+    await key(client, canvas, VK_RIGHT);
     await waitForHome(client, (h) => h.sel === 1, "Right did not move the selection off the first entry");
     sendCommand(frame, cmdId("CmdFindFirst")); // focuses the home search box
     await waitForHome(client, (h) => h.searchFocus, "CmdFindFirst did not focus the search box");
     for (const ch of "doc-04") {
-      sendMessage(searchEdit, WM_CHAR, ch.charCodeAt(0), 0);
+      await typeChar(client, searchEdit, ch);
     }
     await waitForHome(
       client,
       (h) => h.entries === 1 && h.path.includes("doc-04.pdf"),
       "typing in the search box did not filter down to doc-04",
     );
-    key(searchEdit, VK_DOWN); // search box -> the filtered list
+    await key(client, searchEdit, VK_DOWN); // search box -> the filtered list
     await waitForHome(client, (h) => !h.searchFocus, "Down did not move the focus to the filtered list");
-    key(canvas, VK_RETURN);
+    await key(client, canvas, VK_RETURN);
     const title = await waitForTitle(frame, (t) => t.includes("doc-04.pdf"));
     if (!title.includes("doc-04.pdf")) {
       throw new Error(`filtering should re-select the first match, opened title: '${title}'`);

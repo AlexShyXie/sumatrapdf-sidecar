@@ -2,57 +2,12 @@
    License: Simplified BSD (see COPYING.BSD) */
 
 #include "base/Base.h"
+
+#if OS_WIN
 #include "base/File.h"
-#include "base/AutoWin.h"
+#include "base/ScopedWin.h"
 #include "base/Win.h"
 
-// MinGW's winhttp.h redefines INTERNET_SCHEME as int after wininet.h (via Base.h)
-// already typedef'd it as an enum, which is a hard error. MSVC headers are fine
-// together. On MinGW declare only the WinHTTP bits HttpPostUrl needs and link
-// -lwinhttp (see cmd/helper/mingw-build.ts).
-#if defined(__MINGW32__) || defined(__MINGW64__)
-#ifndef WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
-constexpr DWORD WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY = 4;
-#endif
-#ifndef WINHTTP_NO_PROXY_NAME
-#define WINHTTP_NO_PROXY_NAME ((LPCWSTR) nullptr)
-#endif
-#ifndef WINHTTP_NO_PROXY_BYPASS
-#define WINHTTP_NO_PROXY_BYPASS ((LPCWSTR) nullptr)
-#endif
-#ifndef WINHTTP_NO_REFERER
-#define WINHTTP_NO_REFERER ((LPCWSTR) nullptr)
-#endif
-#ifndef WINHTTP_DEFAULT_ACCEPT_TYPES
-#define WINHTTP_DEFAULT_ACCEPT_TYPES ((LPCWSTR*)nullptr)
-#endif
-#ifndef WINHTTP_FLAG_SECURE
-constexpr DWORD WINHTTP_FLAG_SECURE = 0x00800000;
-#endif
-#ifndef WINHTTP_QUERY_STATUS_CODE
-constexpr DWORD WINHTTP_QUERY_STATUS_CODE = 19;
-#endif
-#ifndef WINHTTP_QUERY_FLAG_NUMBER
-constexpr DWORD WINHTTP_QUERY_FLAG_NUMBER = 0x20000000;
-#endif
-#ifndef WINHTTP_HEADER_NAME_BY_INDEX
-#define WINHTTP_HEADER_NAME_BY_INDEX ((LPCWSTR) nullptr)
-#endif
-#ifndef WINHTTP_NO_HEADER_INDEX
-#define WINHTTP_NO_HEADER_INDEX ((LPDWORD) nullptr)
-#endif
-extern "C" {
-HINTERNET WINAPI WinHttpOpen(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
-HINTERNET WINAPI WinHttpConnect(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
-HINTERNET WINAPI WinHttpOpenRequest(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD);
-BOOL WINAPI WinHttpSendRequest(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
-BOOL WINAPI WinHttpReceiveResponse(HINTERNET, LPVOID);
-BOOL WINAPI WinHttpQueryHeaders(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD);
-BOOL WINAPI WinHttpQueryDataAvailable(HINTERNET, LPDWORD);
-BOOL WINAPI WinHttpReadData(HINTERNET, LPVOID, DWORD, LPDWORD);
-BOOL WINAPI WinHttpCloseHandle(HINTERNET);
-}
-#else
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 #endif
@@ -74,6 +29,8 @@ bool IsHttpRspOk(const HttpRsp* rsp) {
     }
     return true;
 }
+
+#if OS_WIN
 
 // per RFC 1945 10.15 and 3.7, a user agent product token shouldn't contain whitespace
 constexpr const WCHAR* kUserAgent = L"SumatraPdfHTTP";
@@ -233,6 +190,91 @@ Exit:
     return ok;
 }
 
+bool HttpPost(Str serverA, int port, Str urlA, str::Builder* headers, str::Builder* data) {
+    str::Builder resp;
+    str::BuilderReserve(resp, 2048);
+    bool ok = false;
+    char* hdr = nullptr;
+    DWORD hdrLen = 0;
+    HINTERNET hConn = nullptr, hReq = nullptr;
+    void* d = nullptr;
+    DWORD dLen = 0;
+    unsigned int timeoutMs = 15 * 1000;
+    DWORD respHttpCode = 0;
+    DWORD respHttpCodeSize = sizeof(respHttpCode);
+    DWORD dwRead = 0;
+    DWORD flags;
+    DWORD dwService;
+    WCHAR* server = CWStrTemp(serverA);
+    WCHAR* url = CWStrTemp(urlA);
+    DWORD infoLevel;
+
+    DWORD accessType = INTERNET_OPEN_TYPE_PRECONFIG;
+    HINTERNET hInet = InternetOpenW(kUserAgent, accessType, nullptr, nullptr, 0);
+    if (!hInet) {
+        goto Exit;
+    }
+    dwService = INTERNET_SERVICE_HTTP;
+    hConn = InternetConnectW(hInet, server, (INTERNET_PORT)port, nullptr, nullptr, dwService, 0, 1);
+    if (!hConn) {
+        goto Exit;
+    }
+
+    flags = INTERNET_FLAG_NO_UI;
+    if (port == 443) {
+        flags |= INTERNET_FLAG_SECURE;
+    }
+    hReq = HttpOpenRequestW(hConn, L"POST", url, nullptr, nullptr, nullptr, flags, 0);
+    if (!hReq) {
+        goto Exit;
+    }
+
+    if (headers && len(*headers) > 0) {
+        hdr = ToStr(*headers).s;
+        hdrLen = (DWORD)len(*headers);
+    }
+    if (data && len(*data) > 0) {
+        d = ToStr(*data).s;
+        dLen = (DWORD)len(*data);
+    }
+
+    InternetSetOptionW(hReq, INTERNET_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+    InternetSetOptionW(hReq, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+
+    if (!HttpSendRequestA(hReq, hdr, hdrLen, d, dLen)) {
+        goto Exit;
+    }
+
+    infoLevel = HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER;
+    HttpQueryInfoW(hReq, infoLevel, &respHttpCode, &respHttpCodeSize, nullptr);
+
+    do {
+        char buf[1024];
+        if (!InternetReadFile(hReq, buf, sizeof(buf), &dwRead)) {
+            goto Exit;
+        }
+        ok = resp.Append(Str(buf, (int)dwRead));
+        if (!ok) {
+            goto Exit;
+        }
+    } while (dwRead > 0);
+
+    ok = (200 == respHttpCode);
+Exit:
+    if (hReq) {
+        InternetCloseHandle(hReq);
+    }
+    if (hConn) {
+        InternetCloseHandle(hConn);
+    }
+    if (hInet) {
+        InternetCloseHandle(hInet);
+    }
+    return ok;
+}
+
+#endif // OS_WIN
+
 //--- URL encoding
 
 // URL-encode s so it can be substituted into a URL, shortening it if the
@@ -271,6 +313,8 @@ TempStr HttpNormalizeHeadersTemp(Str headers) {
     return ToStrTemp(b);
 }
 
+#if OS_WIN
+
 // POST body to url with an explicit Content-Type and optional extra headers.
 // Blocking, so call it off the ui thread. Returns true on a 2xx; rspOut always
 // carries the status code, the body and the win32 error.
@@ -286,8 +330,7 @@ bool HttpPostUrl(Str url, Str contentType, Str extraHeaders, Str body, HttpRsp* 
     HINTERNET hSession = nullptr, hConnect = nullptr, hRequest = nullptr;
     rspOut->error = ERROR_SUCCESS;
 
-    // InternetCrackUrl (WinINet) rather than WinHttpCrackUrl: same URL_COMPONENTS,
-    // and avoids needing the full winhttp.h URL crack API on MinGW.
+    // InternetCrackUrl (WinINet) rather than WinHttpCrackUrl: same URL_COMPONENTS
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
     uc.dwSchemeLength = (DWORD)-1;
@@ -379,3 +422,5 @@ Exit2:
     }
     return ok;
 }
+
+#endif

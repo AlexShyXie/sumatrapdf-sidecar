@@ -29,6 +29,7 @@
 #include "PngOptimizer.h"
 #include "ImageReader.h"
 #include "ImageSaveCropResize.h"
+#include "ImageSaveCropResizeCommon.h"
 
 ImageEditHost gImageEditHost;
 
@@ -90,94 +91,23 @@ constexpr int kButtonPadding = 8;
 constexpr UINT_PTR kCopyStatusTimerId = 1;
 constexpr UINT kCopyStatusTimeoutMs = 1500;
 
-struct ImageFormat {
-    Str label;
-    const GUID* containerFormat; // WIC container format GUID (null for PDF)
-    Str ext;
-    bool needsProbe; // if true, check if encoder is available before offering
-    bool available;  // set after probing
-    bool isPdf;      // PDF is created via PdfCreator, not WIC
+// clang-format off
+ImageFormat gImageFormats[kImageFormatCount] = {
+    {StrL("PNG"),  StrL(".png"),  false, true,  false},
+    {StrL("JPEG"), StrL(".jpg"),  false, true,  false},
+    {StrL("BMP"),  StrL(".bmp"),  false, true,  false},
+    {StrL("GIF"),  StrL(".gif"),  false, true,  false},
+    {StrL("TIFF"), StrL(".tif"),  false, true,  false},
+    {StrL("WebP"), StrL(".webp"), true,  false, false},
+    {StrL("PDF"),  StrL(".pdf"),  false, true,  true},
 };
 
-// clang-format off
-static ImageFormat gImageFormats[] = {
-    {StrL("PNG"),  &GUID_ContainerFormatPng,  StrL(".png"),  false, true,  false},
-    {StrL("JPEG"), &GUID_ContainerFormatJpeg, StrL(".jpg"),  false, true,  false},
-    {StrL("BMP"),  &GUID_ContainerFormatBmp,  StrL(".bmp"),  false, true,  false},
-    {StrL("GIF"),  &GUID_ContainerFormatGif,  StrL(".gif"),  false, true,  false},
-    {StrL("TIFF"), &GUID_ContainerFormatTiff, StrL(".tif"),  false, true,  false},
-    {StrL("WebP"), &GUID_ContainerFormatWebp, StrL(".webp"), true,  false, false},
-    {StrL("PDF"),  nullptr,                   StrL(".pdf"),  false, true,  true},
+// WIC container format of each gImageFormats entry (null for PDF)
+static const GUID* gImageFormatGuids[kImageFormatCount] = {
+    &GUID_ContainerFormatPng, &GUID_ContainerFormatJpeg, &GUID_ContainerFormatBmp, &GUID_ContainerFormatGif,
+    &GUID_ContainerFormatTiff, &GUID_ContainerFormatWebp, nullptr,
 };
 // clang-format on
-
-// index of the PDF entry in gImageFormats
-constexpr int kPdfFormatIdx = 6;
-
-constexpr int kDefaultFormatIdx = 0; // PNG
-
-Str ImageSaveExtFromData(Str data) {
-    if (len(data) == 0) {
-        return {};
-    }
-    switch (GuessFileTypeFromData(data)) {
-        case FileType::Png:
-            return StrL(".png");
-        case FileType::Jpeg:
-            return StrL(".jpg");
-        case FileType::Gif:
-            return StrL(".gif");
-        case FileType::Tiff:
-            return StrL(".tif");
-        case FileType::Bmp:
-            return StrL(".bmp");
-        case FileType::Ico:
-            return StrL(".ico");
-        case FileType::Webp:
-            return StrL(".webp");
-        case FileType::Jxl:
-            return StrL(".jxl");
-        case FileType::Jp2:
-            return StrL(".jp2");
-        default:
-            return {};
-    }
-}
-
-static bool ExtMatchesOriginal(Str ext, Str originalExt) {
-    if (len(ext) == 0 || len(originalExt) == 0) {
-        return false;
-    }
-    if (str::EqI(ext, originalExt)) {
-        return true;
-    }
-    if (str::EqI(originalExt, StrL(".jpg")) && str::EqI(ext, StrL(".jpeg"))) {
-        return true;
-    }
-    if (str::EqI(originalExt, StrL(".tif")) && str::EqI(ext, StrL(".tiff"))) {
-        return true;
-    }
-    return false;
-}
-
-static int FormatIdxFromExt(Str ext) {
-    if (str::EqI(ext, StrL(".jpeg"))) {
-        ext = StrL(".jpg");
-    } else if (str::EqI(ext, StrL(".tiff"))) {
-        ext = StrL(".tif");
-    }
-    for (int i = 0; i < dimofi(gImageFormats); i++) {
-        if (gImageFormats[i].available && str::EqI(gImageFormats[i].ext, ext)) {
-            return i;
-        }
-    }
-    return kDefaultFormatIdx;
-}
-
-static TempStr PathWithExtTemp(Str path, Str ext) {
-    TempStr noExt = path::GetPathNoExtTemp(path);
-    return fmt("%s%s", noExt, ext);
-}
 
 static bool gFormatsProbed = false;
 
@@ -194,12 +124,13 @@ static void ProbeImageFormats() {
         return;
     }
 
-    for (auto& fmt : gImageFormats) {
+    for (int i = 0; i < kImageFormatCount; i++) {
+        ImageFormat& fmt = gImageFormats[i];
         if (!fmt.needsProbe) {
             continue;
         }
         IWICBitmapEncoder* pEncoder = nullptr;
-        hr = pFactory->CreateEncoder(*fmt.containerFormat, nullptr, &pEncoder);
+        hr = pFactory->CreateEncoder(*gImageFormatGuids[i], nullptr, &pEncoder);
         if (SUCCEEDED(hr) && pEncoder) {
             fmt.available = true;
             pEncoder->Release();
@@ -208,20 +139,6 @@ static void ProbeImageFormats() {
 
     pFactory->Release();
 }
-
-enum class DragEdge {
-    None,
-    Left,
-    Right,
-    Top,
-    Bottom,
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-    Move,   // only used in crop mode
-    NewCrop // only used in crop mode
-};
 
 // a button labelled "&Save": virtual controls draw their text as-is, so the
 // '&' is stripped for the label and kept here as the Alt- shortcut
@@ -1312,83 +1229,6 @@ Done:
     return ok;
 }
 
-// Uncompressed chunky CMYK TIFF (PhotometricInterpretation = Separated).
-// samples are packed C,M,Y,K, stride = w*4, PDF polarity (0 = no ink).
-static bool WriteCmykTiff(Str destPath, int w, int h, int srcStride, const u8* samples) {
-    if (len(destPath) == 0 || w <= 0 || h <= 0 || srcStride < w * 4 || !samples) {
-        return false;
-    }
-    const int rowBytes = w * 4;
-    const u32 dataLen = (u32)rowBytes * (u32)h;
-    const int nTags = 11;
-    const u32 ifdOff = 8;
-    const u32 ifdSize = 2 + ((u32)nTags * 12) + 4;
-    const u32 bitsOff = ifdOff + ifdSize;
-    const u32 dataOff = bitsOff + 8;
-
-    ByteWriterLE wr(8 + (int)ifdSize + 8 + (int)dataLen);
-    wr.Write8x2('I', 'I');
-    wr.Write16(42);
-    wr.Write32(ifdOff);
-    wr.Write16((u16)nTags);
-
-    auto tagLong = [&](u16 tag, u32 val) {
-        wr.Write16(tag);
-        wr.Write16(4); // LONG
-        wr.Write32(1);
-        wr.Write32(val);
-    };
-    auto tagShort = [&](u16 tag, u16 val) {
-        wr.Write16(tag);
-        wr.Write16(3); // SHORT
-        wr.Write32(1);
-        wr.Write16(val);
-        wr.Write16(0);
-    };
-    auto tagShortArray = [&](u16 tag, u32 count, u32 offset) {
-        wr.Write16(tag);
-        wr.Write16(3);
-        wr.Write32(count);
-        wr.Write32(offset);
-    };
-
-    tagLong(256, (u32)w);           // ImageWidth
-    tagLong(257, (u32)h);           // ImageLength
-    tagShortArray(258, 4, bitsOff); // BitsPerSample
-    tagShort(259, 1);               // Compression = none
-    tagShort(262, 5);               // PhotometricInterpretation = Separated
-    tagLong(273, dataOff);          // StripOffsets
-    tagShort(277, 4);               // SamplesPerPixel
-    tagLong(278, (u32)h);           // RowsPerStrip
-    tagLong(279, dataLen);          // StripByteCounts
-    tagShort(284, 1);               // PlanarConfiguration = chunky
-    tagShort(332, 1);               // InkSet = CMYK
-    wr.Write32(0);                  // next IFD
-
-    wr.Write16(8);
-    wr.Write16(8);
-    wr.Write16(8);
-    wr.Write16(8);
-
-    for (int y = 0; y < h; y++) {
-        const u8* row = samples + ((size_t)y * (size_t)srcStride);
-        for (int x = 0; x < rowBytes; x++) {
-            wr.Write8(row[x]);
-        }
-    }
-    return file::WriteFile(destPath, wr.AsByteSlice());
-}
-
-// CMYK JPEG (Adobe polarity) → CMYK TIFF (PDF polarity). False if not CMYK.
-bool TrySaveOriginalAsCmykTiff(Str originalData, Str destPath) {
-    int w = 0, h = 0, stride = 0;
-    Vec<u8> samples;
-    if (!DecodeJpegToCmyk(originalData, w, h, stride, samples)) {
-        return false;
-    }
-    return WriteCmykTiff(destPath, w, h, stride, samples.els);
-}
-
 static void OnSave(ImageEditWindow* ew) {
     if (!ew->srcBitmap) {
         return;
@@ -1487,7 +1327,7 @@ static void OnSave(ImageEditWindow* ew) {
         saved = gImageEditHost.SaveBitmapAsPdf && gImageEditHost.SaveBitmapAsPdf(result, dest);
     } else {
         TempWStr destW = ToWStrTemp(dest);
-        saved = SaveBitmapWithWIC(result, destW, gImageFormats[fmtIdx].containerFormat);
+        saved = SaveBitmapWithWIC(result, destW, gImageFormatGuids[fmtIdx]);
     }
     delete result;
 

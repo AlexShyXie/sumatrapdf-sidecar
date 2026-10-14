@@ -164,12 +164,39 @@ export async function runLogged(cmd: string, args: string[], cwd?: string): Prom
   }
 }
 
+// Visual Studio ships clang-format on Windows; elsewhere it is on PATH or,
+// on mac, inside the Xcode toolchain.
+// msbuild arg passing #defines (PRE_RELEASE_VER, GIT_COMMIT_ID; see
+// src/shared/Version.h) to the projects calling build_defines() in premake5.lua
+// e.g. /p:SumatraBuildDefines=GIT_COMMIT_ID=70cdc0%3BPRE_RELEASE_VER=10175
+export function msbuildDefinesArg(defines: Record<string, string>): string {
+  const pairs = Object.entries(defines).map(([name, value]) => `${name}=${value}`);
+  // %3B: a raw ";" would start the next msbuild property
+  return "/p:SumatraBuildDefines=" + pairs.join("%3B");
+}
+
+export function preReleaseDefines(sha1: string, preRelVer: string): Record<string, string> {
+  return { GIT_COMMIT_ID: sha1, PRE_RELEASE_VER: preRelVer };
+}
+
+export function findClangFormat(): string {
+  if (process.platform === "win32") {
+    const { clangFormatPath } = detectVisualStudio();
+    if (clangFormatPath) return clangFormatPath;
+  }
+  const onPath = Bun.which("clang-format");
+  if (onPath) return onPath;
+  if (process.platform === "darwin") {
+    const r = Bun.spawnSync(["xcrun", "--find", "clang-format"], { stdout: "pipe", stderr: "ignore" });
+    const path = r.stdout.toString().trim();
+    if (r.exitCode === 0 && path) return path;
+  }
+  throw new Error("couldn't find clang-format (install LLVM or the Visual Studio C++ Clang tools)");
+}
+
 // clang-format every generated C++ file so gen-code output matches cmd/format.ts
 export async function clangFormatFiles(rootDir: string, relativePaths: string[]): Promise<void> {
-  const { clangFormatPath } = detectVisualStudio();
-  if (!clangFormatPath) {
-    throw new Error("couldn't find clang-format.exe");
-  }
+  const clangFormatPath = findClangFormat();
   for (const rel of [...new Set(relativePaths)]) {
     const path = join(rootDir, rel);
     await runLogged(clangFormatPath, ["-i", "-style=file", path]);
@@ -209,7 +236,7 @@ export async function getGitLinearVersion(): Promise<number> {
 }
 
 export function extractSumatraVersion(): string {
-  const path = join("src", "Version.h");
+  const path = join("src", "shared", "Version.h");
   const content = readFileSync(path, "utf-8");
   const prefix = "#define CURR_VERSION ";
   for (const line of content.split("\n")) {

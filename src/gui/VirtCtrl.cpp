@@ -16,9 +16,71 @@
 #include "gui/Gfx.h"
 #include "gui/GuiColors.h"
 #include "gui/VirtHost.h"
+#include "Theme.h"
+#include "TipLink.h"
 #include "gui/VirtCtrl.h"
 
 //--- VirtCtrl
+
+VirtButton* NewThemedButton(HWND hwndForDpi, Str text, PlatformFont* font, bool isDefault) {
+    DpiSetFromHwnd(hwndForDpi);
+    auto* b = new VirtButton(text, font);
+    b->SetIsDefault(isDefault);
+    b->textPadding = DpiScaledInsets(5, 12);
+    return b;
+}
+
+constexpr int kDlgBtnRadius = 4;
+constexpr int kDlgBtnHoverShift = 14;
+
+VirtButton* NewDlgButton(HWND hwndForDpi, Str text, PlatformFont* font, DlgButtonStyle style, bool isDefault) {
+    VirtButton* b = NewThemedButton(hwndForDpi, text, font, isDefault);
+    Color colTxt = ThemeWindowTextColor();
+    Color colBg = ThemeWindowControlBackgroundColor();
+    Color fg = colTxt;
+    Color bg = colBg;
+    Color border = kColorTransparent;
+    switch (style) {
+        case DlgButtonStyle::Filled:
+            fg = colBg;
+            bg = colTxt;
+            border = colTxt;
+            break;
+        case DlgButtonStyle::Outline:
+            border = ThemeEdgeColor();
+            break;
+        case DlgButtonStyle::Ghost:
+            fg = ThemeWindowTextDisabledColor();
+            break;
+    }
+    b->cornerRadius = DpiScale(kDlgBtnRadius);
+    b->SetColor(kColBtnText, fg);
+    b->SetColor(kColBtnBg, bg);
+    b->SetColor(kColBtnBgHover, AccentColor(bg, kDlgBtnHoverShift));
+    b->SetColor(kColBtnBorder, border);
+    return b;
+}
+
+constexpr int kDlgBtnDisabledShift = 28;
+
+void SetDlgButtonEnabled(VirtButton* b, DlgButtonStyle style, bool enabled) {
+    if (enabled == b->HasFlag(vwfEnabled)) {
+        return;
+    }
+    b->SetFlag(vwfEnabled, enabled);
+    if (style == DlgButtonStyle::Filled) {
+        Color colTxt = ThemeWindowTextColor();
+        Color colBg = ThemeWindowControlBackgroundColor();
+        b->SetColor(kColBtnBg, enabled ? colTxt : AccentColor(colBg, kDlgBtnDisabledShift));
+        b->SetColor(kColBtnBorder, enabled ? colTxt : kColorTransparent);
+        b->SetColor(kColBtnTextDisabled, ThemeWindowTextDisabledColor());
+    }
+    b->Invalidate();
+}
+
+PlatformFont* DlgUiFont(int px) {
+    return GetUserGuiFont(StrL("Segoe UI"), DpiScale(px));
+}
 
 static Kind kindVirtCtrl = "virtCtrl";
 
@@ -937,6 +999,7 @@ static void FillMouseEvent(VirtMouseEvent& ev, VirtCtrl* target, Point ptWindow,
     ev.isCtrl = IsCtrlPressed() || (wp & MK_CONTROL) != 0;
     ev.isShift = IsShiftPressed() || (wp & MK_SHIFT) != 0;
     ev.isAlt = IsAltPressed();
+    ev.isLeftDown = (wp & MK_LBUTTON) != 0;
 }
 
 // walks up from target until someone consumes the event
@@ -2600,7 +2663,8 @@ void VirtText::PaintText(VirtPaintCtx& ctx, Color textColor) {
     if (withUnderline) {
         GetIdealSize(true);
         Rect lineRect = {r.x, r.y + sz.dy + underlineOffsetY, sz.dx, 0};
-        ctx.gfx->DrawLine(lineRect, textColor);
+        Color col = underlineColor == kColorUnset ? textColor : underlineColor;
+        ctx.gfx->DrawLine(lineRect, col);
     }
 }
 
@@ -2722,8 +2786,14 @@ Color VirtButton::TextColor(Color bg) const {
 void VirtButton::Paint(VirtPaintCtx& ctx) {
     bool isEnabled = HasFlag(vwfEnabled);
     Color bg = GetColor((isEnabled && HasFlag(vwfHovered)) ? kColBtnBgHover : kColBtnBg);
-    ctx.gfx->FillRect(ctx.bounds, bg);
     Color borderCol = GetColor(kColBtnBorder);
+    if (cornerRadius > 0) {
+        Color border = ColorSkipsPaint(borderCol) ? kColorTransparent : borderCol;
+        ctx.gfx->FillRoundedRect(ctx.bounds, cornerRadius, bg, border);
+        borderCol = kColorUnset;
+    } else {
+        ctx.gfx->FillRect(ctx.bounds, bg);
+    }
     if (!ColorSkipsPaint(borderCol)) {
         Rect b = ctx.bounds;
         ctx.gfx->FillRect({b.x, b.y, b.dx, 1}, borderCol);
@@ -3804,21 +3874,6 @@ static void AppendKbdWords(VirtRichText& tip, Str content, bool noSpace) {
     }
 }
 
-// resolve a link command to the target a tip link stores
-static TempStr ResolveLinkCmdTemp(Str cmd) {
-    if (str::StartsWith(cmd, StrL("https://")) || str::StartsWith(cmd, StrL("http://"))) {
-        return str::DupTemp(cmd);
-    }
-    if (str::TrimPrefix(cmd, StrL("Help/"))) {
-        // cmd is a non-NUL-terminated view into the tip line, so %s must get a
-        // zero-terminated copy of exactly the remainder -- otherwise it reads
-        // past the link, pulling in trailing chars like ")."
-        return fmt("https://www.sumatrapdfreader.org/docs/%s", cmd);
-    }
-    // Cmd* - use as-is, will be resolved to command ID on click
-    return str::DupTemp(cmd);
-}
-
 // Text from outside the app -- a clipboard string, a file name -- can contain
 // anything the markup uses, so this adds it as plain words with nothing
 // interpreted.
@@ -3835,6 +3890,23 @@ static TempStr CommandShortcutTemp(Str cmdName) {
         return {};
     }
     return gCommandsContext->GetCommandShortcutTemp(cmdName);
+}
+
+void InitKeyHint(VirtRichText* t, PlatformFont* font, Str key, Str desc, Color colTxt, Color colBg) {
+    ParseTipInto(t, str::JoinTemp(StrL("(Kbd/"), key, StrL(") "), desc));
+    t->font = font;
+    // a hint is not a link, so it takes the plain text color
+    t->SetColor(kColRichText, colTxt);
+    t->SetColor(kColRichLink, colTxt);
+    t->SetColor(kColRichBg, colBg);
+    int padX = DpiScale(8);
+    t->padding = Insets{0, padX, 0, padX};
+}
+
+VirtRichText* NewKeyHint(PlatformFont* font, Str key, Str desc, Color colTxt, Color colBg) {
+    auto* t = new VirtRichText();
+    InitKeyHint(t, font, key, desc, colTxt, colBg);
+    return t;
 }
 
 void ParseTipInto(VirtRichText* tipIn, Str s) {
@@ -4152,9 +4224,11 @@ TipLink* VirtRichText::LinkAt(Point ptLocal) {
 }
 
 // a click on a link runs it; anything else bubbles up to whoever hosts us
+// LayoutText's line pitch: a word's height with a pixel above and below it,
+// and 2 between the lines
 int VirtFixedLinesText::FixedDy() {
-    int lineDy = PlatformFontMeasureText(font, StrL("Ag")).dy;
-    return (lineDy * nLines) + padding.top + padding.bottom;
+    int lineDy = PlatformFontMeasureText(font, StrL("Ag")).dy + (2 * DpiScale(1));
+    return (lineDy * nLines) + (2 * (nLines - 1)) + padding.top + padding.bottom;
 }
 
 // the height is ours in all three, or the box would follow the text: it is

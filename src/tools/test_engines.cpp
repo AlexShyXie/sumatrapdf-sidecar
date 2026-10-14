@@ -114,7 +114,7 @@ static bool ListLinks(Str path) {
                 continue;
             }
             RectF rect = element->GetRect();
-            Str value = PageDestGetValue(dest);
+            Str value = dest->GetValue();
             printf("page %d: %.2f %.2f %.2f %.2f -> %.*s\n", pageNo, rect.x, rect.y, rect.dx, rect.dy, len(value),
                    value.s ? value.s : "");
             linkCount++;
@@ -135,11 +135,11 @@ static bool SelectAllText(Str path) {
     TextSelection selection(engine);
     selection.StartAt(1, 0);
     selection.SelectUpTo(engine->PageCount(), -1);
-    Str text = selection.ExtractText(StrL("\n"));
+    TempStr text = selection.ExtractTextTemp(StrL("\n"));
     printf("selected bytes: %d\n", len(text));
-    printf("selection rectangles: %d\n", selection.result.len);
-    bool ok = len(text) > 0 && selection.result.len > 0;
-    str::Free(text);
+    printf("selection rectangles: %d\n", len(selection.result));
+    bool ok = len(text) > 0 && len(selection.result) > 0;
+
     engine->Release();
     return ok;
 }
@@ -153,7 +153,7 @@ static bool FindText(Str path, Str term) {
 
     TextSearch search(engine);
     search.SetDirection(TextSearch::Direction::Forward);
-    TextSel* result = search.FindFirst(1, term);
+    Vec<TextSel>* result = search.FindFirst(1, term);
     int matches = 0;
     while (result) {
         matches++;

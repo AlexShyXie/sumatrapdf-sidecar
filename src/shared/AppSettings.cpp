@@ -1,0 +1,1884 @@
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
+   License: GPLv3 */
+
+#include "base/Base.h"
+#include "base/File.h"
+#include "base/Pixmap.h"
+#include "base/SettingsUtil.h"
+#include "base/FileWatcher.h"
+#include "base/SquareTreeParser.h"
+#include "base/UITask.h"
+#if OS_WIN
+#include "base/Win.h"
+#endif
+#include "gui/Dpi.h"
+#if !defined(SUMATRA_NG)
+#include "gui/PlatformFont.h"
+#endif
+#include "base/Timer.h"
+
+#include "gui/UIModels.h"
+
+#if defined(SUMATRA_NG)
+#define INCLUDE_SETTINGSSTRUCTS_METADATA
+#endif
+#include "Settings.h"
+#include "Commands.h"
+#include "DisplayMode.h"
+#include "DocController.h"
+#include "EngineBase.h"
+#include "base/GuessFileType.h"
+#include "EngineAll.h"
+#include "PdfCad.h"
+#include "SumatraConfig.h"
+#include "FileHistory.h"
+#include "SumatraPDF.h"
+#if !defined(SUMATRA_NG)
+#include "WindowTab.h"
+#include "MainWindow.h"
+#include "DisplayModel.h"
+#include "VirtualDesktop.h"
+#endif
+#include "AppTools.h"
+#if !defined(SUMATRA_NG)
+#include "Favorites.h"
+#include "Menu.h"
+#include "HomePage.h"
+#include "Toolbar.h"
+#endif
+#include "FileThumbnails.h"
+#include "Translations.h"
+#if defined(SUMATRA_NG)
+#include "ShortcutParse.h"
+#endif
+#include "Accelerators.h"
+#include "Theme.h"
+#include "PdfDarkMode.h"
+#if defined(SUMATRA_NG)
+#include "CachedObjects.h"
+#include "PagePosition.h"
+#include "GlobalHotkeys.h"
+#include "ExplorerQuickLook.h"
+#endif
+#include "ReadAloud.h"
+#if defined(SUMATRA_NG)
+#include "gui/WasmBridge.h"
+#else
+#include "Notifications.h"
+#include "ExplorerQuickLook.h"
+#include "Tabs.h"
+#include "GlobalHotkeys.h"
+#include "PagePosition.h"
+#include "CachedObjects.h"
+#endif
+#include "AppSettings.h"
+void ReloadSettingsUpdateWindows(bool showToolbarBefore);
+#if defined(SUMATRA_NG)
+void HomePageInvalidateLayoutCache();
+int CmdIdFromVirtualZoom(float virtualZoom); // Menu.h
+void ApplySettingsToWindowsUi();
+#endif
+
+// workaround for OnMenuExit
+// if this flag is set, CloseWindow will not save prefs before closing the window.
+bool gDontSaveSettings = false;
+
+// coalesces ScheduleSaveSettings() onto one uitask; a sync SaveSettings()
+// clears it so a pending post becomes a no-op
+static bool gSaveSettingsPending = false;
+
+// last bytes we wrote (or loaded). Watcher reloads and SaveSettings() writes
+// are skipped when the file / serialized prefs still match this.
+static Str gLastSavedPrefs;
+
+static bool IsLastSavedPrefs(Str s) {
+    return len(gLastSavedPrefs) == len(s) && str::Eq(gLastSavedPrefs, s);
+}
+
+static void RememberLastSavedPrefs(Str s) {
+    str::ReplaceWithCopy(&gLastSavedPrefs, s);
+}
+
+#if !defined(SUMATRA_NG)
+static bool ApplyReadAloudVoiceFromSettings() {
+    if (!gSettings) {
+        return false;
+    }
+
+    float speed = gSettings->readAloudSpeed;
+    TtsSetSpeed(speed > 0 ? speed : 1.0f);
+
+    Str voiceId = gSettings->readAloudVoiceId;
+    if (len(voiceId) == 0) {
+        TtsSetVoiceById(StrL(""));
+        return false;
+    }
+
+    if (!TtsSetVoiceById(voiceId)) {
+        logf("ApplyReadAloudVoiceFromSettings: voice '%s' not available, using system default\n", voiceId);
+        str::ReplaceWithCopy(&gSettings->readAloudVoiceId, Str{});
+        TtsSetVoiceById(StrL(""));
+        return true;
+    }
+    return false;
+}
+#endif
+
+#if !defined(SUMATRA_NG)
+// SumatraPDF.cpp
+extern void RememberDefaultWindowPosition(MainWindow* win);
+#endif
+
+static WatchedFile* gWatchedSettingsFile = nullptr;
+
+static DocumentColorsFollowTheme MapLegacyDocumentColorMode(Str v) {
+    if (str::EqI(v, StrL("auto"))) {
+        return DocumentColorsFollowTheme::Smart;
+    }
+    if (str::EqI(v, StrL("black"))) {
+        return DocumentColorsFollowTheme::Legacy;
+    }
+    return DocumentColorsFollowTheme::Off;
+}
+
+// the black-on-white a document renders as when FixedPageUI says nothing
+constexpr Color kColBlackDefault = 0x000000;
+constexpr Color kColWhiteDefault = 0xFFFFFF;
+
+// Migrate FixedPageUI.InvertColors and DocumentColorMode to DocumentColorsFollowTheme
+static bool MigrateDocumentColorsFollowThemeSetting(Str prefsData) {
+    if (len(prefsData) == 0) {
+        return false;
+    }
+    SquareTreeNode* root = ParseSquareTree(prefsData);
+    if (!root) {
+        return false;
+    }
+
+    Str newSetting = root->GetValue(StrL("DocumentColorsFollowTheme"));
+    if (!str::IsNull(newSetting)) {
+        delete root;
+        DocumentColorsFollowTheme mode = GetDocumentColorsFollowTheme();
+        SetDocumentColorsFollowTheme(mode);
+        return false;
+    }
+
+    Str oldSetting = root->GetValue(StrL("DocumentColorMode"));
+    bool hadOldSetting = !str::IsNull(oldSetting);
+
+    bool hadInvertColors = false;
+    SquareTreeNode* fixedPageUI = root->GetChild(StrL("FixedPageUI"));
+    if (fixedPageUI) {
+        Str invertColors = fixedPageUI->GetValue(StrL("InvertColors"));
+        hadInvertColors = str::EqI(invertColors, StrL("true"));
+    }
+
+    delete root;
+
+    if (hadOldSetting) {
+        SetDocumentColorsFollowTheme(MapLegacyDocumentColorMode(oldSetting));
+        return true;
+    }
+    if (hadInvertColors) {
+        // InvertColors meant "swap FixedPageUI TextColor and BackgroundColor",
+        // so swap them: that's still what those two settings do, it doesn't
+        // depend on the theme, and it's what the user was looking at in 3.6.
+        //
+        // This used to map to DocumentColorsFollowTheme::Smart, which inverted
+        // back when the mapping was written. 37f920ff0 then redefined smart as
+        // "match the UI theme, don't swap black/white", which quietly turned
+        // this migration into "light pages" for anyone on a light theme.
+        Color text = ParseColor(gSettings->fixedPageUI.textColor.s, kColBlackDefault);
+        Color bg = ParseColor(gSettings->fixedPageUI.backgroundColor.s, kColWhiteDefault);
+        SetColorText(gSettings->fixedPageUI.textColor, SerializeColorTemp(bg));
+        SetColorText(gSettings->fixedPageUI.backgroundColor, SerializeColorTemp(text));
+        SetDocumentColorsFollowTheme(DocumentColorsFollowTheme::Off);
+        return true;
+    }
+    return false;
+}
+
+// Older ng builds stored Unix nanoseconds here. Convert realistic post-2001
+// values once so Windows can read them too.
+static bool MigrateLegacyFileTime(FILETIME* ft) {
+    constexpr u64 kLegacyMin = 1000000000000000000ULL;
+    u64 value = FileTimeToU64(*ft);
+    if (value < kLegacyMin) {
+        return false;
+    }
+    *ft = FileTimeFromU64(kFileTimeUnixEpoch + value / 100);
+    return true;
+}
+
+#if !defined(SUMATRA_NG)
+// UI fonts are cached per DPI so windows on monitors with different scale
+// factors get correctly sized fonts. User-set sizes (UIFontSize, TreeFontSize)
+// are pixel sizes and used as-is at every DPI.
+struct UiFontsAtDpi {
+    int dpi = 0;
+    PlatformFont* appFont = nullptr;
+    PlatformFont* biggerAppFont = nullptr;
+    PlatformFont* appMenuFont = nullptr;
+    PlatformFont* sidebarLabelFont = nullptr;
+    PlatformFont* treeFontEx[4] = {nullptr, nullptr, nullptr, nullptr};
+};
+
+static Vec<UiFontsAtDpi> gUiFontsAtDpi;
+
+// the returned pointer is only valid until the next call (Vec can reallocate)
+static UiFontsAtDpi* GetUiFontsAtDpi(int dpi) {
+    int n = len(gUiFontsAtDpi);
+    for (int i = 0; i < n; i++) {
+        if (gUiFontsAtDpi[i].dpi == dpi) {
+            return &gUiFontsAtDpi[i];
+        }
+    }
+    UiFontsAtDpi e;
+    e.dpi = dpi;
+    VecAppend(gUiFontsAtDpi, e);
+    return &gUiFontsAtDpi[n];
+}
+
+static void ResetCachedFonts() {
+    // Fonts are interned PlatformFonts, so just drop these per-DPI references;
+    // old fonts stay valid for windows that still hold them.
+    VecReset(gUiFontsAtDpi);
+}
+#endif
+
+// number of weeks past since 2011-01-01
+static int GetWeekCount() {
+#if OS_WIN
+    SYSTEMTIME date20110101{};
+    date20110101.wYear = 2011;
+    date20110101.wMonth = 1;
+    date20110101.wDay = 1;
+    FILETIME origTime, currTime;
+    BOOL ok = SystemTimeToFileTime(&date20110101, &origTime);
+    ReportIf(!ok);
+    GetSystemTimeAsFileTime(&currTime);
+    return (int)(currTime.dwHighDateTime - origTime.dwHighDateTime) / 1408;
+    // 1408 == (10 * 1000 * 1000 * 60 * 60 * 24 * 7) / (1 << 32)
+#else
+    constexpr i64 kSecs20110101 = 1293840000;
+    constexpr i64 kSecsPerWeek = 60 * 60 * 24 * 7;
+    i64 now = (i64)time(nullptr);
+    return (int)((now - kSecs20110101) / kSecsPerWeek);
+#endif
+}
+
+static int cmpFloat(const float* a, const float* b) {
+    if (*a < *b) {
+        return -1;
+    }
+    if (*a > *b) {
+        return 1;
+    }
+    return 0;
+}
+
+TempStr GetSettingsFileNameTemp() {
+    return str::DupTemp(StrL("SumatraPDF-settings.txt"));
+}
+
+// this could be virtual path when running in app store
+TempStr GetSettingsPathTemp() {
+    return GetPathInAppDataDirTemp(GetSettingsFileNameTemp());
+}
+
+static void setMin(int& i, int minVal) {
+    i = std::max(i, minVal);
+}
+
+static void ClampNonNegative(WindowMargin& m) {
+    setMin(m.bottom, 0);
+    setMin(m.top, 0);
+    setMin(m.left, 0);
+    setMin(m.right, 0);
+}
+
+static void ClampNonNegative(Size& size) {
+    setMin(size.dx, 0);
+    setMin(size.dy, 0);
+}
+
+static void AddStringArgIfSet(CommandArg** args, Str name, Str value) {
+    if (str::IsEmptyOrWhiteSpace(value)) {
+        return;
+    }
+    InsertArg(args, NewStringArg(name, value));
+}
+
+/* for every selection handler defined by user in advanced settings, create
+    a command that will be inserted into a menu item */
+static void CreateSelectionHandlerCommands() {
+    // every handler reads the selection; only the ones that talk to a web
+    // service need network access, so an Exe handler still works without it
+    if (!HasPermission(Perm::CopySelection)) {
+        return;
+    }
+    bool canUseInternet = HasPermission(Perm::InternetAccess);
+
+    for (auto& sh : *gSettings->selectionHandlers) {
+        if (!sh || str::IsEmptyOrWhiteSpace(sh->name)) {
+            // can happen for bad selection handler definition
+            continue;
+        }
+        bool hasExe = !str::IsEmptyOrWhiteSpace(sh->exe);
+        bool hasUrl = !str::IsEmptyOrWhiteSpace(sh->url);
+        if (!hasExe && !hasUrl) {
+            continue;
+        }
+        if (!hasExe && !canUseInternet) {
+            continue;
+        }
+
+        // args are a linked list; only attach the optional ones that are set so
+        // a handler with just URL/Name/Key behaves exactly as it did before
+        Str definition = hasExe ? sh->exe : sh->url;
+        CommandArg* args = hasExe ? NewStringArg(kCmdArgExe, sh->exe) : NewStringArg(kCmdArgURL, sh->url);
+        if (!hasExe) {
+            AddStringArgIfSet(&args, kCmdArgMethod, sh->method);
+            AddStringArgIfSet(&args, kCmdArgBody, sh->body);
+            AddStringArgIfSet(&args, kCmdArgContentType, sh->contentType);
+            AddStringArgIfSet(&args, kCmdArgHeaders, sh->headers);
+        }
+        AddStringArgIfSet(&args, kCmdArgSelectToolbar, sh->selectToolbarNameOrSvg);
+        AddStringArgIfSet(&args, kCmdArgToolbarText, sh->toolbarText);
+        AddStringArgIfSet(&args, kCmdArgToolbarSvgIcon, sh->toolbarSvgIcon);
+        CreateCustomCommand(definition, CmdSelectionHandler, args, sh->name, sh->key);
+    }
+}
+
+// Create one command per configured text snippet.
+static void CreateTextSnippetCommands() {
+    for (TextSnippet* ts : *gSettings->textSnippets) {
+        if (!ts || str::IsEmptyOrWhiteSpace(ts->name) || str::IsEmptyOrWhiteSpace(ts->text)) {
+            continue;
+        }
+        // Settings values are single-line: \n in Text is a line break.
+        TempStr text = str::ReplaceTemp(ts->text, StrL("\\n"), StrL("\n"));
+        CommandArg* args = NewStringArg(kCmdArgText, text);
+        CreateCustomCommand(StrL(""), CmdInsertTextSnippet, args, ts->name, ts->key);
+    }
+}
+
+static void CreateExternalViewersCommands() {
+    for (ExternalViewer* ev : *gSettings->externalViewers) {
+        if (!ev || str::IsEmptyOrWhiteSpace(ev->commandLine)) {
+            continue;
+        }
+        CommandArg* args = NewStringArg(kCmdArgCommandLine, ev->commandLine);
+        AddStringArgIfSet(&args, kCmdArgFilter, ev->filter);
+        AddStringArgIfSet(&args, kCmdArgToolbarText, ev->toolbarText);
+        AddStringArgIfSet(&args, kCmdArgToolbarSvgIcon, ev->toolbarSvgIcon);
+        CreateCustomCommand(StrL(""), CmdViewWithExternalViewer, args, ev->name, ev->key);
+    }
+}
+
+// A command per zoom level the zoom buttons step through, in the same order, so
+// the toolbar's zoom drop-down can offer every step. Most of the built-in levels
+// have no command of their own; those get a CmdZoomCustom with the level as its
+// argument, the same as the ZoomLevels ones.
+static Vec<int> gZoomStepCmdIds;
+
+Vec<int>* GetZoomStepCmdIds() {
+    return &gZoomStepCmdIds;
+}
+
+static void CreateZoomCommands() {
+    auto* prefs = gSettings;
+    delete prefs->zoomLevelsCmdIds;
+    prefs->zoomLevelsCmdIds = nullptr;
+    VecReset(gZoomStepCmdIds);
+
+    int n = len(*prefs->zoomLevels);
+    if (n > 0) {
+        // ZoomLevels replaces the built-in levels, for the buttons too
+        Vec<int>* cmdIds = new Vec<int>();
+        VecReserve(*cmdIds, n);
+        prefs->zoomLevelsCmdIds = cmdIds;
+        for (int i = 0; i < n; i++) {
+            float zoomLevel = (*prefs->zoomLevels)[i];
+            CommandArg* arg = NewFloatArg(kCmdArgLevel, zoomLevel);
+            auto* cmd = CreateCustomCommand(StrL("CmdZoomCustom"), CmdZoomCustom, arg);
+            VecInsertAt(*cmdIds, i, cmd->id);
+            VecAppend(gZoomStepCmdIds, cmd->id);
+        }
+        return;
+    }
+    float* levels = GetDefaultZoomLevels(&n);
+    for (int i = 0; i < n; i++) {
+        // the ones the Zoom menu already has a command for keep it, so they
+        // keep their shortcut and don't turn into a second, identical command
+        int cmdId = CmdIdFromVirtualZoom(levels[i]);
+        if (cmdId == CmdZoomCustom) {
+            CommandArg* arg = NewFloatArg(kCmdArgLevel, levels[i]);
+            cmdId = CreateCustomCommand(StrL("CmdZoomCustom"), CmdZoomCustom, arg)->id;
+        }
+        VecAppend(gZoomStepCmdIds, cmdId);
+    }
+}
+
+// Every entry in the Shortcuts section is its own thing: it has its own Name,
+// its own Key and possibly its own toolbar button. Two entries must therefore
+// never share a CustomCommand or command id: the toolbar identifies a button
+// (and its tooltip) by command id, so with duplicate ids all but one of the
+// buttons ends up without a working tooltip (#5869).
+//
+// CreateCommandFromDefinition caches by definition string and may return a
+// command that keeps its original id (no args). Always CloneCustomCommand so
+// each shortcut gets a unique id with its name/key packed into the allocation.
+static void CreateCustomShortcuts() {
+    for (Shortcut* shortcut : *gSettings->shortcuts) {
+        auto* base = CreateCommandFromDefinition(shortcut->cmd);
+        if (!base) {
+            continue;
+        }
+        auto* cmd = CloneCustomCommand(base, shortcut->name, shortcut->key);
+        shortcut->cmdId = cmd->id;
+    }
+}
+
+/* Caller needs to CleanUpSettings() */
+void ApplySettingsToOpenWindows() {
+    if (gSettings) {
+        setMinMax(gSettings->saveMemory, 0, 100);
+        gSaveMemory = gSettings->saveMemory;
+    }
+#if !defined(SUMATRA_NG)
+    for (MainWindow* win : gWindows) {
+        // WindowMargin / PageSpacing are copied into DisplayModel at SetUiDpi;
+        // pick up the reloaded prefs before the relayout below (issue #6018)
+        if (DisplayModel* dm = win->AsFixed()) {
+            int dpi = win->frameDpi > 0 ? win->frameDpi : DpiGetForHwnd(win->hwndFrame);
+            dm->SetUiDpi(dpi);
+        }
+        // LoadSettings re-creates custom commands (themes, external viewers,
+        // selection handlers, shortcuts) with fresh command ids. Menus still
+        // hold the old ids unless rebuilt - without this, e.g. "Set theme ..."
+        // does nothing until restart (issue #5822).
+        RebuildMenuBarForWindow(win);
+        ReCreateToolbar(win);
+        ToolbarUpdateStateForWindow(win, true);
+        UpdateFindbox(win);
+        // force the relayout: toolbar size/font are not part of the layout
+        // state snapshot (see issue #5136), and repaint the toolbar after it
+        ScheduleUiUpdate(win, kUiForceRelayout | kUiToolbarDirty);
+        for (WindowTab* tab : win->Tabs()) {
+            UpdateTabPageText(tab);
+        }
+        win->RedrawAll(true);
+    }
+#else
+    ApplySettingsToWindowsUi();
+#endif
+    ReRegisterGlobalHotkeys();
+}
+
+// FileStates are large; the minidump comment only needs the rest.
+static void UpdateCrashHandlerSettings() {
+    if (!gSettings) {
+        return;
+    }
+    Vec<FileState*> empty;
+    Vec<FileState*>* saved = gSettings->fileStates;
+    gSettings->fileStates = &empty;
+    Str d = SerializeSettings(gSettings, {});
+    gSettings->fileStates = saved;
+    CrashHandlerSetSettings(d);
+    str::Free(d);
+}
+
+#if !defined(SUMATRA_NG)
+TabState* CloneTabState(const TabState* src) {
+    TabState* dst = (TabState*)AllocStruct<TabState>();
+    str::ReplaceWithCopy(&dst->filePath, src->filePath);
+    str::ReplaceWithCopy(&dst->displayMode, src->displayMode);
+    str::ReplaceWithCopy(&dst->pageNo, src->pageNo);
+    str::ReplaceWithCopy(&dst->zoom, src->zoom);
+    dst->rotation = src->rotation;
+    dst->scrollPos = src->scrollPos;
+    dst->showToc = src->showToc;
+    str::ReplaceWithCopy(&dst->sidebarView, src->sidebarView);
+    dst->tocState = new Vec<int>(*src->tocState);
+    return dst;
+}
+
+static SessionData* CloneSessionData(const SessionData* src) {
+    SessionData* dst = NewSessionData();
+    dst->tabIndex = src->tabIndex;
+    dst->windowState = src->windowState;
+    dst->windowPos = src->windowPos;
+    dst->sidebarDx = src->sidebarDx;
+    str::ReplaceWithCopy(&dst->virtualDesktopId, src->virtualDesktopId);
+    for (TabState* ts : *src->tabStates) {
+        VecAppend(*dst->tabStates, CloneTabState(ts));
+    }
+    return dst;
+}
+
+#endif
+// session snapshot loaded at startup. Also the source of state for re-saving
+// not-yet-loaded (lazy) tabs, kept mirroring the live session by
+// SyncInitialSessionData() so it never carries closed-window entries.
+Vec<SessionData*>* gInitialSessionData = nullptr;
+
+#if defined(SUMATRA_NG)
+// ng: orig's SaveSettings() calls UpdateTabFileDisplayStateForTab() for every
+// tab, then RememberSessionState() + SyncInitialSessionData(). All three need
+// MainWindow / WindowTab, which live in the SumatraPDF target because `app`
+// also links into the console tools, so the shell installs them here.
+// src/SessionState.cpp has orig's code.
+void (*gRememberSessionStateFn)() = nullptr;
+#else
+// find the saved state for a lazy tab by file path. Because gInitialSessionData
+// is kept in sync with the live session, this never matches a closed window;
+// per-tab disambiguation (e.g. same file in two windows) comes from the more
+// reliable tab->tabState, which RememberSessionState prefers.
+static TabState* FindSessionTabState(Str fp) {
+    if (!gInitialSessionData) {
+        return nullptr;
+    }
+    for (SessionData* psd : *gInitialSessionData) {
+        for (TabState* pts : *psd->tabStates) {
+            if (str::Eq(pts->filePath, fp)) {
+                return pts;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// lazy tabs borrow tab->tabState from gInitialSessionData. After we replace that
+// snapshot, repoint those pointers so the next SaveSettings() does not clone freed
+// TabState objects
+static void RefreshLazyTabStatePointers() {
+    int sdIdx = 0;
+    for (MainWindow* win : gWindows) {
+        bool hasFileTab = false;
+        for (WindowTab* tab : win->Tabs()) {
+            if (tab->filePath) {
+                hasFileTab = true;
+                break;
+            }
+        }
+        if (!hasFileTab) {
+            continue;
+        }
+        SessionData* sd = nullptr;
+        if (gInitialSessionData && sdIdx < len(*gInitialSessionData)) {
+            sd = (*gInitialSessionData)[sdIdx++];
+        }
+        int tsIdx = 0;
+        for (WindowTab* tab : win->Tabs()) {
+            if (len(tab->filePath) == 0) {
+                continue;
+            }
+            TabState* ts = nullptr;
+            if (sd && tsIdx < len(*sd->tabStates)) {
+                ts = (*sd->tabStates)[tsIdx];
+            }
+            tsIdx++;
+            if (!tab->ctrl && tab->tabState) {
+                // null when the new snapshot has nothing to borrow: the old one
+                // was just freed and must not be left dangling
+                tab->tabState = ts;
+            }
+        }
+    }
+}
+
+// keep gInitialSessionData mirroring the just-saved live session, so re-saving
+// not-yet-loaded tabs never feeds stale state from a closed window back into the
+// saved session (fixes #5668). Call after RememberSessionState().
+static void SyncInitialSessionData() {
+    if (!gInitialSessionData) {
+        return;
+    }
+    FreeSessionDataVec(gInitialSessionData);
+    for (SessionData* sd : *gSettings->sessionData) {
+        VecAppend(*gInitialSessionData, CloneSessionData(sd));
+    }
+    RefreshLazyTabStatePointers();
+}
+
+static void RememberSessionState() {
+    Vec<SessionData*>* sessionState = gSettings->sessionData;
+    FreeSessionDataVec(sessionState);
+
+    if (!SettingsRememberOpenedFiles()) {
+        return;
+    }
+
+    // which virtual desktop each window is on, so restoring puts it back (#6271)
+    ISumatraVirtualDesktopManager* vdm = CreateVirtualDesktopManager();
+    for (auto* win : gWindows) {
+        if (win->isQuickLook) {
+            continue;
+        }
+        SessionData* windowState = NewSessionData();
+        for (WindowTab* tab : win->Tabs()) {
+            if (len(tab->filePath) == 0) {
+                // home page tab
+                continue;
+            }
+            Str fp = tab->filePath;
+            if (!tab->ctrl) {
+                // file not loaded into a tab (lazy loading, or a placeholder for
+                // a missing file). Prefer the tab's own remembered state -- it's
+                // authoritative and disambiguates the same file open in multiple
+                // windows -- and only fall back to the (in-sync) startup snapshot.
+                TabState* src = tab->tabState;
+                if (!src) {
+                    src = FindSessionTabState(fp);
+                }
+                if (src) {
+                    VecAppend(*windowState->tabStates, CloneTabState(src));
+                }
+                continue;
+            }
+            FileState* fs = NewFileState(fp);
+            tab->ctrl->GetDisplayState(fs);
+            fs->showToc = tab->showToc;
+            str::ReplaceWithCopy(&fs->sidebarView, SidebarViewToStr(tab->sidebarView));
+            *fs->tocState = tab->tocState;
+            TabState* ts = NewTabState(fs);
+            VecAppend(*windowState->tabStates, ts);
+            DeleteFileState(fs);
+        }
+        if (len(*windowState->tabStates) == 0) {
+            FreeSessionData(windowState);
+            continue;
+        }
+        str::ReplaceWithCopy(&windowState->virtualDesktopId, GetWindowDesktopIdTemp(vdm, win->hwndFrame));
+        // 1-based index among document tabs only (home / about tab is omitted
+        // from TabStates above). Using the UI tab index would mis-restore when
+        // the home tab was closed at save time but recreated on the next start.
+        int docOrdinal = 0;
+        int selectedDocOrdinal = 1;
+        WindowTab* cur = win->CurrentTab();
+        for (WindowTab* tab : win->Tabs()) {
+            if (tab->IsAboutTab() || len(tab->filePath) == 0) {
+                continue;
+            }
+            docOrdinal++;
+            if (tab == cur) {
+                selectedDocOrdinal = docOrdinal;
+            }
+        }
+        windowState->tabIndex = selectedDocOrdinal;
+        RememberDefaultWindowPosition(win);
+        windowState->windowState = gSettings->windowState;
+        windowState->windowPos = gSettings->windowPos;
+        windowState->sidebarDx = gSettings->sidebarDx;
+        VecAppend(*sessionState, windowState);
+    }
+    if (vdm) {
+        vdm->Release();
+    }
+}
+#endif
+
+// called whenever global preferences change or a file is
+// added or removed from the file history (in order to keep
+// the list of recently opened documents in sync)
+// force: Open Settings File. -for-testing and exit skip every other save.
+static bool SaveSettings(bool force) {
+    gSaveSettingsPending = false;
+    if (!force && gForTesting) {
+        // started with -for-testing for ad-hoc testing: don't modify
+        // the settings of the tester
+        return true;
+    }
+    if (!force && gDontSaveSettings) {
+        // if we are exiting the application by File->Exit,
+        // OnMenuExit will have called SaveSettings() already
+        // and we skip the call here to avoid saving incomplete session info
+        // (because some windows might have been closed already)
+        return true;
+    }
+
+    // don't save preferences without the proper permission
+    if (!HasPermission(Perm::SavePreferences)) {
+        return false;
+    }
+    logf("SaveSettings\n");
+#if defined(SUMATRA_NG)
+    // update display states for all tabs, then snapshot the session
+    if (gRememberSessionStateFn) {
+        gRememberSessionStateFn();
+#else
+    // update display states for all tabs
+    // we snapshot the list because SaveSettings() can be called re-entrantly
+    // (e.g. from LoadDocumentFinish while other documents are still loading/closing)
+    for (MainWindow* win : gWindows) {
+        Vec<WindowTab*> tabs = win->Tabs();
+        for (WindowTab* tab : tabs) {
+            UpdateTabFileDisplayStateForTab(tab);
+        }
+#endif
+    }
+#if !defined(SUMATRA_NG)
+    RememberSessionState();
+    SyncInitialSessionData();
+#endif
+
+    // remove entries which should (no longer) be remembered
+    FileHistoryPurge(!gSettings->rememberStatePerDocument);
+    // update display mode and zoom fields from internal values.
+    // "page aspect" is not a DisplayMode enum value — keep the string.
+    if (!IsPageAspectDisplayMode(gSettings->defaultDisplayMode)) {
+        str::ReplaceWithCopy(&gSettings->defaultDisplayMode, DisplayModeToString(gSettings->defaultDisplayModeEnum));
+    }
+    ZoomToString(&gSettings->defaultZoom, gSettings->defaultZoomFloat, nullptr);
+    if (gSettings->imageUI.defaultZoomFloat != 0) {
+        ZoomToString(&gSettings->imageUI.defaultZoom, gSettings->imageUI.defaultZoomFloat, nullptr);
+    }
+    if (gSettings->comicBookUI.defaultZoomFloat != 0) {
+        ZoomToString(&gSettings->comicBookUI.defaultZoom, gSettings->comicBookUI.defaultZoomFloat, nullptr);
+    }
+
+    TempStr path = GetSettingsPathTemp();
+    ReportIf(len(path) == 0);
+    if (len(path) == 0) {
+        return false;
+    }
+    // startup save is skipped under -for-testing, so the file can be missing
+    // while these bytes still match the last in-memory snapshot
+    bool missing = !file::Exists(path);
+    TempStr prevPrefs = file::ReadFileWithArena(path, GetTempArena());
+    Str prefs = SerializeSettings(gSettings, prevPrefs);
+    AutoCall freePrefs((void (*)(Str))str::Free, prefs);
+    ReportIf(len(prefs) == 0);
+    if (len(prefs) == 0) {
+        return false;
+    }
+    UpdateCrashHandlerSettings();
+
+    if (!missing && (IsLastSavedPrefs(prefs) || (prevPrefs.len == prefs.len && str::Eq(prefs, prevPrefs)))) {
+        RememberLastSavedPrefs(prefs);
+        return true;
+    }
+
+    WatchedFileSetIgnore(gWatchedSettingsFile, true);
+    bool ok = file::WriteFile(path, prefs);
+    if (ok) {
+        RememberLastSavedPrefs(prefs);
+        gSettings->lastPrefUpdate = file::GetModificationTime(path);
+#if defined(SUMATRA_NG)
+#if OS_WASM
+        // the settings directory is MEMFS; a write only outlives the tab once
+        // it is copied back to OPFS
+        WasmPersistSettings();
+#endif
+#endif
+    }
+    WatchedFileSetIgnore(gWatchedSettingsFile, false);
+    return ok;
+}
+
+static bool SaveSettings() {
+    return SaveSettings(false);
+}
+
+static void SaveSettingsPosted() {
+    if (!gSaveSettingsPending) {
+        return;
+    }
+    gSaveSettingsPending = false;
+    SaveSettings();
+}
+
+void ScheduleSaveSettings() {
+    if (gSaveSettingsPending || gForTesting || gDontSaveSettings) {
+        return;
+    }
+    if (!HasPermission(Perm::SavePreferences)) {
+        return;
+    }
+    gSaveSettingsPending = true;
+    auto fn = MkFunc0Void(SaveSettingsPosted);
+    uitask::Post(fn, "SaveSettings");
+}
+
+// Last-window close and process exit cannot wait for the uitask:
+// ShowWindow(SW_HIDE) can tear the window down first, and a fast
+// ExitProcess never drains the queue.
+void FlushScheduledSaveSettings() {
+    if (!gSaveSettingsPending) {
+        return;
+    }
+    SaveSettings();
+}
+
+bool LoadSettings() {
+    ReportIf(gSettings);
+
+    auto timeStart = TimeGet();
+
+    Settings* gprefs = nullptr;
+    TempStr settingsPath = GetSettingsPathTemp();
+    bool settingsMigrated = false;
+    {
+        Str prefsData = file::ReadFile(settingsPath);
+
+        gSettings = NewSettings(prefsData);
+        ReportIf(!gSettings);
+        gprefs = gSettings;
+        settingsMigrated = MigrateDocumentColorsFollowThemeSetting(prefsData);
+        settingsMigrated |= MigrateLegacyFileTime(&gSettings->timeOfLastUpdateCheck);
+        RememberLastSavedPrefs(prefsData);
+        str::Free(prefsData);
+    }
+    if (MigrateRenamedThemeNames()) {
+        // the file still named a theme we dropped; save so it stops doing that
+        settingsMigrated = true;
+    }
+
+    // takes effect for PDFs loaded after this (startup, and on settings reload)
+    EngineMupdfSetDisableJavaScript(gSettings->disableJavaScript);
+    EngineMupdfSetAllowExternalImages(gSettings->allowExternalImages);
+    EngineMupdfSetAutoHeadingToc(gSettings->autoGenerateTOC);
+    auto authorVisibility =
+        gSettings->showAnnotationAuthorInTooltip ? AnnotAuthorVisibility::Show : AnnotAuthorVisibility::Hide;
+    EngineMupdfSetAnnotAuthorInTooltip(authorVisibility);
+    SetEngineeringDrawingEnhanceMode(gSettings->engineeringDrawingEnhance);
+    ExplorerQuickLookApplyFromSettings();
+
+    if (trans::ValidateLangCode(gprefs->uiLanguage)) {
+        SetCurrentLang(gprefs->uiLanguage);
+    } else {
+        // guess the ui language on first start
+        str::ReplaceWithCopy(&gprefs->uiLanguage, trans::DetectUserLang());
+    }
+
+    gprefs->lastPrefUpdate = file::GetModificationTime(settingsPath);
+    // make sure that zoom levels are in the order expected by DisplayModel
+    VecSort(*gprefs->zoomLevels, cmpFloat);
+    while (len(*gprefs->zoomLevels) > 0 && (*gprefs->zoomLevels)[0] < kZoomMin) {
+        VecRemoveAt(*gprefs->zoomLevels, 0);
+    }
+    while (len(*gprefs->zoomLevels) > 0 && VecLast(*gprefs->zoomLevels) > kZoomMaxAllowed) {
+        VecPop(*gprefs->zoomLevels);
+    }
+    // the largest level the user listed is the largest zoom we allow (issue
+    // #1195). Must come before any zoom is parsed, as it decides which are valid
+    kZoomMax = kZoomMaxDefault;
+    if (len(*gprefs->zoomLevels) > 0) {
+        kZoomMax = std::max(kZoomMax, VecLast(*gprefs->zoomLevels));
+    }
+
+    gprefs->defaultDisplayModeEnum = DisplayModeFromString(gprefs->defaultDisplayMode, DisplayMode::Automatic);
+    gprefs->defaultZoomFloat = ZoomFromString(gprefs->defaultZoom, kZoomActualSize);
+    ReportIf(!IsValidZoom(gprefs->defaultZoomFloat));
+    if (gprefs->imageUI.defaultZoom) {
+        gprefs->imageUI.defaultZoomFloat = ZoomFromString(gprefs->imageUI.defaultZoom, 0);
+    }
+    if (gprefs->comicBookUI.defaultZoom) {
+        gprefs->comicBookUI.defaultZoomFloat = ZoomFromString(gprefs->comicBookUI.defaultZoom, 0);
+    }
+
+    int weekDiff = GetWeekCount() - gprefs->openCountWeek;
+    gprefs->openCountWeek = GetWeekCount();
+    if (weekDiff > 0) {
+        // "age" openCount statistics (cut in in half after every week)
+        for (FileState* fs : *gprefs->fileStates) {
+            fs->openCount >>= weekDiff;
+        }
+    }
+
+    // sanitize WindowMargin and PageSpacing values
+    // https://github.com/sumatrapdfreader/sumatrapdf/issues/1899
+    ClampNonNegative(gprefs->fixedPageUI.windowMargin);
+    ClampNonNegative(gprefs->comicBookUI.windowMargin);
+    ClampNonNegative(gprefs->fixedPageUI.pageSpacing);
+    ClampNonNegative(gprefs->comicBookUI.pageSpacing);
+    // 0 means "not set, use system DPI"; users have been seen setting -1,
+    // which would propagate as a negative DPI and break zoom calculations
+    setMin(gprefs->customScreenDPI, 0);
+    setMin(gprefs->tabWidth, 60);
+    setMin(gprefs->sidebarDx, 0);
+    setMin(gprefs->tocDy, 0);
+    setMin(gprefs->treeFontSize, 0);
+    if (gprefs->toolbarSize == 0) {
+        gprefs->toolbarSize = 18; // same as the ToolbarSize default in gen-settings.ts
+    }
+    setMinMax(gprefs->toolbarSize, 8, 64);
+    setMinMax(gprefs->annotations.freeTextOpacity, 0, 100);
+    setMinMax(gprefs->saveMemory, 0, 100);
+
+    if (SeqStrIndexIS(gScrollbarModeNames, gprefs->scrollbars) < 0) {
+        str::ReplaceWithCopy(&gprefs->scrollbars, StrL("windows"));
+    }
+
+    // toolbar mode: if unset/invalid, derive from the legacy showToolbar bool
+    // so existing settings (ShowToolbar = false) keep working
+    if (SeqStrIndexIS(gToolbarModeNames, gprefs->toolbar) < 0) {
+        str::ReplaceWithCopy(&gprefs->toolbar, gprefs->showToolbar ? StrL("show") : StrL("hide"));
+    } else {
+        // keep the legacy bool consistent with the mode
+        gprefs->showToolbar = !str::EqI(gprefs->toolbar, StrL("hide"));
+    }
+
+    // fullscreen toolbar mode: same migration from Fullscreen.ShowToolbar
+    if (SeqStrIndexIS(gToolbarModeNames, gprefs->fullscreen.toolbar) < 0) {
+        str::ReplaceWithCopy(&gprefs->fullscreen.toolbar, gprefs->fullscreen.showToolbar ? StrL("show") : StrL("hide"));
+    } else {
+        gprefs->fullscreen.showToolbar = !str::EqI(gprefs->fullscreen.toolbar, StrL("hide"));
+    }
+
+    if (SeqStrIndexIS(gToolbarPositionNames, gprefs->toolbarPosition) < 0) {
+        str::ReplaceWithCopy(&gprefs->toolbarPosition, StrL("top"));
+    }
+
+    if (len(gprefs->treeFontName) == 0) {
+        gprefs->treeFontName = StrL("automatic");
+    }
+
+    // drop file states without a path: they can't be opened, found by path
+    // or shown as a thumbnail, so they're useless and would render as blank
+    // thumbnails on the home page
+    {
+        Vec<FileState*>* fileStates = gprefs->fileStates;
+        for (int i = len(*fileStates) - 1; i >= 0; i--) {
+            FileState* fs = (*fileStates)[i];
+            if (len(fs->filePath) == 0) {
+                VecRemoveAt(*fileStates, i);
+                DeleteFileState(fs);
+            }
+        }
+    }
+    FileHistorySetStates(gprefs->fileStates);
+    {
+        Str fontName = EbookFontNameFromSetting(gprefs->eBookUI.fontName);
+        if (len(fontName) == 0) {
+            fontName = StrL("Georgia");
+        }
+        float fontSize = gprefs->eBookUI.fontSize;
+        if (fontSize <= 0) {
+            fontSize = 8.f;
+        }
+        SetDefaultEbookFont(fontName, fontSize);
+        SetDefaultChmFont(EbookFontNameFromSetting(gprefs->chmUI.fontName));
+    }
+
+#if !defined(SUMATRA_NG)
+    ResetCachedFonts();
+#endif
+
+    // re-create commands
+    FreeCustomCommands();
+    // Note: some are also created in ReCreateSumatraAcceleratorTable()
+    CreateZoomCommands();
+    CreateThemeCommands();
+    CreateExternalViewersCommands();
+    CreateSelectionHandlerCommands();
+    CreateTextSnippetCommands();
+    CreateCustomShortcuts();
+
+    // re-create accelerators
+    FreeAcceleratorTables();
+    CreateSumatraAcceleratorTable();
+
+    SetCurrentThemeFromSettings();
+    ApplySettingsToOpenWindows();
+    bool readAloudVoiceCleared = ApplyReadAloudVoiceFromSettings();
+
+    bool needsSave = !file::Exists(settingsPath) || readAloudVoiceCleared || settingsMigrated;
+    if (needsSave) {
+        SaveSettings();
+    }
+
+    UpdateCrashHandlerSettings();
+
+    logf("LoadSettings('%s') took %.2f ms\n", settingsPath, TimeSinceInMs(timeStart));
+    return true;
+}
+
+// refresh the preferences when a different SumatraPDF process saves them
+// or if they are edited by the user using a text editor
+#if !defined(SUMATRA_NG)
+// a reload that waits for document load threads to finish
+static bool gReloadDeferred = false;
+static bool gReloadDeferredForce = false;
+
+#endif
+static void ReloadSettings(bool force = false) {
+#if !defined(SUMATRA_NG)
+    // load threads read gSettings and file history; freeing them under a
+    // running load crashed LoadDocumentAsync
+    if (AreLoadThreadsActive()) {
+        gReloadDeferred = true;
+        gReloadDeferredForce |= force;
+        return;
+    }
+
+#endif
+    TempStr settingsPath = GetSettingsPathTemp();
+    if (!file::Exists(settingsPath)) {
+        return;
+    }
+
+    // make sure that the settings file is readable - else wait
+    // a short while to prevent accidental data loss
+    // this is triggered when e.g. saving the file with VS Code
+    bool ok = false;
+    Str prefsData{};
+    for (int i = 0; !ok && i < 5; i++) {
+        str::Free(prefsData);
+        prefsData = file::ReadFile(settingsPath);
+        if (prefsData.len > 0) {
+            ok = true;
+            break;
+        }
+        logf("ReloadSettings: failed to load '%s', i=%d\n", settingsPath, i);
+        SleepInMs(200);
+    }
+    if (!ok) {
+        str::Free(prefsData);
+        return;
+    }
+
+    if (!force && IsLastSavedPrefs(prefsData)) {
+        if (gSettings) {
+            gSettings->lastPrefUpdate = file::GetModificationTime(settingsPath);
+        }
+        str::Free(prefsData);
+        return;
+    }
+
+    FILETIME time = file::GetModificationTime(settingsPath);
+    if (!force && gSettings && FileTimeEq(time, gSettings->lastPrefUpdate)) {
+        str::Free(prefsData);
+        return;
+    }
+    str::Free(prefsData);
+
+    TempStr uiLanguage = str::DupTemp(gSettings->uiLanguage);
+    TempStr thumbnailsType = str::DupTemp(gSettings->thumbnailsType);
+    bool showToolbar = gSettings->showToolbar;
+
+    // FileState* in the cache and chrome die with CleanUpSettings()
+    // (crash 8c34d7eda). LoadSettings() rebuilds both; do not destroy after.
+    HomePageInvalidateLayoutCache();
+#if !defined(SUMATRA_NG)
+    for (MainWindow* win : gWindows) {
+        if (win->IsCurrentTabAbout()) {
+            win->DeleteToolTip();
+            HomePageDestroyChrome(win);
+        }
+    }
+#endif
+
+    FileHistorySetStates(nullptr);
+    // no cache trim until LoadSettings() restores it: reading the file
+    // allocates and the trim's canFree callbacks read gSettings
+    gSaveMemory = 0;
+    CleanUpSettings();
+
+    ok = LoadSettings();
+    ReportIf(!ok || !gSettings);
+
+    if (!str::Eq(uiLanguage, gSettings->uiLanguage)) {
+        SetCurrentLanguageAndRefreshUI(gSettings->uiLanguage);
+    }
+
+    ReloadSettingsUpdateWindows(showToolbar);
+
+    UpdateDocumentColors();
+    UpdateFixedPageScrollbarsVisibility();
+#if defined(SUMATRA_NG)
+    ReRegisterGlobalHotkeys();
+#endif
+    if (!str::EqI(thumbnailsType, gSettings->thumbnailsType)) {
+        OnThumbnailsTypeChanged();
+    }
+}
+
+void CleanUpSettings() {
+    DeleteSettings(gSettings);
+    gSettings = nullptr;
+}
+
+void ForceReloadSettings() {
+    // a pending scheduled save must reach the file before we re-read it
+    FlushScheduledSaveSettings();
+    ReloadSettings(true);
+}
+
+#if !defined(SUMATRA_NG)
+void ReloadDeferredSettings() {
+    if (!gReloadDeferred || AreLoadThreadsActive()) {
+        return;
+    }
+    bool force = gReloadDeferredForce;
+    gReloadDeferred = false;
+    gReloadDeferredForce = false;
+    ReloadSettings(force);
+}
+#endif
+
+static void ReloadSettingsFromWatcher() {
+    ReloadSettings(false);
+}
+
+static void SchedulePrefsReload() {
+    auto fn = MkFunc0Void(ReloadSettingsFromWatcher);
+    uitask::Post(fn, "TaskReloadSettings");
+}
+
+// Write the file when it does not exist yet, then open it in the default
+// .txt app (ShellExecute on Windows, open / xdg-open on macOS and Linux).
+void OpenSettingsFile() {
+    if (!CanAccessDisk()) {
+        return;
+    }
+    TempStr path = GetSettingsPathTemp();
+    if (len(path) == 0) {
+        return;
+    }
+    if (!file::Exists(path)) {
+        if (!SaveSettings(true) || !file::Exists(path)) {
+            logf("OpenSettingsFile: could not create '%s'\n", path);
+            return;
+        }
+        // subscribe failed at startup because the file was not there yet
+        if (!gWatchedSettingsFile) {
+            RegisterSettingsForFileChanges();
+        }
+    }
+    LaunchFileIfExists(path);
+}
+
+void RegisterSettingsForFileChanges() {
+    if (!HasPermission(Perm::SavePreferences)) {
+        return;
+    }
+
+    ReportIf(gWatchedSettingsFile); // only call me once
+    TempStr path = GetSettingsPathTemp();
+    auto fn = MkFunc0Void(SchedulePrefsReload);
+    gWatchedSettingsFile = FileWatcherSubscribe(path, fn, true);
+}
+
+void UnregisterSettingsForFileChanges() {
+    FileWatcherUnsubscribe(gWatchedSettingsFile);
+    gWatchedSettingsFile = nullptr;
+}
+
+constexpr int kMinFontSize = 9;
+
+#if !defined(SUMATRA_NG)
+// metrics for an explicit DPI (system dpi when GetNonClientMetricsForDpi fails)
+static void GetNonClientMetricsForDpiValue(int dpi, NONCLIENTMETRICS* ncm) {
+    if (dpi <= 0) {
+        dpi = 96;
+    }
+    if (!GetNonClientMetricsForDpi(dpi, ncm)) {
+        ncm->cbSize = sizeof(*ncm);
+        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(*ncm), ncm, 0);
+    }
+}
+
+// Font size follows the current layout DPI (dpiX/dpiY), so UI text scales
+// when a window is moved to a monitor with a different scale factor.
+// A user-set UIFontSize is used as-is at every dpi.
+int GetAppMenuFontSizeForDpi(int dpi) {
+    if (gSettings->uIFontSize >= kMinFontSize) {
+        return gSettings->uIFontSize;
+    }
+    NONCLIENTMETRICS ncm{};
+    GetNonClientMetricsForDpiValue(dpi, &ncm);
+    return std::abs(ncm.lfMenuFont.lfHeight);
+}
+
+int GetAppMenuFontSize() {
+    return GetAppMenuFontSizeForDpi(DpiGet());
+}
+
+int GetAppFontSizeForDpi(int dpi) {
+    auto fntSize = gSettings->uIFontSize;
+    if (fntSize < kMinFontSize) {
+        // match the menu font so tabs/toolbar text scale like native menus
+        fntSize = GetAppMenuFontSizeForDpi(dpi);
+    }
+    return fntSize;
+}
+
+int GetAppFontSize() {
+    return GetAppFontSizeForDpi(DpiGet());
+}
+
+PlatformFont* GetAppFontForDpi(int dpi) {
+    UiFontsAtDpi* fonts = GetUiFontsAtDpi(dpi);
+    if (fonts->appFont) {
+        return fonts->appFont;
+    }
+    fonts->appFont = GetUserGuiFont(StrL("auto"), GetAppFontSizeForDpi(dpi));
+    return fonts->appFont;
+}
+
+PlatformFont* GetAppFont() {
+    return GetAppFontForDpi(DpiGet());
+}
+
+constexpr int kMinBiggerFontSize = 14;
+
+// if user provided font size, we use that
+// otherwise we return 1.2x of default font size but no smaller than 14
+static int GetAppBiggerFontSizeForDpi(int dpi) {
+    int fntSize = gSettings->uIFontSize;
+    if (fntSize < kMinFontSize) {
+        fntSize = GetAppMenuFontSizeForDpi(dpi);
+        fntSize = (fntSize * 12) / 10;
+        fntSize = std::max(fntSize, kMinBiggerFontSize);
+    }
+    return fntSize;
+}
+
+PlatformFont* GetAppBiggerFontForDpi(int dpi) {
+    UiFontsAtDpi* fonts = GetUiFontsAtDpi(dpi);
+    if (fonts->biggerAppFont) {
+        return fonts->biggerAppFont;
+    }
+    fonts->biggerAppFont = GetUserGuiFont({}, GetAppBiggerFontSizeForDpi(dpi));
+    return fonts->biggerAppFont;
+}
+
+PlatformFont* GetAppBiggerFont() {
+    return GetAppBiggerFontForDpi(DpiGet());
+}
+
+PlatformFont* GetAppTreeFontExForDpi(int dpi, bool bold, bool italic) {
+    int idx = (bold ? 1 : 0) | (italic ? 2 : 0);
+    UiFontsAtDpi* fonts = GetUiFontsAtDpi(dpi);
+    if (fonts->treeFontEx[idx]) {
+        return fonts->treeFontEx[idx];
+    }
+    int fntSize = gSettings->treeFontSize;
+    if (fntSize < kMinFontSize) {
+        fntSize = gSettings->uIFontSize;
+    }
+    if (fntSize < kMinFontSize) {
+        fntSize = GetAppMenuFontSizeForDpi(dpi);
+    }
+    Str fntNameUser = gSettings->treeFontName;
+    fonts->treeFontEx[idx] = GetUserGuiFontEx(fntNameUser, fntSize, bold, italic);
+    return fonts->treeFontEx[idx];
+}
+
+PlatformFont* GetAppTreeFontForDpi(int dpi) {
+    return GetAppTreeFontExForDpi(dpi, false, false);
+}
+
+PlatformFont* GetAppTreeFont() {
+    return GetAppTreeFontEx(false, false);
+}
+
+PlatformFont* GetAppTreeFontEx(bool bold, bool italic) {
+    return GetAppTreeFontExForDpi(DpiGet(), bold, italic);
+}
+
+PlatformFont* GetAppSidebarLabelFontForDpi(int dpi) {
+    UiFontsAtDpi* fonts = GetUiFontsAtDpi(dpi);
+    if (fonts->sidebarLabelFont) {
+        return fonts->sidebarLabelFont;
+    }
+    fonts->sidebarLabelFont = GetUserGuiFontEx({}, GetAppBiggerFontSizeForDpi(dpi), true, false);
+    return fonts->sidebarLabelFont;
+}
+
+PlatformFont* GetAppSidebarLabelFont() {
+    return GetAppSidebarLabelFontForDpi(DpiGet());
+}
+
+PlatformFont* GetAppMenuFontForDpi(int dpi) {
+    UiFontsAtDpi* fonts = GetUiFontsAtDpi(dpi);
+    if (fonts->appMenuFont) {
+        return fonts->appMenuFont;
+    }
+    NONCLIENTMETRICS ncm{};
+    GetNonClientMetricsForDpiValue(dpi, &ncm);
+    int fntSize = GetAppMenuFontSizeForDpi(dpi);
+    ncm.lfMenuFont.lfHeight = -fntSize;
+    fonts->appMenuFont = GetPlatformFont(CreateFontIndirectW(&ncm.lfMenuFont));
+    return fonts->appMenuFont;
+}
+
+PlatformFont* GetAppMenuFont() {
+    return GetAppMenuFontForDpi(DpiGet());
+}
+
+bool IsMenuFontSizeDefault() {
+    auto fntSize = gSettings->uIFontSize;
+    return fntSize < kMinFontSize;
+}
+
+bool IsAppFontSizeDefault() {
+    auto fntSize = gSettings->uIFontSize;
+    return fntSize < kMinFontSize;
+}
+#endif
+
+TempStr ZoomLevelStr(float zoom) {
+    if (zoom == kZoomFitPage) {
+        return Tr("Fit Page");
+    }
+    if (zoom == kZoomFitWidth) {
+        return Tr("Fit Width");
+    }
+    if (zoom == kZoomFitHeight) {
+        return Tr("Fit Height");
+    }
+    if (zoom == kZoomFitContent) {
+        return Tr("Fit Content");
+    }
+    if (zoom == kZoomFitVisible) {
+        return Tr("Fit Visible");
+    }
+    if (zoom == kZoomShrinkToFit) {
+        return Tr("Shrink To Fit");
+    }
+    if (zoom == kZoomFitByOrientation) {
+        return Tr("Fit by Orientation");
+    }
+    if (zoom == 0) {
+        return StrL("-");
+    }
+    return fmt("%.f%%", zoom);
+}
+
+// A level as a list of them should offer it: a fit mode by name, a percentage
+// exactly. ZoomLevelStr() rounds, which is right for "Zoom: 137%" in the corner
+// of the window but turns the 12.5% level into a row saying "12%".
+TempStr ZoomLevelStrExact(float zoom) {
+    if (zoom <= 0) {
+        return ZoomLevelStr(zoom);
+    }
+    return fmt("%g%%", zoom);
+}
+
+// clang-format off
+static float gZoomLevels[] = {
+    kZoomFitPage,
+    kZoomFitWidth,
+    kZoomFitHeight,
+    kZoomFitByOrientation,
+    kZoomFitContent,
+    kZoomFitVisible,
+    kZoomShrinkToFit,
+    6400.0,
+    3200.0,
+    1600.0,
+    800.0,
+    400.0,
+    200.0,
+    150.0,
+    125.0,
+    100.0,
+    50.0,
+    25.0,
+    12.5,
+    8.33f
+};
+static float gZoomLevelsChm[] = {
+    800.0,
+    400.0,
+    200.0,
+    150.0,
+    125.0,
+    100.0,
+    50.0,
+    25.0,
+};
+// clang-format on
+
+// "#ff0000 #00ff00 ..." => list of colors. maxColors of 0 means no limit
+void ParseColorList(Str s, Vec<Color>& out, int maxColors) {
+    int i = 0;
+    while (i < s.len && (maxColors == 0 || len(out) < maxColors)) {
+        while (i < s.len && s.s[i] == ' ') {
+            i++;
+        }
+        if (i >= s.len) {
+            break;
+        }
+        int start = i;
+        while (i < s.len && s.s[i] != ' ') {
+            i++;
+        }
+        ParsedColor parsed;
+        ParseColor(parsed, Str(s.s + start, i - start));
+        if (parsed.parsedOk) {
+            VecAppend(out, parsed.col);
+        }
+    }
+}
+
+TempStr SerializeColorList(const Vec<Color>& colors) {
+    str::Builder buf;
+    for (Color col : colors) {
+        if (len(buf) > 0) {
+            buf.AppendChar(' ');
+        }
+        buf.Append(SerializeColorTemp(col));
+    }
+    return ToStrTemp(buf);
+}
+
+// Fit/preset zoom values for the zoom combo (Settings) and Custom Zoom dialog.
+void CollectZoomLevels(Vec<float>& out, bool forChm) {
+    VecReset(out);
+    auto* customZoomLevels = gSettings->zoomLevels;
+    int n = customZoomLevels ? len(*customZoomLevels) : 0;
+    if (n > 0) {
+        if (!forChm) {
+            for (int i = 0; i < 4; i++) {
+                VecAppend(out, gZoomLevels[i]);
+            }
+        }
+        float maxZoom = forChm ? 800 : kZoomMax;
+        float minZoom = forChm ? 16 : kZoomMin;
+        for (int i = 0; i < n; i++) {
+            float zl = (*customZoomLevels)[n - i - 1]; // largest first
+            if (zl >= minZoom && zl <= maxZoom) {
+                VecAppend(out, zl);
+            }
+        }
+        return;
+    }
+    float* zoomLevels = forChm ? gZoomLevelsChm : gZoomLevels;
+    n = forChm ? dimofi(gZoomLevelsChm) : dimofi(gZoomLevels);
+    for (int i = 0; i < n; i++) {
+        VecAppend(out, zoomLevels[i]);
+    }
+}
+
+Settings* gSettings = nullptr;
+
+// leaves a user can edit by path: the scalar types and compact structs.
+// Arrays, pointer sub-structs and internal fields are skipped
+static void CollectSettingFieldsInStruct(Vec<SettingField>& out, const StructInfo* info, int baseOffset, Str prefix) {
+    const char* fieldName = info->fieldNames;
+    const char* fieldComment = info->fieldComments; // parallel to fieldNames
+    for (u16 i = 0; i < info->fieldCount; i++) {
+        const FieldInfo& field = info->fields[i];
+        Str fname(fieldName);
+        fieldName += len(fname) + 1;
+        Str comment;
+        if (fieldComment) {
+            comment = Str(fieldComment);
+            fieldComment += len(comment) + 1;
+        }
+        if (field.internal || field.type == SettingType::Comment || field.offset == (size_t)-1) {
+            continue;
+        }
+        int offset = baseOffset + (int)field.offset;
+        TempStr path = len(prefix) > 0 ? fmt("%s.%s", prefix, fname) : str::DupTemp(fname);
+        switch (field.type) {
+            case SettingType::Struct:
+                CollectSettingFieldsInStruct(out, (const StructInfo*)field.value, offset, path);
+                break;
+            case SettingType::Bool:
+            case SettingType::Int:
+            case SettingType::Float:
+            case SettingType::String:
+            case SettingType::Color:
+            case SettingType::Compact: {
+                SettingField sf;
+                sf.path = path;
+                sf.comment = comment;
+                sf.field = &field;
+                sf.offset = offset;
+                VecAppend(out, sf);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
+void CollectSettingFields(Vec<SettingField>& out) {
+    if (!gSettings) {
+        return;
+    }
+    CollectSettingFieldsInStruct(out, &gSettingsInfo, 0, {});
+}
+
+// the layout is fixed at compile time, so an offset stays valid across the
+// reload that replaces gSettings
+u8* SettingFieldPtr(int offset) {
+    return (u8*)gSettings + offset;
+}
+
+// Walk setting metadata for the field matching name (case-insensitive leaf or
+// full dotted path), whatever its type.
+static bool FindSettingInStruct(const StructInfo* info, u8* base, Str prefix, Str name, SettingType* typeOut,
+                                u8** ptrOut) {
+    const char* fieldName = info->fieldNames;
+    for (u16 i = 0; i < info->fieldCount; i++) {
+        const FieldInfo& field = info->fields[i];
+        Str fname(fieldName);
+        fieldName += len(fname) + 1;
+        if (field.type == SettingType::Comment || field.offset == (size_t)-1) {
+            continue;
+        }
+        u8* fieldPtr = base + field.offset;
+        TempStr path = len(prefix) > 0 ? fmt("%s.%s", prefix, fname) : str::DupTemp(fname);
+        if (field.type == SettingType::Struct) {
+            const auto* sub = (const StructInfo*)field.value;
+            if (FindSettingInStruct(sub, fieldPtr, path, name, typeOut, ptrOut)) {
+                return true;
+            }
+            continue;
+        }
+        if (str::EqI(fname, name) || str::EqI(path, name)) {
+            *typeOut = field.type;
+            *ptrOut = fieldPtr;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Case-insensitive leaf or dotted path (e.g. "SelectionToolbar", "Fullscreen.ShowMenubar").
+bool* FindSettingsBoolSetting(Str name) {
+    if (!gSettings || len(name) == 0) {
+        return nullptr;
+    }
+    SettingType type = SettingType::Comment;
+    u8* p = nullptr;
+    if (!FindSettingInStruct(&gSettingsInfo, (u8*)gSettings, {}, name, &type, &p) || type != SettingType::Bool) {
+        return nullptr;
+    }
+    return (bool*)p;
+}
+
+void ToggleSettingsBool(bool* p) {
+    if (!p) {
+        return;
+    }
+    *p = !*p;
+    ScheduleSaveSettings();
+    ApplySettingsToOpenWindows();
+}
+
+// the FieldInfo of a setting by case-insensitive leaf or dotted path
+static const FieldInfo* FindSettingField(const StructInfo* info, Str prefix, Str name) {
+    const char* fieldName = info->fieldNames;
+    for (u16 i = 0; i < info->fieldCount; i++) {
+        const FieldInfo& field = info->fields[i];
+        Str fname(fieldName);
+        fieldName += len(fname) + 1;
+        if (field.type == SettingType::Comment || field.offset == (size_t)-1) {
+            continue;
+        }
+        TempStr path = len(prefix) > 0 ? fmt("%s.%s", prefix, fname) : str::DupTemp(fname);
+        if (field.type == SettingType::Struct) {
+            const FieldInfo* found = FindSettingField((const StructInfo*)field.value, path, name);
+            if (found) {
+                return found;
+            }
+            continue;
+        }
+        if (str::EqI(fname, name) || str::EqI(path, name)) {
+            return &field;
+        }
+    }
+    return nullptr;
+}
+
+// the allowed values of an enum setting, nullptr for any other setting
+const char** GetSettingsEnumValues(Str path) {
+    const FieldInfo* field = FindSettingField(&gSettingsInfo, {}, path);
+    return field ? field->enumValues : nullptr;
+}
+
+// SaveSettings() re-generates these strings from their parsed twins, which would
+// clobber the text we just wrote unless the twin is updated as well.
+static void UpdateParsedSettingTwin(Str path, Str value) {
+    if (str::EqI(path, StrL("DefaultDisplayMode"))) {
+        gSettings->defaultDisplayModeEnum = DisplayModeFromString(value, DisplayMode::Automatic);
+    } else if (str::EqI(path, StrL("DefaultZoom"))) {
+        gSettings->defaultZoomFloat = ZoomFromString(value, kZoomActualSize);
+    } else if (str::EqI(path, StrL("ImageUI.DefaultZoom"))) {
+        gSettings->imageUI.defaultZoomFloat = ZoomFromString(value, 0);
+    } else if (str::EqI(path, StrL("ComicBookUI.DefaultZoom"))) {
+        gSettings->comicBookUI.defaultZoomFloat = ZoomFromString(value, 0);
+    }
+}
+
+// Parses value for the setting's own type, writes it and applies it to the
+// running app. Arrays and compact structs aren't handled: they need the
+// advanced settings dialog or the settings file.
+bool SetSettingsValueFromStr(Str path, Str value) {
+    SettingType type = SettingType::Comment;
+    u8* p = nullptr;
+    if (!gSettings || len(path) == 0) {
+        return false;
+    }
+    if (!FindSettingInStruct(&gSettingsInfo, (u8*)gSettings, {}, path, &type, &p)) {
+        return false;
+    }
+    // snapshot the settings that need an explicit apply (tabs, menu bar, ...)
+    // before we overwrite them, so we can act on what actually changed
+    SettingsApplyState before = GetSettingsApplyState();
+    switch (type) {
+        case SettingType::Bool:
+            *(bool*)p = str::EqI(value, StrL("true")) || str::Eq(value, StrL("1"));
+            break;
+        case SettingType::Int:
+            *(int*)p = ParseInt(value);
+            break;
+        case SettingType::Float:
+            str::Parse(value, "%f", (float*)p);
+            break;
+        case SettingType::Color: {
+            auto* parsed = (ParsedColor*)p;
+            str::ReplaceWithCopy(&parsed->s, value);
+            // the cached parse belonged to the old text
+            parsed->wasParsed = false;
+            parsed->parsedOk = false;
+            break;
+        }
+        case SettingType::String:
+            str::ReplaceWithCopy((Str*)p, value);
+            break;
+        default:
+            return false;
+    }
+    UpdateParsedSettingTwin(path, value);
+    ScheduleSaveSettings();
+    // reload so everything derived from settings (theme, fonts, parsed colors,
+    // custom commands, accelerators ...) is re-computed and applied
+    ForceReloadSettings();
+    ApplyChangedSettingsAndRelayout(before);
+    return true;
+}
+
+FileState* NewFileState(Str filePath) {
+    FileState* fs = (FileState*)DeserializeStruct(&gFileStateInfo, {});
+    SetFileStatePath(fs, filePath);
+    return fs;
+}
+
+FileEBookUI* NewFileEBookUI() {
+    return (FileEBookUI*)DeserializeStruct(&gFileEBookUIInfo, {});
+}
+
+FileEBookUI* CopyFileEBookUI(const FileEBookUI* src) {
+    if (!src) {
+        return nullptr;
+    }
+    auto* res = NewFileEBookUI();
+    str::ReplaceWithCopy(&res->fontName, src->fontName);
+    res->fontSize = src->fontSize;
+    res->lineSpacing = src->lineSpacing;
+    res->layoutDx = src->layoutDx;
+    res->layoutDy = src->layoutDy;
+    str::ReplaceWithCopy(&res->ignoreDocumentCSS, src->ignoreDocumentCSS);
+    str::ReplaceWithCopy(&res->customCSS, src->customCSS);
+    return res;
+}
+
+void DeleteFileEBookUI(FileEBookUI* v) {
+    if (v) {
+        FreeStruct(&gFileEBookUIInfo, v);
+    }
+}
+
+void DeleteFileState(FileState* fs) {
+    FreePixmap(fs->thumbnail);
+    FreeStruct(&gFileStateInfo, fs);
+}
+
+void DeleteFileStates(Vec<FileState*>* a) {
+    for (auto* fs : *a) {
+        DeleteFileState(fs);
+    }
+    delete a;
+}
+
+Favorite* NewFavorite(Str pageNo, Str name, Str pageLabel) {
+    Favorite* fav = (Favorite*)DeserializeStruct(&gFavoriteInfo, {});
+    str::ReplaceWithCopy(&fav->pageNo, pageNo);
+    str::ReplaceWithCopy(&fav->name, name);
+    str::ReplaceWithCopy(&fav->pageLabel, pageLabel);
+    return fav;
+}
+
+Favorite* NewFavorite(int pageNo, Str name, Str pageLabel) {
+    return NewFavorite(FormatStoredPagePosTemp(pageNo), name, pageLabel);
+}
+
+void DeleteFavorite(Favorite* fav) {
+    FreeStruct(&gFavoriteInfo, fav);
+}
+
+Settings* NewSettings(Str data) {
+    return (Settings*)DeserializeStruct(&gSettingsInfo, data);
+}
+
+// With file history turned off the only thing worth keeping about a file is a
+// favorite the user added on purpose. Everything else in a FileState is history
+// by definition, and some entries have no user content at all: searching
+// creates one just to hang the session-only "jump back here" favorite on
+// (SetSearchStartFavorite), which left a bare FilePath in the settings file of
+// someone who asked us not to remember opened files (issue #5899).
+static bool FileStateWorthKeepingWithoutHistory(FileState* fs) {
+    if (!fs) {
+        return false;
+    }
+    // per-document ebook settings are configuration the user typed, not history
+    if (fs->eBookUI) {
+        return true;
+    }
+    if (!fs->favorites) {
+        return false;
+    }
+    for (Favorite* fav : *fs->favorites) {
+        if (!fav->isTemporary) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// FileState identity kept when RememberStatePerDocument is false. Display
+// fields (page, zoom, scroll, window) are omitted (#5907).
+static SeqStrings kFileStateKeepNoPerDoc =
+    "Favorites\0EBookUI\0FilePath\0DecryptionKey\0OpenCount\0IsPinned\0IsMissing\0UseDefaultState\0";
+
+// prevData is used to preserve fields that exists in prevField but not in Settings
+// caller has to free()
+Str SerializeSettings(Settings* prefs, Str prevData) {
+    Vec<FileState*>* allFileStates = prefs->fileStates;
+    Vec<FileState*> withFavorites;
+
+    // The two settings mean different things and must not be conflated (#5907):
+    // RememberStatePerDocument = false only drops the per-document state (page,
+    // zoom, scroll, window placement) - the list of files stays, because that is
+    // what the home page shows. RememberOpenedFiles = false drops the list
+    // itself, keeping only files the user hung a favorite on (#5899).
+    bool dropPerDocState = !prefs->rememberStatePerDocument || !prefs->rememberOpenedFiles;
+    bool dropHistory = !prefs->rememberOpenedFiles;
+
+    if (dropPerDocState) {
+        for (FileState* fs : *prefs->fileStates) {
+            fs->useDefaultState = true;
+            if (FileStateWorthKeepingWithoutHistory(fs)) {
+                VecAppend(withFavorites, fs);
+            }
+        }
+        if (dropHistory) {
+            // serialize the filtered list, then put the real one back below -
+            // the in-memory history is still needed for this session
+            prefs->fileStates = &withFavorites;
+        }
+        FieldInfo keepFields[dimof(gFileStateFields)];
+        char keepNames[512];
+        int nKeep = 0;
+        int namesLen = 0;
+        const char* srcName = gFileStateInfo.fieldNames;
+        for (int i = 0; i < dimofi(gFileStateFields); i++) {
+            Str name = Str(srcName);
+            if (SeqStrIndex(kFileStateKeepNoPerDoc, name) >= 0) {
+                keepFields[nKeep] = gFileStateFields[i];
+                int n = len(name);
+                ReportIf(namesLen + n + 1 > (int)sizeof(keepNames));
+                memcpy(keepNames + namesLen, name.s, (size_t)n + 1);
+                namesLen += n + 1;
+                nKeep++;
+            }
+            srcName += len(name) + 1;
+        }
+        const FieldInfo* savedFields = gFileStateInfo.fields;
+        const char* savedNames = gFileStateInfo.fieldNames;
+        u16 savedCount = gFileStateInfo.fieldCount;
+        gFileStateInfo.fields = keepFields;
+        gFileStateInfo.fieldNames = keepNames;
+        gFileStateInfo.fieldCount = (u16)nKeep;
+
+        Str serialized = SerializeStruct(&gSettingsInfo, prefs, prevData);
+
+        gFileStateInfo.fields = savedFields;
+        gFileStateInfo.fieldNames = savedNames;
+        gFileStateInfo.fieldCount = savedCount;
+        prefs->fileStates = allFileStates;
+        return serialized;
+    }
+
+    return SerializeStruct(&gSettingsInfo, prefs, prevData);
+}
+
+void DeleteSettings(Settings* gp) {
+    if (!gp) {
+        return;
+    }
+
+    for (FileState* ds : *gp->fileStates) {
+        FreePixmap(ds->thumbnail);
+    }
+    FreeStruct(&gSettingsInfo, gp);
+}
+
+SessionData* NewSessionData() {
+    return (SessionData*)DeserializeStruct(&gSessionDataInfo, {});
+}
+
+TabState* NewTabState(FileState* fs) {
+    TabState* state = (TabState*)DeserializeStruct(&gTabStateInfo, {});
+    str::ReplaceWithCopy(&state->filePath, fs->filePath);
+    str::ReplaceWithCopy(&state->displayMode, fs->displayMode);
+    str::ReplaceWithCopy(&state->pageNo, fs->pageNo);
+    str::ReplaceWithCopy(&state->zoom, fs->zoom);
+    state->rotation = fs->rotation;
+    state->scrollPos = fs->scrollPos;
+    state->showToc = fs->showToc;
+    str::ReplaceWithCopy(&state->sidebarView, fs->sidebarView);
+    *state->tocState = *fs->tocState;
+    return state;
+}
+
+void DeleteTabState(TabState* state) {
+    FreeStruct(&gTabStateInfo, state);
+}
+
+void FreeSessionData(SessionData* data) {
+    FreeStruct(&gSessionDataInfo, data);
+}
+
+void FreeSessionDataVec(Vec<SessionData*>* sessionData) {
+    ReportIf(!sessionData);
+    if (!sessionData) {
+        return;
+    }
+    for (SessionData* data : *sessionData) {
+        FreeSessionData(data);
+    }
+    VecReset(*sessionData);
+}
+
+void SetFileStatePath(FileState* fs, Str path) {
+    if (fs->filePath && str::EqI(fs->filePath, path)) {
+        return;
+    }
+    str::ReplaceWithCopy(&fs->filePath, path);
+}
+
+void SetFileStatePath(FileState* fs, WStr path) {
+    SetFileStatePath(fs, ToUtf8Temp(path));
+}
+
+Themes* ParseThemes(Str data) {
+    return (Themes*)DeserializeStruct(&gThemesInfo, data);
+}
+
+void FreeParsedThemes(Themes* themes) {
+    if (!themes) {
+        return;
+    }
+    FreeStruct(&gThemesInfo, themes);
+}

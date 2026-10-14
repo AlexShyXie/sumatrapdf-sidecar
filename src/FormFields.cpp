@@ -24,6 +24,7 @@
 #include "Toolbar.h"
 #include "SumatraDialogs.h"
 #include "FormFields.h"
+#include "AppHelpersCommon.h"
 
 // One field is edited at a time: either a text edit box or a choice list box
 // floats over the page.
@@ -44,10 +45,6 @@ static bool gCommitting = false;
 bool IsFormFieldEditActive() {
     return gEdit.hwnd != nullptr;
 }
-
-// Acrobat / Chrome pale blue, translucent so the page still shows through.
-constexpr Color kFormFieldHighlightCol = MkRgb(166, 202, 240);
-constexpr u8 kFormFieldHighlightAlpha = 96;
 
 // Tint empty fillable fields so they are visible without hovering (issue #5966).
 void PaintFormFieldHighlights(MainWindow* win, Gfx* gfx) {
@@ -202,19 +199,6 @@ static HFONT MakeFieldFont(int fontPx) {
                        CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Arial");
 }
 
-// the field's on-screen font height in pixels: the /DA font size (PDF points)
-// scaled to the page's current zoom, or a height-derived fallback for
-// auto-sized (/DA size 0) fields.
-static int FieldFontPx(Annotation* widget, Rect rc) {
-    float daSize = GetWidgetFontSize(widget);
-    float pageDy = widget->bounds.dy; // field height in page (PDF) units
-    if (daSize > 0 && pageDy > 0) {
-        float scale = (float)rc.dy / pageDy; // screen px per PDF unit
-        return std::max(8, (int)(daSize * scale));
-    }
-    return std::max(8, (int)((float)rc.dy * 0.7f));
-}
-
 static bool StartTextEdit(MainWindow* win, Annotation* widget, Rect rc, int flags) {
     bool multiline = (flags & PDF_TX_FIELD_IS_MULTILINE) != 0;
     bool password = (flags & PDF_TX_FIELD_IS_PASSWORD) != 0;
@@ -308,37 +292,6 @@ static bool StartChoiceEdit(MainWindow* win, Annotation* widget, Rect rc) {
     gEdit.isChoice = true;
 
     HwndSetFocus(hLb);
-    return true;
-}
-
-// Start editing a text form field in place (floats an edit box over the field).
-// Returns false if `widget` isn't an editable (non-read-only) text widget.
-// Clicking a signature field the document's author left unsigned opens Sign
-// Document with that field selected. Signed fields are left alone (clicking one
-// shouldn't offer to overwrite it), and so is everything else (issue #5964).
-bool StartSignatureFieldSigning(MainWindow* win, Annotation* widget) {
-    if (!win || !AnnotationIsLive(widget)) {
-        return false;
-    }
-    if (GetWidgetType(widget) != PDF_WIDGET_TYPE_SIGNATURE) {
-        return false;
-    }
-    if (GetWidgetFieldFlags(widget) & PDF_FIELD_IS_READ_ONLY) {
-        return false;
-    }
-    // signing rewrites the PDF, so it needs the same engine support annotations
-    // do - and the same gate that decides whether the Sign Document command is
-    // shown at all, so a click can't reach a dialog the menu is hiding
-    DisplayModel* dm = win->AsFixed();
-    if (!dm || !EngineSupportsAnnotations(dm->GetEngine()) || win->isFullScreen) {
-        return false;
-    }
-    TempStr fieldName;
-    if (!IsUnsignedSignatureWidget(widget, &fieldName)) {
-        return false;
-    }
-    CommitFormFieldEdit(true); // don't leave an in-place edit hanging
-    ShowSignDocumentDialog(win, fieldName, true);
     return true;
 }
 

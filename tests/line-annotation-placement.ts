@@ -5,7 +5,8 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ControlClient, ControlCommand } from "./control.ts";
-import { cmdId, runStandalone, tmpPath, assemblePdf } from "./util.ts";
+import { IS_MAC } from "./host.ts";
+import { cmdId, runStandalone, SLOW_BUILD_FACTOR, tmpPath, USE_NG, makeBlankPdf } from "./util.ts";
 import {
   captureWindowPixels,
   clientToScreen,
@@ -35,6 +36,9 @@ import {
   launchControlled,
   pressKey,
   sendCommand,
+  ngKey,
+  ngType,
+  countPreviewBlue,
 } from "./win-automation.ts";
 
 type Point = { x: number; y: number };
@@ -50,15 +54,6 @@ type PlacementState = {
   message: string;
   raw: string;
 };
-
-function makeBlankPdf(): string {
-  const objects = [
-    "<< /Type /Catalog /Pages 2 0 R >>",
-    "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
-    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
-  ];
-  return assemblePdf(objects);
-}
 
 async function placementState(client: ControlClient): Promise<PlacementState> {
   const res = await client.request(ControlCommand.TestMarkupAnnots, []);
@@ -83,6 +78,9 @@ async function placementState(client: ControlClient): Promise<PlacementState> {
     raw,
   };
 }
+
+const TOOLBAR_CLICK_TIMEOUT_MS = 5_000;
+const TOOLBAR_CLICK_SETTLE_MS = 300;
 
 async function waitForPlacement(client: ControlClient, active: boolean): Promise<PlacementState> {
   const deadline = Date.now() + 5_000;
@@ -111,7 +109,58 @@ function toolbarButtonRect(dump: string, command: string): { x: number; y: numbe
   return { x, y, dx: +m[3]! - x, dy: +m[4]! - y };
 }
 
+async function executeFromCommandPaletteNg(client: ControlClient, frame: number): Promise<void> {
+  sendCommand(frame, cmdId("CmdCommandPalette"));
+  const openDeadline = Date.now() + 8_000 * SLOW_BUILD_FACTOR;
+  let raw = "";
+  for (;;) {
+    const res = await client.request(ControlCommand.TestCommandPalette, []);
+    raw = String(res[1] ?? "");
+    if (res[0] === 0 && raw.startsWith("OK") && raw.includes("editFocus=1")) {
+      break;
+    }
+    if (Date.now() > openDeadline) {
+      throw new Error(`line-annotation-placement: command palette did not open\n${raw}`);
+    }
+    await sleep(50);
+  }
+
+  const query = ">Create Line Annotation";
+  await ngType(client, query);
+  const filterDeadline = Date.now() + 3_000 * SLOW_BUILD_FACTOR;
+  let itemCount = 0;
+  for (;;) {
+    const res = await client.request(ControlCommand.TestCommandPalette, []);
+    raw = String(res[1] ?? "");
+    const m = /items=(\d+) querySel=-?\d+,-?\d+ queryLen=(\d+) cmd=(-?\d+)/.exec(raw);
+    if (res[0] === 0 && m && +m[2]! === query.length) {
+      itemCount = +m[1]!;
+      break;
+    }
+    if (Date.now() > filterDeadline) {
+      throw new Error(`line-annotation-placement: palette query did not settle\n${raw}`);
+    }
+    await sleep(40);
+  }
+
+  for (let i = 0; i < itemCount; i++) {
+    const res = await client.request(ControlCommand.TestCommandPalette, []);
+    raw = String(res[1] ?? "");
+    const m = /cmd=(-?\d+)/.exec(raw);
+    if (res[0] === 0 && m && +m[1]! === cmdId("CmdCreateAnnotLine")) {
+      await ngKey(client, VK_RETURN);
+      return;
+    }
+    await ngKey(client, VK_DOWN);
+  }
+  throw new Error("line-annotation-placement: Line annotation command was not in the filtered palette");
+}
+
 async function executeFromCommandPalette(client: ControlClient, frame: number): Promise<void> {
+  if (USE_NG) {
+    await executeFromCommandPaletteNg(client, frame);
+    return;
+  }
   sendCommand(frame, cmdId("CmdCommandPalette"));
   const openDeadline = Date.now() + 8_000;
   let palette = 0;
@@ -167,29 +216,6 @@ function moveMouse(canvas: number, point: Point, key = 0): void {
   sendMessage(canvas, WM_MOUSEMOVE, key, packCoords(point.x, point.y));
 }
 
-function countPreviewBlue(shot: { w: number; h: number; data: Uint8Array } | null, start: Point, end: Point): number {
-  if (!shot) {
-    return 0;
-  }
-  const left = Math.max(0, Math.min(start.x, end.x) - 8);
-  const right = Math.min(shot.w - 1, Math.max(start.x, end.x) + 8);
-  const top = Math.max(0, Math.min(start.y, end.y) - 8);
-  const bottom = Math.min(shot.h - 1, Math.max(start.y, end.y) + 8);
-  let count = 0;
-  for (let y = top; y <= bottom; y++) {
-    for (let x = left; x <= right; x++) {
-      const off = (y * shot.w + x) * 4;
-      const b = shot.data[off]!;
-      const g = shot.data[off + 1]!;
-      const r = shot.data[off + 2]!;
-      if (b > 150 && b > g + 50 && g > r + 30 && r < 80) {
-        count++;
-      }
-    }
-  }
-  return count;
-}
-
 export async function testit(): Promise<void> {
   const dir = tmpPath("line-annotation-placement");
   rmSync(dir, { recursive: true, force: true });
@@ -222,16 +248,58 @@ export async function testit(): Promise<void> {
     const outside = { x: 2, y: center.y };
 
     sendMessage(frame, WM_COMMAND, cmdId("CmdToggleEditPDF"), 0);
-    const toolbarDump = String((await client.request(ControlCommand.TestToolbarButtons, []))[1] ?? "");
-    const lineButton = toolbarButtonRect(toolbarDump, "CmdCreateAnnotLine");
-    const toolbar = findChildByClass(frame, "SUMATRA_VIRT_TOOLBAR");
-    const clickLineToolbar = () =>
-      clickAt(toolbar, lineButton.x + Math.floor(lineButton.dx / 2), lineButton.y + Math.floor(lineButton.dy / 2), 0);
+    const buttonDeadline = Date.now() + 5_000 * SLOW_BUILD_FACTOR;
+    let lineButton = { x: 0, y: 0, dx: 0, dy: 0 };
+    let toolbarDump = "";
+    for (;;) {
+      toolbarDump = String((await client.request(ControlCommand.TestToolbarButtons, []))[1] ?? "");
+      try {
+        lineButton = toolbarButtonRect(toolbarDump, "CmdCreateAnnotLine");
+      } catch {
+        lineButton = { x: 0, y: 0, dx: 0, dy: 0 };
+      }
+      if (lineButton.dx > 0 && lineButton.dy > 0) {
+        break;
+      }
+      if (Date.now() > buttonDeadline) {
+        throw new Error(`line-annotation-placement: toolbar button not laid out\n${toolbarDump}`);
+      }
+      await sleep(40);
+    }
+    const bx = lineButton.x + Math.floor(lineButton.dx / 2);
+    const by = lineButton.y + Math.floor(lineButton.dy / 2);
+    const clickLineToolbar = async () => {
+      if (USE_NG) {
+        // a button laid out or re-enabled this frame can't be hit until the frame
+        // is painted: click until the tool takes
+        const deadline = Date.now() + TOOLBAR_CLICK_TIMEOUT_MS * SLOW_BUILD_FACTOR;
+        for (;;) {
+          const res = await client.request(ControlCommand.TestInput, ["click", bx, by, 0, 0]);
+          const raw = String(res[1] ?? "");
+          if (res[0] !== 0 || !raw.startsWith("OK")) {
+            throw new Error(`line-annotation-placement: toolbar click failed: ${raw}`);
+          }
+          await sleep(TOOLBAR_CLICK_SETTLE_MS);
+          if ((await placementState(client)).active || Date.now() > deadline) {
+            return;
+          }
+        }
+      }
+      const toolbar = findChildByClass(frame, "SUMATRA_VIRT_TOOLBAR");
+      await clickAt(toolbar, bx, by, 0);
+    };
 
     await clickLineToolbar();
     let state = await waitForPlacement(client, true);
-    moveMouse(canvas, center);
-    state = await placementState(client);
+    // a cursor query from another window (toolbar repaint, notification)
+    // after the move resets the cross cursor: move again until it sticks
+    const cursorDeadline = Date.now() + 2_000 * SLOW_BUILD_FACTOR;
+    for (;;) {
+      moveMouse(canvas, center);
+      state = await placementState(client);
+      if (state.cursor || Date.now() > cursorDeadline) break;
+      await sleep(40);
+    }
     if (
       !state.notification ||
       !state.cursor ||
@@ -258,7 +326,7 @@ export async function testit(): Promise<void> {
     }
 
     await client.setNotificationsEnabled(false);
-    const before = captureWindowPixels(canvas);
+    const before = IS_MAC ? null : captureWindowPixels(canvas);
     const blueBefore = countPreviewBlue(before, start, end);
     // SetCursorPos queues a WM_MOUSEMOVE with no Shift, which can land after the
     // synthetic one and undo the snap. Resend until the 45-degree preview sticks.
@@ -282,13 +350,17 @@ export async function testit(): Promise<void> {
     if (!snapped || !state.raw.includes(`end=${end.x},${end.y}`)) {
       throw new Error(`line-annotation-placement: releasing Shift did not restore the pointer endpoint\n${state.raw}`);
     }
-    await sleep(150);
-    const after = captureWindowPixels(canvas);
-    const blueAfter = countPreviewBlue(after, start, end);
-    if (blueAfter < blueBefore + 80) {
-      throw new Error(
-        `line-annotation-placement: live preview did not paint while moving (${blueBefore} -> ${blueAfter})`,
-      );
+    if (IS_MAC) {
+      console.log("SKIP line-annotation-placement: preview pixels are read from a window DC");
+    } else {
+      await sleep(150);
+      const after = captureWindowPixels(canvas);
+      const blueAfter = countPreviewBlue(after, start, end);
+      if (blueAfter < blueBefore + 80) {
+        throw new Error(
+          `line-annotation-placement: live preview did not paint while moving (${blueBefore} -> ${blueAfter})`,
+        );
+      }
     }
 
     await clickAt(canvas, outside.x, outside.y, 0);

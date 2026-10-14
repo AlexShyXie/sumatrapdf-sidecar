@@ -30,6 +30,7 @@
 #include "SumatraPDF.h"
 #include "ReadingBar.h"
 #include "ReadingAutoScroll.h"
+#include "ReadingAutoScrollCommon.h"
 #include "SumatraLog.h"
 
 // Hands-free continuous pan (Acrobat / Foxit Automatically Scroll): a stored
@@ -46,7 +47,6 @@ struct ReadingAutoScrollBar : WindowBase {
     void UpdateLayout(bool forceLayout = false);
     void OnPaint(WindowBase::PaintEvent* ev);
 
-    WindowTab* sessionTab = nullptr;
     HWND hwndCanvas = nullptr;
     VirtButton* btnPause = nullptr;
     VirtButton* btnStop = nullptr;
@@ -63,143 +63,10 @@ struct ReadingAutoScrollBar : WindowBase {
     Func1List<MainWindow*> onWindowMoved;
 };
 
-constexpr int kBarMargin = 8;
-constexpr int kBarPadX = 12;
-constexpr int kBarPadY = 6;
-constexpr int kBtnGap = 8;
 constexpr int kBtnPadX = 10;
 constexpr int kBtnPadY = 3;
 
-// Arrow keys step these. Finer than Acrobat's 0-9 so speed is tunable.
-static const float kSpeeds[] = {8, 12, 16, 20, 24, 32, 40, 48, 56, 64, 80, 96, 120, 160, 200, 260, 320};
-
-// Acrobat maps 0 (slowest) .. 9 (fastest) onto these.
-static const float kDigitSpeeds[] = {8, 12, 16, 24, 36, 48, 72, 108, 160, 240};
-
-static int SpeedCount() {
-    return dimofi(kSpeeds);
-}
-
-static float ClampSpeed(float s) {
-    if (s < kSpeeds[0]) {
-        return kSpeeds[0];
-    }
-    if (s > kSpeeds[SpeedCount() - 1]) {
-        return kSpeeds[SpeedCount() - 1];
-    }
-    return s;
-}
-
-static float CurrentSpeed() {
-    if (!gSettings) {
-        return 40;
-    }
-    return ClampSpeed(gSettings->readingAutoScrollSpeed);
-}
-
-static int ClosestSpeedIdx(float s) {
-    int best = 0;
-    float bestD = fabsf(kSpeeds[0] - s);
-    for (int i = 1; i < SpeedCount(); i++) {
-        float d = fabsf(kSpeeds[i] - s);
-        if (d < bestD) {
-            best = i;
-            bestD = d;
-        }
-    }
-    return best;
-}
-
-static void SetSpeed(float s) {
-    if (!gSettings) {
-        return;
-    }
-    s = ClampSpeed(s);
-    if (gSettings->readingAutoScrollSpeed == s) {
-        return;
-    }
-    gSettings->readingAutoScrollSpeed = s;
-    ScheduleSaveSettings();
-}
-
-static void StepSpeed(int dir) {
-    int idx = ClosestSpeedIdx(CurrentSpeed()) + dir;
-    idx = limitValue(idx, 0, SpeedCount() - 1);
-    SetSpeed(kSpeeds[idx]);
-}
-
-static TempStr SpeedLabelTemp(WindowTab* tab) {
-    const char* arrow = (!tab || tab->autoScroll.dir >= 0) ? "\xE2\x86\x93" : "\xE2\x86\x91";
-    return fmt("%s %d px/s", Str(arrow), (int)lroundf(CurrentSpeed()));
-}
-
-static TempStr StatusTextTemp(WindowTab* tab) {
-    if (!tab) {
-        return {};
-    }
-    if (tab->autoScroll.atEnd) {
-        return str::DupTemp(Tr("End of document"));
-    }
-    if (tab->autoScroll.paused) {
-        return str::DupTemp(Tr("Paused"));
-    }
-    return str::DupTemp(Tr("Scrolling"));
-}
-
-static DisplayModel* ScrollModel(WindowTab* tab) {
-    if (!tab) {
-        return nullptr;
-    }
-    return tab->AsFixed();
-}
-
-static WindowTab* CurrentDocTab(MainWindow* win) {
-    WindowTab* tab = win ? win->CurrentTab() : nullptr;
-    if (!tab || tab->IsNonDocumentTab()) {
-        return nullptr;
-    }
-    return tab;
-}
-
-static WindowTab* ActiveTab(MainWindow* win) {
-    WindowTab* tab = CurrentDocTab(win);
-    if (!tab || !tab->autoScroll.on) {
-        return nullptr;
-    }
-    return tab;
-}
-
-static WindowTab* SessionTab(MainWindow* win) {
-    if (!win || !win->readingAutoScrollBar) {
-        return nullptr;
-    }
-    return win->readingAutoScrollBar->sessionTab;
-}
-
-static bool AtScrollLimit(DisplayModel* dm, int dir) {
-    if (!dm) {
-        return true;
-    }
-    if (dir > 0) {
-        int maxY = std::max(0, dm->canvasSize.dy - dm->viewPort.dy);
-        if (dm->viewPort.y < maxY) {
-            return false;
-        }
-        if (IsContinuous(dm->GetDisplayMode())) {
-            return true;
-        }
-        return dm->CurrentPageNo() >= dm->PageCount();
-    }
-    if (dm->viewPort.y > 0) {
-        return false;
-    }
-    if (IsContinuous(dm->GetDisplayMode())) {
-        return true;
-    }
-    return dm->CurrentPageNo() <= 1;
-}
-
-static void StopMiddleClickScroll(MainWindow* win) {
+void StopMiddleClickScroll(MainWindow* win) {
     if (!win || win->mouseAction != MouseAction::Scrolling) {
         return;
     }
@@ -214,13 +81,13 @@ static void StopMiddleClickScroll(MainWindow* win) {
     }
 }
 
-static void KillReadingTimer(MainWindow* win) {
+void KillReadingTimer(MainWindow* win) {
     if (win && win->hwndCanvas) {
         KillTimer(win->hwndCanvas, kReadingAutoScrollTimerID);
     }
 }
 
-static void ArmReadingTimer(MainWindow* win, WindowTab* tab) {
+void ArmReadingTimer(MainWindow* win, WindowTab* tab) {
     if (!win || !win->hwndCanvas || !tab) {
         return;
     }
@@ -229,250 +96,9 @@ static void ArmReadingTimer(MainWindow* win, WindowTab* tab) {
     SetTimer(win->hwndCanvas, kReadingAutoScrollTimerID, USER_TIMER_MINIMUM, nullptr);
 }
 
-static ReadingAutoScrollBar* BarEnsure(MainWindow* win);
-static void BarHide(MainWindow* win);
-static void BarUpdate(MainWindow* win, bool forceLayout = false);
-
-static void ClearTabScroll(WindowTab* tab) {
-    if (tab) {
-        tab->autoScroll = {};
-    }
-}
-
-bool ReadingAutoScrollIsOn(MainWindow* win) {
-    return ActiveTab(win) != nullptr;
-}
-
-void ReadingAutoScrollHideBar(MainWindow* win) {
-    KillReadingTimer(win);
-    BarHide(win);
-}
-
-void ReadingAutoScrollStop(MainWindow* win) {
-    WindowTab* tab = ActiveTab(win);
-    if (!tab) {
-        ReadingAutoScrollHideBar(win);
-        return;
-    }
-    ClearTabScroll(tab);
-    ReadingAutoScrollHideBar(win);
-}
-
-void ReadingAutoScrollForgetTab(WindowTab* tab) {
-    if (!tab) {
-        return;
-    }
-    MainWindow* win = tab->win;
-    bool wasSession = win && SessionTab(win) == tab;
-    ClearTabScroll(tab);
-    if (wasSession) {
-        ReadingAutoScrollHideBar(win);
-    }
-}
-
-static void ReadingAutoScrollStart(MainWindow* win) {
-    WindowTab* tab = CurrentDocTab(win);
-    if (!tab || !ScrollModel(tab)) {
-        return;
-    }
-    StopMiddleClickScroll(win);
-    tab->autoScroll.on = true;
-    tab->autoScroll.paused = false;
-    tab->autoScroll.atEnd = AtScrollLimit(ScrollModel(tab), tab->autoScroll.dir);
-    tab->autoScroll.accum = 0;
-    if (!tab->autoScroll.atEnd) {
-        ArmReadingTimer(win, tab);
-    } else {
-        tab->autoScroll.paused = true;
-        KillReadingTimer(win);
-    }
-    ReadingAutoScrollBar* bar = BarEnsure(win);
-    if (bar) {
-        bar->sessionTab = tab;
-    }
-    BarUpdate(win, true);
-}
-
-void ReadingAutoScrollSyncToTab(WindowTab* tab) {
-    if (!tab || !tab->win) {
-        return;
-    }
-    MainWindow* win = tab->win;
-    if (tab->IsNonDocumentTab() || !tab->autoScroll.on || !ScrollModel(tab)) {
-        ReadingAutoScrollHideBar(win);
-        return;
-    }
-    if (!tab->autoScroll.paused && !tab->autoScroll.atEnd) {
-        ArmReadingTimer(win, tab);
-    } else {
-        KillReadingTimer(win);
-    }
-    ReadingAutoScrollBar* bar = BarEnsure(win);
-    if (bar) {
-        bar->sessionTab = tab;
-    }
-    BarUpdate(win, true);
-}
-
-void ReadingAutoScrollToggle(MainWindow* win) {
-    if (!win) {
-        return;
-    }
-    if (ActiveTab(win)) {
-        ReadingAutoScrollStop(win);
-        return;
-    }
-    ReadingAutoScrollStart(win);
-}
-
-void ReadingAutoScrollPause(MainWindow* win) {
-    WindowTab* tab = ActiveTab(win);
-    if (!tab) {
-        return;
-    }
-    if (tab->autoScroll.atEnd && tab->autoScroll.paused) {
-        return;
-    }
-    tab->autoScroll.paused = !tab->autoScroll.paused;
-    if (tab->autoScroll.paused) {
-        KillReadingTimer(win);
-        tab->autoScroll.accum = 0;
-    } else {
-        tab->autoScroll.atEnd = AtScrollLimit(ScrollModel(tab), tab->autoScroll.dir);
-        if (tab->autoScroll.atEnd) {
-            tab->autoScroll.paused = true;
-        } else {
-            ArmReadingTimer(win, tab);
-        }
-    }
-    BarUpdate(win, true);
-}
-
-void ReadingAutoScrollFaster(MainWindow* win) {
-    if (!ActiveTab(win)) {
-        return;
-    }
-    StepSpeed(1);
-    BarUpdate(win);
-}
-
-void ReadingAutoScrollSlower(MainWindow* win) {
-    if (!ActiveTab(win)) {
-        return;
-    }
-    StepSpeed(-1);
-    BarUpdate(win);
-}
-
-void ReadingAutoScrollReverse(MainWindow* win) {
-    WindowTab* tab = ActiveTab(win);
-    if (!tab) {
-        return;
-    }
-    tab->autoScroll.dir = tab->autoScroll.dir >= 0 ? -1 : 1;
-    tab->autoScroll.atEnd = AtScrollLimit(ScrollModel(tab), tab->autoScroll.dir);
-    if (tab->autoScroll.atEnd) {
-        tab->autoScroll.paused = true;
-        KillReadingTimer(win);
-    } else if (!tab->autoScroll.paused) {
-        ArmReadingTimer(win, tab);
-    }
-    BarUpdate(win, true);
-}
-
-static void ApplyArrowSpeed(MainWindow* win, WindowTab* tab, int keyDir) {
-    // Acrobat: the arrow that matches the pan direction speeds up; the other slows.
-    if (keyDir == tab->autoScroll.dir) {
-        StepSpeed(1);
-    } else {
-        StepSpeed(-1);
-    }
-    BarUpdate(win);
-}
-
-static void ApplyDigitSpeed(MainWindow* win, int digit) {
-    if (digit < 0 || digit > 9) {
-        return;
-    }
-    SetSpeed(kDigitSpeeds[digit]);
-    BarUpdate(win);
-}
-
-bool ReadingAutoScrollOnKey(MainWindow* win, WPARAM key) {
-    WindowTab* tab = ActiveTab(win);
-    if (!tab) {
-        return false;
-    }
-    if (IsCtrlPressed() || IsShiftPressed() || IsAltPressed()) {
-        return false;
-    }
-    if (IsFindUIVisible(win)) {
-        return false;
-    }
-
-    if (key == VK_ESCAPE) {
-        ReadingAutoScrollStop(win);
-        return true;
-    }
-    if (key == VK_SPACE) {
-        ReadingAutoScrollPause(win);
-        return true;
-    }
-    if (key == VK_DOWN) {
-        ApplyArrowSpeed(win, tab, 1);
-        return true;
-    }
-    if (key == VK_UP) {
-        ApplyArrowSpeed(win, tab, -1);
-        return true;
-    }
-    if (key == VK_LEFT) {
-        if (win->ctrl) {
-            win->ctrl->GoToPrevPage();
-        }
-        return true;
-    }
-    if (key == VK_RIGHT) {
-        if (win->ctrl) {
-            win->ctrl->GoToNextPage();
-        }
-        return true;
-    }
-    if (key == VK_OEM_MINUS || key == VK_SUBTRACT) {
-        ReadingAutoScrollReverse(win);
-        return true;
-    }
-    if (key >= '0' && key <= '9') {
-        ApplyDigitSpeed(win, (int)(key - '0'));
-        return true;
-    }
-    if (key >= VK_NUMPAD0 && key <= VK_NUMPAD9) {
-        ApplyDigitSpeed(win, (int)(key - VK_NUMPAD0));
-        return true;
-    }
-    return false;
-}
-
-void ReadingAutoScrollTick(MainWindow* win) {
-    WindowTab* tab = ActiveTab(win);
-    if (!tab || tab != SessionTab(win) || tab->autoScroll.paused) {
-        KillReadingTimer(win);
-        return;
-    }
-    DisplayModel* dm = ScrollModel(tab);
-    if (!dm) {
-        ReadingAutoScrollStop(win);
-        return;
-    }
-    int dir = tab->autoScroll.dir >= 0 ? 1 : -1;
-    if (AtScrollLimit(dm, dir)) {
-        tab->autoScroll.atEnd = true;
-        tab->autoScroll.paused = true;
-        KillReadingTimer(win);
-        BarUpdate(win, true);
-        return;
-    }
-
+// Seconds since the previous tick of this run, 0 on its first: orig times its
+// own timer.
+float ReadingTickSeconds(WindowTab* tab, int) {
     TimeStamp now = TimeGet();
     float dt = 0;
     if (tab->autoScroll.lastQpc != 0) {
@@ -481,26 +107,11 @@ void ReadingAutoScrollTick(MainWindow* win) {
         dt = (float)(TimeSinceInMs(start) / 1000.0);
     }
     tab->autoScroll.lastQpc = now.QuadPart;
-    if (dt <= 0) {
-        return;
-    }
-    if (dt > 0.1f) {
-        dt = 0.1f;
-    }
+    return dt;
+}
 
-    tab->autoScroll.accum += CurrentSpeed() * (float)dir * dt;
-    int dy = (int)tab->autoScroll.accum;
-    tab->autoScroll.accum -= (float)dy;
-    if (dy == 0) {
-        return;
-    }
-    dm->ScrollYBy(dy, true);
-    if (AtScrollLimit(dm, dir)) {
-        tab->autoScroll.atEnd = true;
-        tab->autoScroll.paused = true;
-        KillReadingTimer(win);
-        BarUpdate(win, true);
-    }
+void ReadingAutoScrollTick(MainWindow* win) {
+    ReadingAutoScrollTick(win, 0);
 }
 
 static MainWindow* WinFromBar(ReadingAutoScrollBar* bar) {
@@ -527,7 +138,7 @@ static void OnReverseClickedBar(ReadingAutoScrollBar* bar, VirtMouseEvent*) {
 }
 
 static void SyncSpeedLabel(ReadingAutoScrollBar* bar) {
-    bar->speedLabel->SetText(SpeedLabelTemp(bar->sessionTab));
+    bar->speedLabel->SetText(SpeedLabelTemp(SessionTab(WinFromBar(bar))));
 }
 
 static void OnSpeedSliderDrag(ReadingAutoScrollBar* bar) {
@@ -646,7 +257,7 @@ void ReadingAutoScrollBar::BuildLayout() {
 }
 
 void ReadingAutoScrollBar::SyncLabels() {
-    WindowTab* tab = sessionTab;
+    WindowTab* tab = SessionTab(WinFromBar(this));
     bool paused = tab && (tab->autoScroll.paused || tab->autoScroll.atEnd);
     btnPause->SetText(paused ? Tr("Resume") : Tr("Pause"));
     if (speedSlider && !speedSlider->IsAdjusting()) {
@@ -735,7 +346,7 @@ static void BarOnWindowMoved(ReadingAutoScrollBar* bar, MainWindow*) {
     bar->UpdateLayout();
 }
 
-static ReadingAutoScrollBar* BarEnsure(MainWindow* win) {
+ReadingAutoScrollBar* BarEnsure(MainWindow* win) {
     if (!win || !win->hwndCanvas) {
         return nullptr;
     }
@@ -753,16 +364,16 @@ static ReadingAutoScrollBar* BarEnsure(MainWindow* win) {
     return bar;
 }
 
-static void BarHide(MainWindow* win) {
+void BarHide(MainWindow* win) {
     if (!win || !win->readingAutoScrollBar || !win->readingAutoScrollBar->hwnd) {
         return;
     }
-    win->readingAutoScrollBar->sessionTab = nullptr;
+    win->readingAutoScrollTab = nullptr;
     SetWindowPos(win->readingAutoScrollBar->hwnd, nullptr, 0, 0, 0, 0,
                  SWP_HIDEWINDOW | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
 }
 
-static void BarUpdate(MainWindow* win, bool forceLayout) {
+void BarUpdate(MainWindow* win, bool forceLayout) {
     if (!win || !win->readingAutoScrollBar || !win->readingAutoScrollBar->hwnd) {
         return;
     }
@@ -789,6 +400,7 @@ void ReadingAutoScrollDestroy(MainWindow* win) {
     win->UnregisterOnWindowMoved(&win->readingAutoScrollBar->onWindowMoved);
     delete win->readingAutoScrollBar;
     win->readingAutoScrollBar = nullptr;
+    win->readingAutoScrollTab = nullptr;
 }
 
 TempStr ReadingAutoScrollBarStateTemp(int* exitCodeOut) {

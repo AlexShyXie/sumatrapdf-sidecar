@@ -166,13 +166,6 @@ static void TreeViewToggle(TreeView* tree, HTREEITEM hItem, bool recursive) {
     }
 }
 
-static void SetTreeItemState(uint uState, TreeItemState& state) {
-    state.isExpanded = bit::IsMaskSet(uState, TVIS_EXPANDED);
-    state.isSelected = bit::IsMaskSet(uState, TVIS_SELECTED);
-    uint n = (uState >> 12) - 1;
-    state.isChecked = n != 0;
-}
-
 static bool HandleKey(TreeView* tree, WPARAM wp) {
     HWND hwnd = tree->hwnd;
     // consistently expand/collapse whole (sub)trees
@@ -219,6 +212,15 @@ void TreeView::WndProc(ControlBase::WndProcEvent* ev) {
         return;
     }
 
+    // A 0-sized tree scrolls a newly selected item to just above its top.
+    if (WM_SIZE == msg && revealSelOnSize && LOWORD(lparam) > 0 && HIWORD(lparam) > 0) {
+        revealSelOnSize = false;
+        ev->result = FinalWindowProc(msg, wparam, lparam);
+        ev->didHandle = true;
+        TreeView_EnsureVisible(hwnd, TreeView_GetSelection(hwnd));
+        return;
+    }
+
     if (WM_KEYDOWN == msg) {
         // Enter is handled here (expand/collapse) before DefWindowProc, so TVN_KEYDOWN
         // never fires for it. Let onKeyDown run first — Favorites uses Enter to open
@@ -251,8 +253,8 @@ void TreeView::WndProc(ControlBase::WndProcEvent* ev) {
 }
 
 bool TreeView::IsExpanded(TreeItem ti) {
-    auto state = GetItemState(ti);
-    return state.isExpanded;
+    TVITEMW* item = GetTVITEM(this, ti);
+    return item && bit::IsMaskSet(item->state, TVIS_EXPANDED);
 }
 
 // https://docs.microsoft.com/en-us/windows/win32/api/commctrl/nf-commctrl-treeview_getitemrect
@@ -281,6 +283,7 @@ bool TreeView::SelectItem(TreeItem ti) {
     // buries other top-level windows (annotations editor, command palette).
     HWND prev = ::GetFocus();
     BOOL ok = TreeView_SelectItem(hwnd, hi);
+    revealSelOnSize = hi && HwndClientRect(hwnd).IsEmpty();
     if (prev && prev != hwnd && ::GetFocus() == hwnd) {
         ::SetFocus(prev);
     }
@@ -509,20 +512,6 @@ bool TreeView::GetState(TreeItem item) {
     ReportIf(!hi);
     auto res = TreeView_GetCheckState(hwnd, hi);
     return res != 0;
-}
-
-TreeItemState TreeView::GetItemState(TreeItem ti) {
-    TreeItemState res;
-
-    TVITEMW* it = GetTVITEM(this, ti);
-    if (!it) {
-        // could be missing if filtered
-        return res;
-    }
-    SetTreeItemState(it->state, res);
-    res.nChildren = it->cChildren;
-
-    return res;
 }
 
 // if context menu invoked via keyboard, get selected item

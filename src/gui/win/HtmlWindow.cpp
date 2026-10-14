@@ -918,10 +918,6 @@ IDownloadManager : public IUnknown {
                                   UINT uiCP) = 0;
 };
 
-#ifdef __GNUC__
-__CRT_UUID_DECL(IDownloadManager, 0x988934a4, 0x064b, 0x11d3, 0xbb, 0x80, 0x0, 0x10, 0x4b, 0x35, 0xe7, 0xf9)
-#endif
-
 #endif
 
 class HW_IDownloadManager : public IDownloadManager {
@@ -1363,7 +1359,7 @@ bool HtmlWindow::CreateBrowser() {
 }
 
 // urlmon.dll is delay-loaded. On systems where it (or an export we need) can't
-// be loaded -- e.g. Wine, or a stripped-down Windows install -- calling a
+// be loaded -- e.g. a stripped-down Windows install -- calling a
 // delay-loaded urlmon function raises a fatal delay-load exception (0xC06D007E)
 // that we can't catch here. The HtmlWindow ctor calls into urlmon
 // (RegisterInternetProtocolFactory -> CoInternetGetSession), so verify urlmon is

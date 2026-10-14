@@ -31,6 +31,7 @@
 #include "Notifications.h"
 #include "DarkMode.h"
 #include "SumatraDialogs.h"
+#include "SignDocumentDialogCommon.h"
 
 extern bool SaveAnnotationsToMaybeNewPdfFile(WindowTab*);
 
@@ -61,6 +62,13 @@ struct SignDocumentWnd : WindowBase {
     Edit* editReason = nullptr;
     Edit* editLocation = nullptr;
     DropDown* ddPlacement = nullptr;
+    // approval or a certifying signature (discussion #6315); certifying is
+    // only offered while the document has no signature yet
+    DropDown* ddType = nullptr;
+    Vec<int> typeCodes; // what each ddType row means (SignatureTypeItems)
+    bool docSigned = false;
+    int initialCertify = 0; // what the drop-down opens on ([CmdSignDocument certify])
+    Checkbox* cbLockFields = nullptr;
     VirtButton* btnBrowse = nullptr;
     VirtButton* btnCancel = nullptr;
     VirtButton* btnSign = nullptr;
@@ -78,6 +86,7 @@ struct SignDocumentWnd : WindowBase {
     void CollectFields();
     void FillCertificates();
     void FillPlacement();
+    void FillSignatureType();
     void FillAppearance();
     bool UsingCertFile() const;
     void UpdateCertFileEnabled();
@@ -102,7 +111,6 @@ static SignDocumentWnd* gSignDocumentWnd = nullptr;
 // true while the Sign Document dialog is hidden and the next click / drag on
 // the page will place a new signature (issue #5967)
 static bool gPlacingSignature = false;
-static Kind kNotifSignPlacement = "notifSignPlacement";
 static void ClearSignaturePlacementNotif(MainWindow* win);
 
 static void SetSignDocumentOwnerEnabled(SignDocumentWnd* wnd, bool enabled) {
@@ -110,11 +118,6 @@ static void SetSignDocumentOwnerEnabled(SignDocumentWnd* wnd, bool enabled) {
         EnableWindow(wnd->hwndOwner, enabled);
     }
 }
-
-// Default size of a new signature when the user clicks rather than dragging
-// a rectangle. 2" x 0.75" at 72 pt/in — enough for name, date and reason.
-constexpr float kDefaultSignatureDx = 144;
-constexpr float kDefaultSignatureDy = 54;
 
 static void ClearSignDocumentWnd() {
     gPlacingSignature = false;
@@ -134,60 +137,14 @@ void CloseSignDocumentDialog(MainWindow* win) {
     gSignDocumentWnd->ScheduleDelete();
 }
 
-static EngineBase* GetPdfEngine(MainWindow* win) {
-    if (!IsMainWindowValidAndNotClosing(win) || !win->IsDocLoaded()) {
-        return nullptr;
-    }
-    DisplayModel* dm = win->AsFixed();
-    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
-    if (!engine || !EngineMupdfSupportsAnnotations(engine)) {
-        return nullptr;
-    }
-    return engine;
-}
-
-// Bounding box of the current selection. Sets pageNoOut to the page of the
-// first non-empty piece. Empty if nothing is selected.
-static RectF SelectionRect(WindowTab* tab, int* pageNoOut) {
-    RectF res;
-    if (!tab || !tab->selectionOnPage) {
-        return res;
-    }
-    for (auto& sel : *tab->selectionOnPage) {
-        if (sel.rect.IsEmpty()) {
-            continue;
-        }
-        if (res.IsEmpty()) {
-            if (pageNoOut) {
-                *pageNoOut = sel.pageNo;
-            }
-            res = sel.rect;
-        } else if (!pageNoOut || sel.pageNo == *pageNoOut) {
-            res = res.Union(sel.rect);
-        }
-    }
-    return res;
-}
-
 static void ClearSignaturePlacementNotif(MainWindow* win) {
     if (win && win->hwndCanvas) {
-        RemoveNotificationsForGroup(win->hwndCanvas, kNotifSignPlacement);
+        RemoveNotificationsForGroup(win, kNotifSignPlacement);
     }
 }
 
-static void ShowSignaturePlacementNotif(MainWindow* win) {
-    if (!win || !win->hwndCanvas) {
-        return;
-    }
-    NotificationCreateArgs args;
-    args.hwndParent = win->hwndCanvas;
-    args.msg = Tr("Click or drag on the page to place the signature. Esc to cancel.");
-    args.timeoutMs = kNotifNoTimeout;
-    args.groupId = kNotifSignPlacement;
-    args.corner = NotifCorner::BottomBar;
-    args.warning = true;
-    args.tab = win->CurrentTab();
-    ShowNotification(args);
+NotifCorner SignPlacementNotifCorner() {
+    return NotifCorner::BottomBar;
 }
 
 bool IsPlacingSignature(MainWindow* win) {
@@ -223,42 +180,6 @@ static void StartSignaturePlacement(SignDocumentWnd* wnd) {
     DeleteOldSelectionInfo(wnd->win, true);
     ShowSignaturePlacementNotif(wnd->win);
     HwndSetFocus(wnd->win->hwndFrame);
-}
-
-static RectF ClampRectToPage(RectF r, RectF page) {
-    if (page.IsEmpty()) {
-        return r;
-    }
-    if (r.dx > page.dx) {
-        r.dx = page.dx;
-    }
-    if (r.dy > page.dy) {
-        r.dy = page.dy;
-    }
-    if (r.x < page.x) {
-        r.x = page.x;
-    }
-    if (r.y < page.y) {
-        r.y = page.y;
-    }
-    if (r.x + r.dx > page.x + page.dx) {
-        r.x = page.x + page.dx - r.dx;
-    }
-    if (r.y + r.dy > page.y + page.dy) {
-        r.y = page.y + page.dy - r.dy;
-    }
-    return r;
-}
-
-// A default-size box centered on the click, kept on the page.
-static RectF DefaultSignatureRectAt(DisplayModel* dm, int pageNo, PointF pt) {
-    RectF r(pt.x - (kDefaultSignatureDx / 2), pt.y - (kDefaultSignatureDy / 2), kDefaultSignatureDx,
-            kDefaultSignatureDy);
-    PageInfo* pi = dm ? dm->GetPageInfo(pageNo) : nullptr;
-    if (!pi || !IsMediaBoxKnown(pi->mediaBox)) {
-        return r;
-    }
-    return ClampRectToPage(r, pi->mediaBox);
 }
 
 // The click or drag that places a new signature. aborted is a click (no drag).
@@ -437,6 +358,20 @@ void SignDocumentWnd::FillPlacement() {
     CbSetCurrentSelection(ddPlacement, sel);
 }
 
+void SignDocumentWnd::FillSignatureType() {
+    if (!ddType) {
+        return;
+    }
+    EngineBase* engine = GetPdfEngine(win);
+    docSigned = engine && EngineMupdfCountSignedSignatures(engine) > 0;
+    StrVec items;
+    VecReset(typeCodes);
+    SignatureTypeItems(items, typeCodes, docSigned);
+    ddType->SetItems(items);
+    int sel = VecFind(typeCodes, initialCertify);
+    CbSetCurrentSelection(ddType, sel >= 0 ? sel : 0);
+}
+
 // Turns the dialog state into what the engine needs; false if something the
 // user has to fix is missing.
 bool SignDocumentWnd::BuildSignArgs(PdfSignArgs& args) {
@@ -503,6 +438,9 @@ bool SignDocumentWnd::BuildSignArgs(PdfSignArgs& args) {
         flags |= kPdfSignShowLabels | kPdfSignShowTextName;
     }
     args.appearanceFlags = flags;
+    int typeIdx = ddType ? CbGetCurrentSelection(ddType) : -1;
+    ApplySignatureType(args, (typeIdx >= 0 && typeIdx < len(typeCodes)) ? typeCodes[typeIdx] : 0);
+    args.lockFields = cbLockFields && cbLockFields->IsChecked();
 
     int idx = CbGetCurrentSelection(ddPlacement);
     if (idx >= 0 && idx < len(fieldNames)) {
@@ -593,35 +531,20 @@ void SignDocumentWnd::OnCancel(VirtMouseEvent*) {
     ScheduleDelete();
 }
 
-// mupdf reports a certificate it can't open as a raw Win32 failure
-// ("PFXImportCertStore failed (gle=86)"). A mistyped password is by far the
-// most likely cause of gle=86 (ERROR_INVALID_PASSWORD), so say that instead.
-static TempStr SignErrorMessageTemp(Str err) {
-    if (len(err) == 0) {
-        return Tr("Could not sign the document.");
-    }
-    if (str::Contains(err, StrL("PFXImportCertStore"))) {
-        if (str::Contains(err, StrL("gle=86"))) {
-            return Tr("Wrong password for the certificate file.");
-        }
-        return fmt(Tr("Could not read the certificate file: %s").s, err);
-    }
-    if (str::Contains(err, StrL("not found in the Windows certificate store")) ||
-        str::Contains(err, StrL("invalid certificate thumbprint"))) {
-        return Tr("Could not use that certificate from the Windows certificate store.");
-    }
-    if (str::Contains(err, StrL("could not read signature image")) || str::Contains(err, StrL("cannot create image")) ||
-        str::Contains(err, StrL("unknown image format"))) {
-        return Tr("Could not read the signature image.");
-    }
-    return str::DupTemp(err);
-}
-
 void SignDocumentWnd::DoSign(const PdfSignArgs& args) {
     EngineBase* engine = GetPdfEngine(win);
     if (!engine) {
         ScheduleDelete();
         return;
+    }
+
+    if (SignTypeLocksDocument(args)) {
+        UINT flags = MB_ICONEXCLAMATION | MB_YESNO | MbRtlReadingMaybe();
+        if (IDNO == MsgBox(win->hwndFrame, LockDocumentWarning(), Tr("Sign Document"), flags)) {
+            SetIsVisible(true);
+            HwndSetFocus(hwnd);
+            return;
+        }
     }
 
     Str err;
@@ -801,6 +724,20 @@ bool SignDocumentWnd::Create(MainWindow* mainWin) {
         FillPlacement();
     }
 
+    AddLabel(vbox, Tr("Signature &type:"), f, isRtl, 8);
+    {
+        DropDown::CreateArgs args;
+        args.parent = hwnd;
+        args.font = f;
+        args.isRtl = isRtl;
+        auto* c = new DropDown();
+        c->Create(args);
+        ddType = c;
+        vbox->AddChild(c);
+        FillSignatureType();
+    }
+    cbLockFields = AddCheckbox(vbox, hwnd, Tr("Lock form &fields after signing"), isRtl, 2);
+
     AddLabel(vbox, Tr("Appearance:"), f, isRtl, 8);
     cbShowLabels = AddCheckbox(vbox, hwnd, Tr("Show &labels"), isRtl, 2);
     cbShowName = AddCheckbox(vbox, hwnd, Tr("Show &name"), isRtl, 2);
@@ -870,7 +807,7 @@ bool SignDocumentWnd::Create(MainWindow* mainWin) {
 // fieldName selects that signature field in the placement drop-down; pass
 // hasField = false (the default) to leave the choice at the first unsigned
 // field, as the Sign Document command does.
-void ShowSignDocumentDialog(MainWindow* win, Str fieldName, bool hasField) {
+void ShowSignDocumentDialog(MainWindow* win, Str fieldName, bool hasField, int certifyLevel) {
     if (!GetPdfEngine(win)) {
         return;
     }
@@ -883,11 +820,16 @@ void ShowSignDocumentDialog(MainWindow* win, Str fieldName, bool hasField) {
             gSignDocumentWnd->hasPreselect = true;
             gSignDocumentWnd->FillPlacement();
         }
+        if (certifyLevel > 0) {
+            gSignDocumentWnd->initialCertify = certifyLevel;
+            gSignDocumentWnd->FillSignatureType();
+        }
         gSignDocumentWnd->SetIsVisible(true);
         HwndSetFocus(gSignDocumentWnd->hwnd);
         return;
     }
     auto* wnd = new SignDocumentWnd();
+    wnd->initialCertify = certifyLevel;
     if (hasField) {
         str::ReplaceWithCopy(&wnd->preselectField, fieldName);
         wnd->hasPreselect = true;

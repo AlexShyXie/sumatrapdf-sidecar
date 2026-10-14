@@ -10,13 +10,13 @@ import { clangFormatFiles } from "./util";
 // C++ outputs touched by gen-code; formatted at the end so a follow-up
 // cmd/format.ts run does not dirty the tree (e.g. indented @gen markers).
 const generatedCppFiles = [
-  "src/Flags.cpp",
-  "src/Commands.h",
-  "src/Commands.cpp",
-  "src/Accelerators.cpp",
-  "src/EbookDoc.cpp",
-  "src/PdfCreator.cpp",
-  "src/EngineMupdf.cpp",
+  "src/shared/Flags.cpp",
+  "src/shared/Commands.h",
+  "src/shared/Commands.cpp",
+  "src/shared/Accelerators.cpp",
+  "src/shared/EbookDoc.cpp",
+  "src/shared/DocProperties.cpp",
+  "src/shared/EngineMupdf.cpp",
   "src/Settings.h",
   "src/Settings.cpp",
 ];
@@ -271,7 +271,7 @@ export function genVirtKeys(rootDir: string) {
   const cmdDir = join(rootDir, "cmd");
   const vkIds = fetchVkIdsFromCompiler(cmdDir);
 
-  const shortcutPath = join(rootDir, "src", "ShortcutParse.cpp");
+  const shortcutPath = join(rootDir, "src", "shared", "ShortcutParse.cpp");
   let content = readFileSync(shortcutPath, "utf-8");
   content = replaceBetweenMarkers(
     content,
@@ -280,7 +280,7 @@ export function genVirtKeys(rootDir: string) {
     generateVirtKeysNum(vkIds),
   );
   writeFileSync(shortcutPath, content, "utf-8");
-  console.log("Generated gVirtKeysNum in src/ShortcutParse.cpp");
+  console.log("Generated gVirtKeysNum in src/shared/ShortcutParse.cpp");
 }
 
 // name<->DocProp maps, previously hand-written as SeqStrNum literals with the
@@ -290,7 +290,7 @@ export function genVirtKeys(rootDir: string) {
 // Each entry is [format-specific name, DocProp enum member].
 type PropEntry = [string, string];
 
-// DocProp -> PDF /Info key; shared by EngineMupdf's pdfPropNames and PdfCreator.
+// DocProp -> PDF /Info key.
 const pdfInfoNames: PropEntry[] = [
   ["Title", "Title"],
   ["Author", "Author"],
@@ -306,7 +306,7 @@ type PropMapTarget = { file: string; tag: string; varName: string; entries: Prop
 
 const docPropMaps: PropMapTarget[] = [
   {
-    file: "src/EbookDoc.cpp",
+    file: "src/shared/EbookDoc.cpp",
     tag: "docprop-epub",
     varName: "epubPropsMap",
     entries: [
@@ -318,9 +318,9 @@ const docPropMaps: PropMapTarget[] = [
       ["dc:rights", "Copyright"],
     ],
   },
-  { file: "src/PdfCreator.cpp", tag: "docprop-pdfcreator", varName: "pdfCreatorPropsMap", entries: pdfInfoNames },
+  { file: "src/shared/DocProperties.cpp", tag: "docprop-pdf-info", varName: "gPdfInfoPropsMap", entries: pdfInfoNames },
   {
-    file: "src/EngineMupdf.cpp",
+    file: "src/shared/EngineMupdf.cpp",
     tag: "docprop-mupdf",
     varName: "mupdfPropsMap",
     // keys mirror mupdf's FZ_META_INFO_* ("info:Title" etc.)
@@ -334,15 +334,14 @@ const docPropMaps: PropMapTarget[] = [
       ["info:ModDate", "ModificationDate"],
     ],
   },
-  { file: "src/EngineMupdf.cpp", tag: "docprop-pdf-info", varName: "pdfPropNames", entries: pdfInfoNames },
 ];
 
 // parse `enum class DocProp : u8 { None = 0, Title = 1, ... }` -> { Title: 1, ... }
 function parseDocPropValues(rootDir: string): Record<string, number> {
-  const src = readFileSync(join(rootDir, "src", "DocProperties.h"), "utf-8");
+  const src = readFileSync(join(rootDir, "src", "shared", "DocProperties.h"), "utf-8");
   const m = src.match(/enum class DocProp[^{]*\{([^}]*)\}/);
   if (!m) {
-    throw new Error("DocProp enum not found in src/DocProperties.h");
+    throw new Error("DocProp enum not found in src/shared/DocProperties.h");
   }
   const vals: Record<string, number> = {};
   for (const line of m[1].split("\n")) {
@@ -398,7 +397,7 @@ function verifyPropMap(t: PropMapTarget, vals: Record<string, number>): void {
 
 export function genDocPropMaps(rootDir: string) {
   const vals = parseDocPropValues(rootDir);
-  // group targets by file (EngineMupdf.cpp has two sections)
+  // group targets by file
   const byFile = new Map<string, PropMapTarget[]>();
   for (const t of docPropMaps) {
     verifyPropMap(t, vals);

@@ -8,7 +8,7 @@ static void RegressTestEpubLoading(Str fileName) {
     TempStr filePath = path::JoinTemp(TestFilesDir(), fileName);
     VerifyFileExists(filePath);
     FileType kind = GuessFileType(fileName, true);
-    ReportIf(!EpubDoc::IsSupportedFileType(kind));
+    ReportIf(kind != FileType::Epub);
     EpubDoc* doc = EpubDoc::CreateFromFile(filePath);
     ReportIf(!doc);
     delete doc;
@@ -29,7 +29,7 @@ static void Regress00() {
     TempStr filePath = path::JoinTemp(TestFilesDir(), StrL("epub\\widget-figure-gallery-20120405.epub"));
     VerifyFileExists(filePath);
     FileType kind = GuessFileType(filePath, true);
-    ReportIf(!EpubDoc::IsSupportedFileType(kind));
+    ReportIf(kind != FileType::Epub);
     EpubDoc* doc = EpubDoc::CreateFromFile(filePath);
     ReportIf(!doc);
 
@@ -38,7 +38,7 @@ static void Regress00() {
     if (!args) {
         return;
     }
-    args->htmlStr = doc->GetHtmlData();
+    args->htmlStr = ToStr(doc->htmlData);
     HtmlPage* pages[3];
     HtmlFormatter* formatter = new EpubFormatter(args, doc);
     int page = 0;
@@ -51,7 +51,7 @@ static void Regress00() {
     ReportIf(page != 3);
 
     args = CreateFormatterDefaultArgs(820, 920, textAllocator);
-    args->htmlStr = doc->GetHtmlData();
+    args->htmlStr = ToStr(doc->htmlData);
     args->reparseIdx = pages[2]->reparseIdx;
     formatter = new EpubFormatter(args, doc);
     // if bug is present, this will crash in formatter->Next()

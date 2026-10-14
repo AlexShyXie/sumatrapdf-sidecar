@@ -18,7 +18,8 @@ async function navState(client: ControlClient, action = "", idx = -1): Promise<N
   if (res[0] !== 0 || raw === "OK closed") {
     return null;
   }
-  const m = /^OK scan=(\d) sel=(-?\d+) items=(\d+) back=(\d) fwd=(\d) dir="([^"]*)" name="([^"]*)"$/.exec(raw);
+  // ng appends keyboard, dx and filter fields after orig's name
+  const m = /^OK scan=(\d) sel=(-?\d+) items=(\d+) back=(\d) fwd=(\d) dir="([^"]*)" name="([^"]*)"/.exec(raw);
   if (!m) {
     throw new Error(`navigate files: could not parse state: ${raw}`);
   }
@@ -50,6 +51,11 @@ function sameDir(a: string, b: string): boolean {
   return a.replace(/[\\/]+$/, "").toLowerCase() === b.replace(/[\\/]+$/, "").toLowerCase();
 }
 
+// Windows home lists "C:\". macOS lists "/" and the user directory.
+function isVolumeRoot(s: string): boolean {
+  return s === "/" || /^[A-Z]:\\$/.test(s);
+}
+
 export async function testit(): Promise<void> {
   const root = tmpPath("issue-6232");
   const sub = join(root, "sub");
@@ -77,7 +83,7 @@ export async function testit(): Promise<void> {
 
     // Home: no directory, drives listed first (a drive root like "C:\")
     await navState(client, "home");
-    await waitNav(client, "home", (s) => s.dir === "" && s.items >= 1 && /^[A-Z]:\\$/.test(s.name) && s.back === 1);
+    await waitNav(client, "home", (s) => s.dir === "" && s.items >= 1 && isVolumeRoot(s.name) && s.back === 1);
 
     // a new navigation after Back drops the forward history
     await navState(client, "back");
@@ -88,7 +94,7 @@ export async function testit(): Promise<void> {
     // a drive root still lists "..": Enter on it, like Up, lands on the home view
     for (let i = 0; i < 32; i++) {
       const s = await waitNav(client, "up to root", () => true);
-      if (/^[A-Z]:\\$/.test(s.dir)) {
+      if (isVolumeRoot(s.dir)) {
         break;
       }
       await navState(client, "up");

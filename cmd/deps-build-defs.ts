@@ -500,13 +500,20 @@ export const mupdf: LibDef = {
     "TOFU_CJK_LANG",
     "FZ_ENABLE_SVG=1",
     "FZ_ENABLE_BROTLI=1",
-    "FZ_ENABLE_BARCODE=0",
+    "FZ_ENABLE_BARCODE=1",
+    "HAVE_LEPTONICA",
+    "HAVE_TESSERACT",
+    "HAVE_ZXINGCPP",
     "FZ_ENABLE_JS=1",
     "FZ_ENABLE_HYPHEN=0",
     "CMARK_GFM_STATIC_DEFINE",
   ],
   includes: [
+    "src",
     "src/mupdf",
+    "src/shared/mupdf",
+    "ext/mupdf/source/fitz",
+    "ext/jxldec",
     "ext/mupdf/include",
     "ext/cmark-gfm/src",
     "ext/cmark-gfm/extensions",
@@ -529,7 +536,8 @@ export const mupdf: LibDef = {
   ],
   files: [
     // our additions to mupdf (not patches): see src/mupdf/README.md
-    { dir: "src/mupdf", patterns: ["mupdf_load_system_font.c", "noto_sumatra.c", "pkcs7-windows.c"] },
+    { dir: "src/mupdf", patterns: ["mupdf_load_system_font.c"] },
+    { dir: "src/shared/mupdf", patterns: ["fonts_map.c", "noto_sumatra.c", "pkcs7-windows.c", "load-jxl.cpp"] },
     { dir: "ext/mupdf/source/cbz", patterns: ["mucbz.c", "muimg.c"] },
     {
       dir: "ext/mupdf/source/fitz",

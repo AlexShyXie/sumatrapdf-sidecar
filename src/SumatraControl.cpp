@@ -28,6 +28,8 @@
 #include "CommandAvailability.h"
 #include "AppSettings.h"
 #include "Flags.h"
+#include "Installer.h"
+#include "InstallerUtil.h"
 #include "SumatraTest.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
@@ -69,6 +71,7 @@
 #include "NavFilesInFolder.h"
 #include "PerfLog.h"
 #include "SumatraControl.h"
+#include "SumatraControlCommon.h"
 
 extern bool gIsStartup;
 TempStr FindHistoryResultTemp(int* exitCodeOut);
@@ -136,7 +139,7 @@ static TempStr DpiResultTemp(Str action, int* exitCodeOut) {
 }
 
 // Silent add for -dbg-control tests (no name dialog, no settings flush).
-static void AddFavoriteSilent(MainWindow* win, int pageNo) {
+void AddFavoriteSilent(MainWindow* win, int pageNo) {
     if (!win || !win->IsDocLoaded() || !win->ctrl) {
         return;
     }
@@ -174,169 +177,17 @@ static void AddFavoriteSilent(MainWindow* win, int pageNo) {
 
 // Drive favorites on the already-open document for tests/issue-3744.ts.
 // action: "add" | "goto" | "next" | "prev" | "page". pageNo is used by add/goto.
-static TempStr FavoriteNavResultTemp(Str action, int pageNo, int* exitCodeOut) {
-    str::Builder out;
-    auto finish = [&](Str msg, int code) -> TempStr {
-        out.Append(msg);
-        out.AppendChar('\n');
-        if (exitCodeOut) {
-            *exitCodeOut = code;
-        }
-        return ToStrTemp(out);
-    };
-
-    if (len(gWindows) == 0) {
-        return finish(StrL("NOTREADY no-window"), 2);
-    }
-    MainWindow* win = gWindows[0];
-    if (!win || !win->IsDocLoaded() || !win->ctrl) {
-        return finish(StrL("NOTREADY no-doc"), 2);
-    }
-
-    if (str::EqI(action, StrL("add"))) {
-        if (!win->ctrl->ValidPageNo(pageNo)) {
-            return finish(fmt("ERROR bad-page page=%d", pageNo), 1);
-        }
-        AddFavoriteSilent(win, pageNo);
-    } else if (str::EqI(action, StrL("goto"))) {
-        if (!win->ctrl->ValidPageNo(pageNo)) {
-            return finish(fmt("ERROR bad-page page=%d", pageNo), 1);
-        }
-        win->ctrl->GoToPage(pageNo, true);
-    } else if (str::EqI(action, StrL("goto-fav"))) {
-        if (!win->ctrl->ValidPageNo(pageNo)) {
-            return finish(fmt("ERROR bad-page page=%d", pageNo), 1);
-        }
-        FileState* fs = FileHistoryFindByPath(win->ctrl->GetFilePath());
-        Favorite* fav = nullptr;
-        if (fs && fs->favorites) {
-            for (Favorite* f : *fs->favorites) {
-                if (ParseStoredPagePos(f->pageNo).pageNo == pageNo) {
-                    fav = f;
-                    break;
-                }
-            }
-        }
-        if (!fav) {
-            return finish(fmt("ERROR no-fav page=%d", pageNo), 1);
-        }
-        JumpToFavorite(win, fav);
-    } else if (str::EqI(action, StrL("next"))) {
-        GoToNextFavorite(win, true);
-    } else if (str::EqI(action, StrL("prev"))) {
-        GoToNextFavorite(win, false);
-    } else if (str::EqI(action, StrL("page"))) {
-        // report only
-    } else {
-        return finish(fmt("ERROR unknown-action action=%s", action), 1);
-    }
-
-    int cur = win->ctrl->CurrentPageNo();
-    int y = -1;
-    DisplayModel* dm = win->AsFixed();
-    if (dm) {
-        ScrollState ss = dm->GetScrollState();
-        y = (int)ss.y;
-        cur = ss.page;
-    }
-    return finish(fmt("OK page=%d y=%d", cur, y), 0);
+// orig has no favorites menu ids to report
+bool ControlFavoritesMenu(MainWindow*, Str, TempStr*) {
+    return false;
 }
 
-// action: "get" | "r2l" | "presentation" | "fullscreen"
-// Reports the current page layout and whether presentation / windowed
-// fullscreen is on. presentation/fullscreen toggle that mode first.
-static TempStr DisplayModeResultTemp(Str action, int* exitCodeOut) {
-    str::Builder out;
-    auto finish = [&](Str msg, int code) -> TempStr {
-        out.Append(msg);
-        out.AppendChar('\n');
-        if (exitCodeOut) {
-            *exitCodeOut = code;
-        }
-        return ToStrTemp(out);
-    };
-
-    if (len(gWindows) == 0) {
-        return finish(StrL("NOTREADY no-window"), 2);
-    }
-    MainWindow* win = gWindows[0];
-    if (!win || !win->IsDocLoaded() || !win->ctrl) {
-        return finish(StrL("NOTREADY no-doc"), 2);
-    }
-
-    bool reportR2L = str::EqI(action, StrL("r2l"));
-    if (str::EqI(action, StrL("zoom-real"))) {
-        return finish(fmt("OK zoomReal=%g", win->ctrl->GetZoomVirtual(true)), 0);
-    }
-    if (len(action) == 0 || str::EqI(action, StrL("get")) || reportR2L) {
-        // report only
-    } else if (str::EqI(action, StrL("presentation"))) {
-        ToggleFullScreen(win, win->AsFixed() != nullptr);
-    } else if (str::EqI(action, StrL("fullscreen"))) {
-        ToggleFullScreen(win, false);
-    } else {
-        return finish(fmt("ERROR unknown-action action=%s", action), 1);
-    }
-
-    if (reportR2L) {
-        DisplayModel* dm = win->AsFixed();
-        if (!dm) {
-            return finish(StrL("ERROR not-fixed-page"), 1);
-        }
-        AppCommandCtx ctx = NewAppCommandCtx(win);
-        bool available =
-            GetCommandVisibility(CmdToggleMangaMode, ctx, CommandSurface::Palette) == CommandVisibility::Show;
-        return finish(fmt("OK r2l=%d available=%d", dm->GetDisplayR2L() ? 1 : 0, available ? 1 : 0), 0);
-    }
-
-    Str mode = DisplayModeToString(win->ctrl->GetDisplayMode());
-    Str zoomLabel;
-    ZoomToString(&zoomLabel, win->ctrl->GetZoomVirtual(false), nullptr);
-    TempStr res = fmt("OK mode=%s presentation=%d fullscreen=%d zoom=%s", mode, win->InPresentation() ? 1 : 0,
-                      win->isFullScreen ? 1 : 0, zoomLabel);
-    str::Free(zoomLabel);
-    return finish(res, 0);
+void ControlTogglePresentation(MainWindow* win) {
+    ToggleFullScreen(win, win->AsFixed() != nullptr);
 }
 
-// Boxes the current page actually declares (issue #814). Optional int arg is pageNo.
-static TempStr PageBoxesResultTemp(int pageNo, int* exitCodeOut) {
-    str::Builder out;
-    auto finish = [&](Str msg, int code) -> TempStr {
-        out.Append(msg);
-        out.AppendChar('\n');
-        if (exitCodeOut) {
-            *exitCodeOut = code;
-        }
-        return ToStrTemp(out);
-    };
-
-    if (len(gWindows) == 0) {
-        return finish(StrL("NOTREADY no-window"), 2);
-    }
-    MainWindow* win = gWindows[0];
-    if (!win || !win->IsDocLoaded() || !win->ctrl) {
-        return finish(StrL("NOTREADY no-doc"), 2);
-    }
-    DisplayModel* dm = win->AsFixed();
-    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
-    if (!engine) {
-        return finish(StrL("ERROR not-fixed-page"), 1);
-    }
-    if (pageNo < 1) {
-        pageNo = win->ctrl->CurrentPageNo();
-    }
-    if (!win->ctrl->ValidPageNo(pageNo)) {
-        return finish(fmt("ERROR bad-page page=%d", pageNo), 1);
-    }
-    Vec<PdfPageBox> boxes;
-    engine->GetPdfPageBoxes(pageNo, boxes);
-    str::Builder line;
-    line.Append(fmt("OK page=%d show=%d", pageNo, win->showPageBoxes ? 1 : 0));
-    for (const PdfPageBox& box : boxes) {
-        line.Append(fmt(" %s=%.2f,%.2f,%.2f,%.2f", Str(PdfPageBoxName(box.kind)), box.rect.x, box.rect.y, box.rect.dx,
-                        box.rect.dy));
-    }
-    return finish(ToStrTemp(line), 0);
+void ControlToggleFullScreen(MainWindow* win) {
+    ToggleFullScreen(win, false);
 }
 
 // Reports sidebar vs canvas client x positions so tests can check SidebarOnRight.
@@ -381,23 +232,12 @@ static TempStr SidebarLayoutResultTemp(int* exitCodeOut) {
                   0);
 }
 
-struct LayoutProbeState {
-    MainWindow* win = nullptr;
-    int count = 0;
-    bool active = false;
-};
-
 static LayoutProbeState gLayoutProbe;
 
 static void LayoutProbeAfterLayout(MainWindow* win) {
     if (gLayoutProbe.active && gLayoutProbe.win == win) {
         gLayoutProbe.count++;
     }
-}
-
-static void AppendLayoutRect(str::Builder& out, Str name, bool visible, Rect rect) {
-    out.Append(
-        fmt("item name=%s visible=%d rect=%d,%d,%d,%d\n", name, visible ? 1 : 0, rect.x, rect.y, rect.dx, rect.dy));
 }
 
 static void AppendHwndLayoutRect(str::Builder& out, MainWindow* win, Str name, HWND hwnd) {
@@ -490,53 +330,6 @@ static TempStr LayoutInfoResultTemp(Str action, int* exitCodeOut) {
             out.Append(fmt("page n=%d shown=%d pos=%d,%d,%d,%d screen=%d,%d,%d,%d\n", pageNo, pi->isShown ? 1 : 0, p.x,
                            p.y, p.dx, p.dy, s.x, s.y, s.dx, s.dy));
         }
-    }
-    return finish({}, 0);
-}
-
-// Expand SelectionHandlers placeholders against the current tab's selection
-// (discussion #6015 ${selectionPosition}).
-static TempStr SelectionVarsResultTemp(Str pattern, int* exitCodeOut) {
-    str::Builder out;
-    auto finish = [&](Str msg, int code) -> TempStr {
-        out.Append(msg);
-        if (exitCodeOut) {
-            *exitCodeOut = code;
-        }
-        return ToStrTemp(out);
-    };
-    if (len(gWindows) == 0 || !gWindows[0]) {
-        return finish(StrL("NOTREADY no-window\n"), 2);
-    }
-    WindowTab* tab = gWindows[0]->CurrentTab();
-    bool isTextOnly = false;
-    TempStr sel = tab ? GetSelectedTextTemp(tab, StrL("\n"), isTextOnly) : TempStr{};
-    if (len(sel) == 0) {
-        sel = StrL("");
-    }
-    if (str::IsEmptyOrWhiteSpace(pattern)) {
-        pattern = StrL("${selectionPosition}");
-    }
-    TempStr expanded = ExpandSelectionVarsTemp(pattern, sel, false, 0, nullptr, tab);
-    out.Append(StrL("pattern="));
-    out.Append(pattern);
-    out.AppendChar('\n');
-    out.Append(StrL("expanded="));
-    out.Append(expanded);
-    out.AppendChar('\n');
-    if (tab && tab->selectionOnPage) {
-        out.Append(fmt("nrects=%d\n", len(*tab->selectionOnPage)));
-        for (SelectionOnPage& onPage : *tab->selectionOnPage) {
-            RectF r = onPage.rect;
-            out.Append(fmt("rect=%g,%g,%g,%g page=%d\n", r.x, r.y, r.dx, r.dy, onPage.pageNo));
-            if (onPage.HasQuad()) {
-                QuadF q = onPage.quad;
-                out.Append(fmt("quad=%g,%g %g,%g %g,%g %g,%g\n", q.ul.x, q.ul.y, q.ur.x, q.ur.y, q.ll.x, q.ll.y, q.lr.x,
-                               q.lr.y));
-            }
-        }
-    } else {
-        out.Append(StrL("nrects=0\n"));
     }
     return finish({}, 0);
 }
@@ -739,93 +532,6 @@ static TempStr MarkupAnnotsResultTemp(Str action, int x, int y, int* exitCodeOut
     return finish({}, 0);
 }
 
-static TempStr DocumentSignaturesResultTemp(int* exitCodeOut) {
-    auto finish = [exitCodeOut](Str result, int code) -> TempStr {
-        if (exitCodeOut) {
-            *exitCodeOut = code;
-        }
-        return str::DupTemp(result);
-    };
-    if (len(gWindows) == 0) {
-        return finish(StrL("NOTREADY no-window"), 2);
-    }
-    MainWindow* win = gWindows[0];
-    DisplayModel* dm = win ? win->AsFixed() : nullptr;
-    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
-    if (!engine) {
-        return finish(StrL("NOTREADY no-fixed-document"), 2);
-    }
-    EutlRegisterLookup();
-    Props props;
-    engine->GetProperties(props);
-    Str sigs = GetPropValueTemp(props, DocProp::Signatures);
-    if (len(sigs) == 0) {
-        return finish(StrL("ERROR no-signatures"), 1);
-    }
-    return finish(str::DupTemp(sigs), 0);
-}
-
-static TempStr DocumentFontListResultTemp(int* exitCodeOut) {
-    auto finish = [exitCodeOut](Str result, int code) -> TempStr {
-        if (exitCodeOut) {
-            *exitCodeOut = code;
-        }
-        return str::DupTemp(result);
-    };
-    if (len(gWindows) == 0) {
-        return finish(StrL("NOTREADY no-window"), 2);
-    }
-    MainWindow* win = gWindows[0];
-    DisplayModel* dm = win ? win->AsFixed() : nullptr;
-    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
-    if (!engine) {
-        return finish(StrL("NOTREADY no-fixed-document"), 2);
-    }
-    TempStr fonts = engine->GetPropertyTemp(DocProp::FontList);
-    if (len(fonts) == 0) {
-        return finish(StrL("ERROR no-fonts"), 1);
-    }
-    return finish(fmt("OK fonts=%s", fonts), 0);
-}
-
-static TempStr DocumentPropertiesResultTemp(int* exitCodeOut) {
-    auto finish = [exitCodeOut](Str result, int code) -> TempStr {
-        if (exitCodeOut) {
-            *exitCodeOut = code;
-        }
-        return str::DupTemp(result);
-    };
-    if (len(gWindows) == 0) {
-        return finish(StrL("NOTREADY no-window"), 2);
-    }
-    MainWindow* win = gWindows[0];
-    DisplayModel* dm = win ? win->AsFixed() : nullptr;
-    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
-    if (!engine) {
-        return finish(StrL("NOTREADY no-fixed-document"), 2);
-    }
-    Props props;
-    engine->GetProperties(props);
-    str::Builder out;
-    out.Append(StrL("OK"));
-    int n = PropsCount(props);
-    for (int i = 0; i < n; i++) {
-        TempStr name = PropNameTemp(props[i].prop);
-        if (len(name) == 0) {
-            continue;
-        }
-        out.Append(StrL("\n"));
-        out.Append(name);
-        out.Append(StrL("="));
-        out.Append(props[i].val);
-    }
-    // what Save As offers, and the sniffed type Properties shows
-    out.Append(fmt("\ndefaultExt=%s", engine->defaultExt));
-    FileType ft = GuessFileTypeFromFile(engine->FilePath());
-    out.Append(fmt("\nfileTypeExt=%s", GetExtForFileTypeTemp(ft)));
-    return finish(ToStrTemp(out), 0);
-}
-
 enum class ControlCmd : u16 {
     Ping = 1,
     Quit = 2,
@@ -935,147 +641,12 @@ enum class ControlCmd : u16 {
     TestFrameNcStrips = 114,
     TestMergePdf = 115,
     TestWheelWhileClosing = 116,
+    TestQuitProcess = 130,
+    TestRenameFile = 131,
+    TestChapterLayoutHold = 133,
 };
 
-enum class ControlArgType : u16 {
-    End = 0,
-    Int32 = 1,
-    Bytes = 2,
-    String = 3,
-    List = 4,
-};
-
-struct ControlArg {
-    ControlArgType type = ControlArgType::End;
-    i32 intVal = 0;
-    u8* bytes = nullptr;
-    u32 bytesLen = 0;
-    Str str;
-    Vec<ControlArg*>* list = nullptr;
-};
-
-static void DeleteControlArg(ControlArg* arg) {
-    if (!arg) {
-        return;
-    }
-    free(arg->bytes);
-    str::FreePtr(&arg->str);
-    if (arg->list) {
-        for (ControlArg* el : *arg->list) {
-            DeleteControlArg(el);
-        }
-        delete arg->list;
-    }
-    delete arg;
-}
-
-enum class RenderIdleState : u8 {
-    NotReady = 0,
-    Busy = 1,
-    Idle = 2,
-};
-
-struct ControlRequest {
-    u16 cmd = 0;
-    u16 reqId = 0;
-    Vec<ControlArg*> args;
-    str::Builder results;
-    HANDLE done = nullptr;
-    RenderIdleState idleState = RenderIdleState::NotReady;
-    char idleInfo[320]{};
-};
-
-static void DeleteControlRequest(ControlRequest* req) {
-    if (!req) {
-        return;
-    }
-    for (ControlArg* arg : req->args) {
-        DeleteControlArg(arg);
-    }
-    SafeCloseHandle(&req->done);
-    delete req;
-}
-
-struct PacketReader {
-    const u8* data = nullptr;
-    size_t size = 0;
-    size_t pos = 0;
-
-    bool ReadU16(u16& v) {
-        if (pos + 2 > size) {
-            return false;
-        }
-        v = (u16)(data[pos] | (data[pos + 1] << 8));
-        pos += 2;
-        return true;
-    }
-
-    bool ReadU32(u32& v) {
-        if (pos + 4 > size) {
-            return false;
-        }
-        v = (u32)data[pos] | ((u32)data[pos + 1] << 8) | ((u32)data[pos + 2] << 16) | ((u32)data[pos + 3] << 24);
-        pos += 4;
-        return true;
-    }
-
-    bool ReadBytes(u8* dst, size_t n) {
-        if (pos + n > size) {
-            return false;
-        }
-        memcpy(dst, data + pos, n);
-        pos += n;
-        return true;
-    }
-};
-
-static void AppendU16(str::Builder& s, u16 v) {
-    u8 buf[2] = {(u8)(v & 0xff), (u8)((v >> 8) & 0xff)};
-    s.Append(Str((char*)buf, (int)sizeof(buf)));
-}
-
-static void AppendU32(str::Builder& s, u32 v) {
-    u8 buf[4] = {(u8)(v & 0xff), (u8)((v >> 8) & 0xff), (u8)((v >> 16) & 0xff), (u8)((v >> 24) & 0xff)};
-    s.Append(Str((char*)buf, (int)sizeof(buf)));
-}
-
-static void AppendArgEnd(str::Builder& s) {
-    AppendU16(s, (u16)ControlArgType::End);
-}
-
-static void AppendArgInt(str::Builder& s, i32 v) {
-    AppendU16(s, (u16)ControlArgType::Int32);
-    AppendU32(s, (u32)v);
-}
-
-static void AppendArgString(str::Builder& s, Str str) {
-    if (len(str) == 0) {
-        str = StrL("");
-    }
-    size_t n = (size_t)str.len;
-    AppendU16(s, (u16)ControlArgType::String);
-    AppendU32(s, (u32)n);
-    s.Append(str);
-    s.AppendChar(0);
-}
-
-static bool ParseArg(PacketReader& r, ControlArg** argOut);
-
-static bool ParseArgList(PacketReader& r, Vec<ControlArg*>* args, bool explicitCount, u16 count = 0) {
-    for (u16 i = 0; !explicitCount || i < count; i++) {
-        ControlArg* arg = nullptr;
-        if (!ParseArg(r, &arg)) {
-            return false;
-        }
-        if (!arg) {
-            return !explicitCount;
-        }
-        VecAppend(*args, arg);
-    }
-    return true;
-}
-
-static bool ParseArg(PacketReader& r, ControlArg** argOut) {
+bool ParseArg(PacketReader& r, ControlArg** argOut) {
     u16 typeRaw = 0;
     if (!r.ReadU16(typeRaw)) {
         return false;
@@ -1141,44 +712,6 @@ static bool ParseArg(PacketReader& r, ControlArg** argOut) {
     }
     *argOut = arg;
     return true;
-}
-
-static ControlArg* ArgAt(ControlRequest* req, size_t idx, ControlArgType type) {
-    if (idx >= (size_t)len(req->args)) {
-        return nullptr;
-    }
-    ControlArg* arg = req->args[(int)idx];
-    if (arg->type != type) {
-        return nullptr;
-    }
-    return arg;
-}
-
-static Str StringArg(ControlRequest* req, size_t idx) {
-    ControlArg* arg = ArgAt(req, idx, ControlArgType::String);
-    return arg ? arg->str : Str{};
-}
-
-static bool IntArg(ControlRequest* req, size_t idx, i32& valOut) {
-    ControlArg* arg = ArgAt(req, idx, ControlArgType::Int32);
-    if (!arg) {
-        return false;
-    }
-    valOut = arg->intVal;
-    return true;
-}
-
-static void AppendError(ControlRequest* req, Str msg) {
-    req->results.Reset();
-    AppendArgInt(req->results, -1);
-    AppendArgString(req->results, msg);
-    AppendArgEnd(req->results);
-}
-
-static void AppendTestResult(ControlRequest* req, int exitCode, Str result) {
-    AppendArgInt(req->results, exitCode);
-    AppendArgString(req->results, result);
-    AppendArgEnd(req->results);
 }
 
 static void ExecuteControlRequest(ControlRequest* req) {
@@ -1575,15 +1108,19 @@ static void ExecuteControlRequest(ControlRequest* req) {
             Str imagePath = StringArg(req, 5);
             i32 appearanceFlags = -1;
             IntArg(req, 6, appearanceFlags);
+            i32 certifyLevel = 0;
+            IntArg(req, 7, certifyLevel);
+            i32 lockFlags = 0; // 1: lock fields, 2: lock document
+            IntArg(req, 8, lockFlags);
             if (len(pdfPath) == 0 || len(destPath) == 0) {
                 AppendError(
                     req, StrL("TestSignDocument expects string pdfPath, string destPath [, thumbprint] [, certPath] [, "
-                              "password] [, imagePath] [, appearanceFlags]"));
+                              "password] [, imagePath] [, appearanceFlags] [, certifyLevel] [, lockFlags]"));
                 break;
             }
             int exitCode = 0;
             Str res = SignDocumentResultTemp(pdfPath, destPath, thumbprint, certPath, certPassword, imagePath,
-                                             appearanceFlags, &exitCode);
+                                             appearanceFlags, certifyLevel, lockFlags, &exitCode);
             AppendTestResult(req, exitCode, res);
             break;
         }
@@ -1591,6 +1128,17 @@ static void ExecuteControlRequest(ControlRequest* req) {
         // What InitializePolicies actually granted. Used by the restrict.ini
         // GHSA test so it does not have to detect an IFileOpenDialog window
         // (that dialog is often hosted out-of-process and misses a 3s poll).
+        case ControlCmd::TestQuitProcess: {
+            i32 pid = 0;
+            if (!IntArg(req, 0, pid) || pid <= 0) {
+                AppendError(req, StrL("TestQuitProcess expects a process id"));
+                break;
+            }
+            bool gone = KillProcWithId((DWORD)pid, true);
+            AppendTestResult(req, gone ? 0 : 1, gone ? StrL("OK") : StrL("still running"));
+            break;
+        }
+
         case ControlCmd::TestGetPolicies: {
             str::Builder out;
             out.Append(fmt("restricted=%d\n", HasPermission(Perm::RestrictedUse) ? 1 : 0));
@@ -1601,6 +1149,7 @@ static void ExecuteControlRequest(ControlRequest* req) {
             out.Append(fmt("printer=%d\n", HasPermission(Perm::PrinterAccess) ? 1 : 0));
             out.Append(fmt("copy=%d\n", HasPermission(Perm::CopySelection) ? 1 : 0));
             out.Append(fmt("fullscreen=%d\n", HasPermission(Perm::FullscreenAccess) ? 1 : 0));
+            out.Append(fmt("aichat=%d\n", HasPermission(Perm::AIChat) ? 1 : 0));
             AppendTestResult(req, 0, ToStrTemp(out));
             break;
         }
@@ -1608,13 +1157,15 @@ static void ExecuteControlRequest(ControlRequest* req) {
         case ControlCmd::TestRenderPageColors: {
             Str path = StringArg(req, 0);
             if (len(path) == 0) {
-                AppendError(req, StrL("TestRenderPageColors expects string path [, int pageNo]"));
+                AppendError(req, StrL("TestRenderPageColors expects string path [, int pageNo] [, int zoomPercent]"));
                 break;
             }
             i32 pageNo = 1;
+            i32 zoomPercent = 100;
             IntArg(req, 1, pageNo);
+            IntArg(req, 2, zoomPercent);
             int exitCode = 0;
-            Str res = PageRenderColorsResultTemp(path, &exitCode, pageNo);
+            Str res = PageRenderColorsResultTemp(path, &exitCode, pageNo, zoomPercent);
             AppendTestResult(req, exitCode, res);
             break;
         }
@@ -2044,6 +1595,29 @@ static void ExecuteControlRequest(ControlRequest* req) {
             break;
         }
 
+        case ControlCmd::TestRenameFile: {
+            Str dstPath = StringArg(req, 0);
+            if (len(dstPath) == 0) {
+                AppendError(req, StrL("TestRenameFile expects string dstPath"));
+                break;
+            }
+            int exitCode = 0;
+            Str res = RenameFileResultTemp(dstPath, &exitCode);
+            AppendTestResult(req, exitCode, res);
+            break;
+        }
+
+        case ControlCmd::TestChapterLayoutHold: {
+            i32 hold = 0;
+            if (!IntArg(req, 0, hold)) {
+                AppendError(req, StrL("TestChapterLayoutHold expects int hold"));
+                break;
+            }
+            SetChapterLayoutHold(hold != 0);
+            AppendTestResult(req, 0, StrL("OK"));
+            break;
+        }
+
         case ControlCmd::TestImageOrientation: {
             Str pdfPath = StringArg(req, 0);
             i32 pageNo = 0;
@@ -2120,6 +1694,8 @@ static void ExecuteControlRequest(ControlRequest* req) {
                 ApplyAnnotFilterText(win, StringArg(req, 1));
             } else if (str::EqI(action, StrL("paint"))) {
                 PaintAnnotFilterWindow(win);
+            } else if (str::EqI(action, StrL("note"))) {
+                ToggleAnnotFilterNote(win);
             }
             AppendTestResult(req, 0, AnnotFilterToolbarStateTemp(win));
             break;
@@ -2392,31 +1968,31 @@ static void ExecuteControlRequest(ControlRequest* req) {
             AppendError(req, StrL("unknown control command"));
             break;
     }
-    SetEvent(req->done);
+    req->done.Set();
 }
 
 // Snapshot for WaitRenderIdle. Must run on the UI thread: window/doc state
 // and the cache walk both belong there. Does not block; the control thread
 // polls so WM_PAINT can still request missing tiles.
-static void SnapshotRenderIdle(ControlRequest* req) {
+void SnapshotRenderIdle(ControlRequest* req) {
     req->idleState = RenderIdleState::NotReady;
     req->idleInfo[0] = 0;
     if (gIsStartup) {
         // LoadOnStartup applies -zoom after the first paint; a snapshot
         // during that window would see the default-zoom tiles as "done"
         str::BufSet(Str(req->idleInfo, dimof(req->idleInfo)), StrL("startup"));
-        SetEvent(req->done);
+        req->done.Set();
         return;
     }
     if (len(gWindows) == 0) {
         str::BufSet(Str(req->idleInfo, dimof(req->idleInfo)), StrL("no-window"));
-        SetEvent(req->done);
+        req->done.Set();
         return;
     }
     MainWindow* win = gWindows[0];
     if (!win || !win->IsDocLoaded()) {
         str::BufSet(Str(req->idleInfo, dimof(req->idleInfo)), StrL("no-doc"));
-        SetEvent(req->done);
+        req->done.Set();
         return;
     }
     DisplayModel* dm = win->AsFixed();
@@ -2424,7 +2000,7 @@ static void SnapshotRenderIdle(ControlRequest* req) {
         // ebook / CHM / etc.: nothing in RenderCache to wait for
         req->idleState = RenderIdleState::Idle;
         str::BufSet(Str(req->idleInfo, dimof(req->idleInfo)), StrL("no-fixed"));
-        SetEvent(req->done);
+        req->done.Set();
         return;
     }
     // Paint first: that's what queues missing target tiles. Checking the
@@ -2471,147 +2047,35 @@ static void SnapshotRenderIdle(ControlRequest* req) {
                 fmt("zoomV=%.1f zoomR=%.3f res=%d vp=%dx%d ready=%d q=%d why=%s %s", zoomV, zoomR, (int)res, vp.dx,
                     vp.dy, ready ? 1 : 0, nQ, whyNot, busyInfo));
     req->idleState = ready ? RenderIdleState::Idle : (gRenderCache ? RenderIdleState::Busy : RenderIdleState::NotReady);
-    SetEvent(req->done);
+    req->done.Set();
 }
 
-// Block on the control thread until visible tiles are cached at target
-// resolution, or until timeoutMs. Optional first int arg is the timeout.
-static void RunWaitRenderIdle(ControlRequest* req) {
-    i32 timeoutMs = 15000;
-    IntArg(req, 0, timeoutMs);
-    if (timeoutMs < 1) {
-        timeoutMs = 1;
-    }
-    u64 deadline = GetTickCount64() + (u64)timeoutMs;
-    for (;;) {
-        ResetEvent(req->done);
-        uitask::Post(MkFunc0<ControlRequest>(SnapshotRenderIdle, req), "WaitRenderIdle");
-        WaitForSingleObject(req->done, INFINITE);
-        if (req->idleState == RenderIdleState::Idle) {
-            AppendTestResult(req, 0, req->idleInfo[0] ? Str(req->idleInfo) : StrL("idle"));
-            return;
-        }
-        if (GetTickCount64() >= deadline) {
-            Str kind = req->idleState == RenderIdleState::NotReady ? StrL("timeout-notready") : StrL("timeout-busy");
-            AppendTestResult(req, 1, req->idleInfo[0] ? fmt("%s %s", kind, Str(req->idleInfo)) : kind);
-            return;
-        }
-        Sleep(20);
-    }
-}
-
-static void SnapshotSessionRestore(ControlRequest* req) {
+void SnapshotSessionRestore(ControlRequest* req) {
     req->idleState = RenderIdleState::NotReady;
     req->idleInfo[0] = 0;
     if (!IsSessionRestoreFinished() || gIsStartup) {
         str::BufSet(Str(req->idleInfo, dimof(req->idleInfo)), StrL("startup"));
-        SetEvent(req->done);
+        req->done.Set();
         return;
     }
     if (HasPendingDocumentLoads()) {
         str::BufSet(Str(req->idleInfo, dimof(req->idleInfo)), StrL("loading"));
-        SetEvent(req->done);
+        req->done.Set();
         return;
     }
     if (len(gWindows) > 0 && gWindows[0] && gWindows[0]->uiState.updatePending) {
         str::BufSet(Str(req->idleInfo, dimof(req->idleInfo)), StrL("ui-pending"));
-        SetEvent(req->done);
+        req->done.Set();
         return;
     }
     req->idleState = RenderIdleState::Idle;
     str::BufSet(Str(req->idleInfo, dimof(req->idleInfo)), StrL("restored"));
-    SetEvent(req->done);
-}
-
-static void RunWaitSessionRestored(ControlRequest* req) {
-    i32 timeoutMs = 15000;
-    IntArg(req, 0, timeoutMs);
-    if (timeoutMs < 1) {
-        timeoutMs = 1;
-    }
-    u64 deadline = GetTickCount64() + (u64)timeoutMs;
-    for (;;) {
-        ResetEvent(req->done);
-        uitask::Post(MkFunc0<ControlRequest>(SnapshotSessionRestore, req), "WaitSessionRestored");
-        WaitForSingleObject(req->done, INFINITE);
-        if (req->idleState == RenderIdleState::Idle) {
-            AppendTestResult(req, 0, req->idleInfo[0] ? Str(req->idleInfo) : StrL("restored"));
-            return;
-        }
-        if (GetTickCount64() >= deadline) {
-            AppendTestResult(req, 1, req->idleInfo[0] ? fmt("timeout %s", Str(req->idleInfo)) : StrL("timeout"));
-            return;
-        }
-        Sleep(20);
-    }
-}
-
-static bool ReadExact(HANDLE h, void* data, DWORD n) {
-    u8* d = (u8*)data;
-    DWORD total = 0;
-    while (total < n) {
-        DWORD nRead = 0;
-        if (!ReadFile(h, d + total, n - total, &nRead, nullptr) || nRead == 0) {
-            return false;
-        }
-        total += nRead;
-    }
-    return true;
-}
-
-static bool WriteExact(HANDLE h, Str data) {
-    const u8* d = (const u8*)data.s;
-    int total = 0;
-    while (total < data.len) {
-        DWORD nWritten = 0;
-        if (!WriteFile(h, d + total, (DWORD)(data.len - total), &nWritten, nullptr) || nWritten == 0) {
-            return false;
-        }
-        total += (int)nWritten;
-    }
-    return true;
-}
-
-static ControlRequest* ReadControlRequest(HANDLE h) {
-    u32 size = 0;
-    if (!ReadExact(h, &size, sizeof(size))) {
-        return nullptr;
-    }
-    if (size < 4 || size > 16 * 1024 * 1024) {
-        return nullptr;
-    }
-    u8* data = AllocArray<u8>((int)size);
-    if (!ReadExact(h, data, size)) {
-        free(data);
-        return nullptr;
-    }
-
-    PacketReader r{data, size};
-    ControlRequest* req = new ControlRequest();
-    if (!r.ReadU16(req->cmd) || !r.ReadU16(req->reqId) || !ParseArgList(r, &req->args, false)) {
-        DeleteControlRequest(req);
-        free(data);
-        return nullptr;
-    }
-    req->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    free(data);
-    return req;
-}
-
-static bool WriteControlResponse(HANDLE h, ControlRequest* req) {
-    str::Builder payload;
-    AppendU16(payload, req->reqId);
-    payload.Append(ToStr(req->results));
-
-    str::Builder packet;
-    AppendU32(packet, (u32)len(payload));
-    packet.Append(ToStr(payload));
-    return WriteExact(h, ToStr(packet));
+    req->done.Set();
 }
 
 // returns true if the app is quitting, so the listener thread should exit
 // instead of blocking in ConnectNamedPipe (ASan shutdown hangs on that)
-static bool ProcessControlConnection(HANDLE h) {
+bool ProcessControlConnection(HANDLE h) {
     for (;;) {
         ControlRequest* req = ReadControlRequest(h);
         if (!req) {
@@ -2630,52 +2094,12 @@ static bool ProcessControlConnection(HANDLE h) {
             RunWaitSessionRestored(req);
         } else {
             uitask::Post(MkFunc0<ControlRequest>(ExecuteControlRequest, req), "SumatraControl");
-            WaitForSingleObject(req->done, INFINITE);
+            req->done.Wait();
         }
         bool ok = WriteControlResponse(h, req);
         DeleteControlRequest(req);
         if (!ok || isQuit) {
             return isQuit;
-        }
-    }
-}
-
-static WStr FullPipeNameOwned(Str pipeName) {
-    if (str::StartsWith(pipeName, StrL(R"(\\.\pipe\)"))) {
-        return ToWStr(pipeName);
-    }
-    TempStr fullName = str::JoinTemp(StrL(R"(\\.\pipe\)"), pipeName);
-    return ToWStr(fullName);
-}
-
-struct ControlThreadArg {
-    Str pipeName;
-};
-
-static void SumatraControlThread(ControlThreadArg* arg) {
-    WStr pipeNameW = FullPipeNameOwned(arg->pipeName);
-    str::FreePtr(&arg->pipeName);
-    delete arg;
-
-    for (;;) {
-        HANDLE pipe = CreateNamedPipeW(pipeNameW.s, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                                       1, 64 * 1024, 64 * 1024, 0, nullptr);
-        if (pipe == INVALID_HANDLE_VALUE) {
-            logf("CreateNamedPipeW failed for control pipe, err=%u\n", (unsigned)GetLastError());
-            return;
-        }
-        BOOL connected = ConnectNamedPipe(pipe, nullptr) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-        bool stop = false;
-        if (connected) {
-            stop = ProcessControlConnection(pipe);
-        }
-        // DisconnectNamedPipe discards data the client hasn't read yet; wait
-        // until it has, or the Quit reply is lost and the client sees EPIPE
-        FlushFileBuffers(pipe);
-        DisconnectNamedPipe(pipe);
-        CloseHandle(pipe);
-        if (stop) {
-            return;
         }
     }
 }

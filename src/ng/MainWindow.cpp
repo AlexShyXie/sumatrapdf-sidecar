@@ -1,0 +1,621 @@
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
+   License: GPLv3 */
+
+// ng: orig's MainWindow.cpp owns the frame HWND and the link handler. Here it
+// owns the window's tabs, its document controller callback and the gpui window
+// it draws into; the rest of orig's file (LinkHandler, tooltips, UIA, caption)
+// arrives with steps 7-9.
+
+#include "gui/GpuiBridge.h"
+#include "base/File.h"
+#include "base/Launch.h"
+#include "base/Win.h"
+
+#include "gui/UIModels.h"
+
+#include "Settings.h"
+#include "AppTools.h"
+#include "AppSettings.h"
+#include "DisplayMode.h"
+#include "DocController.h"
+#include "EngineBase.h"
+#include "base/GuessFileType.h"
+#include "EngineAll.h"
+#include "ChmModel.h"
+#include "MarkdownModel.h"
+#include "DisplayModel.h"
+#include "RenderCache.h"
+#include "TextSelection.h"
+#include "CommandAvailability.h"
+#include "ExternalViewers.h"
+#include "Menu.h"
+#include "Notifications.h"
+#include "Translations.h"
+#include "SumatraPDF.h"
+#include "Tabs.h"
+#include "ReadingAutoScroll.h"
+#include "ReadAloud.h"
+#include "AIChatCommon.h"
+#include "AIChatPanel.h"
+#include "OverlayScrollbar.h"
+#include "MainWindow.h"
+#include "WindowTab.h"
+#include "gui/AppShell.h"
+#include "gui/DocCanvas.h"
+#include "SelectionToolbar.h"
+#include "Annotation.h"
+#include "AnnotEditToolbar.h"
+#include "AnnotFilterToolbar.h"
+#include "AnnotTextPopup.h"
+#include "RefHover.h"
+#include "ProgressUpdateUI.h"
+#include "TextSearch.h"
+#include "SearchAndDDE.h"
+#include "StressTesting.h"
+#include "FindBar.h"
+#include "FindWindow.h"
+#include "Toolbar.h"
+#include "TableOfContents.h"
+#include "gui/Sidebar.h"
+#include "gui/TabsUI.h"
+#include "gui/TabSwitcher.h"
+#include "HomePage.h"
+#include "ImageSaveCropResize.h"
+#include "MainWindowCommon.h"
+
+#include "SumatraLog.h"
+
+// the model calls back into the window: repaint, scrollbars, rendering.
+// ng: the render requests go to the shared RenderCache (the render happens on
+// a worker thread and comes back through uitask); the scrollbar update fills
+// the canvas' CanvasScrollInfo the way orig fills the canvas HWND's SCROLLINFO.
+struct ControllerCallbackHandler : DocControllerCallback {
+    MainWindow* win{nullptr};
+
+    explicit ControllerCallbackHandler(MainWindow* win) : win(win) {}
+    ~ControllerCallbackHandler() override = default;
+
+    void Repaint() override { AppShellInvalidate(win); }
+    void PageNoChanged(DocController* ctrl, int pageNo) override {
+        if (win->ctrl != ctrl) {
+            return;
+        }
+        logf("PageNoChanged: %d\n", pageNo);
+        // each .md / .html is a page of one model. The tab path has to follow
+        // the file on screen, or next-file reloads and rebuilds the outline.
+        MarkdownModel* md = ctrl ? ctrl->AsMarkdown() : nullptr;
+        if (md && md->ValidPageNo(pageNo)) {
+            WindowTab* tab = win->CurrentTab();
+            Str pagePath = md->GetFilePath();
+            if (tab && len(pagePath) > 0 && !path::IsSame(tab->filePath, pagePath)) {
+                tab->SetFilePath(pagePath);
+                tab->SetDisplayName({});
+                TabsOnChangedDoc(win);
+                UpdateWindowTitle(win);
+            }
+        }
+        win->currPageNo = pageNo;
+        UpdateTocSelection(win, pageNo);
+        ShowPageInfoIfWanted(win);
+        AppShellInvalidate(win);
+    }
+    void ZoomChanged(DocController*, float zoomVirtual) override {
+        logf("ZoomChanged: %.2f\n", (double)zoomVirtual);
+        ShowPageInfoIfWanted(win);
+        AppShellInvalidate(win);
+    }
+    void UpdateScrollbars(DisplayModel* dm, Size canvas) override { CanvasUpdateScrollbars(win, dm, canvas); }
+    void RequestRendering(DisplayModel* dm, int pageNo) override {
+        if (gRenderCache) {
+            gRenderCache->RequestRendering(dm, pageNo);
+        }
+    }
+    void RequestPredictiveRendering(DisplayModel* dm, int originPageNo, const int* pages, int nPages) override {
+        if (gRenderCache) {
+            gRenderCache->RequestPredictiveRendering(dm, originPageNo, pages, nPages);
+        }
+    }
+    void CleanUp(DisplayModel* dm) override {
+        if (gRenderCache) {
+            gRenderCache->FreeForDisplayModel(dm);
+        }
+    }
+    void RenderThumbnail(DisplayModel*, Size, const OnBitmapRendered*) override {}
+    void GotoLink(IPageDestination* dest) override {
+        if (win->linkHandler) {
+            win->linkHandler->GotoLink(dest);
+        }
+    }
+    void FocusFrame(bool) override {}
+    void SaveDownload(Str, Str) override {}
+    void FindResultReceived(int, int, int) override {}
+    void FindAllResultReceived(Str) override {}
+    void TocChanged(DocController* ctrl) override;
+    void PagesRenumbered(DisplayModel* dm) override {
+        if (win->AsFixed() == dm) {
+            UpdateTocSelection(win, dm->CurrentPageNo());
+        }
+        AppShellInvalidate(win);
+    }
+};
+
+// the controller swapped in a new TocTree (a background heading / markdown
+// ToC arrived); orig's ControllerCallbackHandler::TocChanged
+void ControllerCallbackHandler::TocChanged(DocController* ctrl) {
+    WindowTab* tab = win->CurrentTab();
+    if (!tab || tab->ctrl != ctrl) {
+        if (tab) {
+            tab->currToc = nullptr;
+        }
+        return;
+    }
+    if (win->tocLoaded) {
+        ReloadTocTree(tab);
+    } else if (tab->showToc && !win->InPresentation()) {
+        // presentation mode has its own sidebar state (tab->showTocPresentation)
+        SetSidebarVisibility(win, true, gSettings->showFavorites);
+    }
+    AppShellInvalidate(win);
+}
+
+DocControllerCallback* CreateControllerCallbackHandler(MainWindow* win) {
+    return new ControllerCallbackHandler(win);
+}
+
+// --- LinkHandler ------------------------------------------------------------
+
+// ng: orig's LinkHandler, from this file. What is not ported: the JavaScript
+// menu destination (orig's TrackPopupMenu at the cursor; the port has no popup
+// it can open from code and wait on). It is marked below.
+static void LaunchEmbeddedDestination(MainWindow* win, PageDestination* pd) {
+    if (pd->embedObjNum <= 0) {
+        return;
+    }
+    EngineBase* engine = win->CurrentTab()->AsFixed()->GetEngine();
+    Str data = EngineMupdfLoadAnnotAttachment(engine, pd->embedObjNum);
+    if (len(data) == 0) {
+        return;
+    }
+    Str fileName = pd->GetValue();
+    logf("GotoLink: opening file attachment annotation '%s', objNum: %d, size: %d\n", fileName, pd->embedObjNum,
+         len(data));
+    if (OpenDocumentFromMemory(win, data, fileName)) {
+        str::Free(data);
+        return;
+    }
+    TempStr tmpDir = GetTempDirPathTemp();
+    TempStr tmpPath = path::JoinTemp(tmpDir, path::GetBaseNameTemp(fileName));
+    if (len(tmpDir) == 0 || !file::WriteFile(tmpPath, data)) {
+        str::Free(data);
+        return;
+    }
+    // a type the shell isn't allowed to open is shown in the file manager instead
+    if (OpenFileExternally(tmpPath)) {
+        logf("LaunchEmbeddedDestination: opened '%s'\n", tmpPath);
+    } else {
+        logf("LaunchEmbeddedDestination: showing '%s' in the file manager\n", tmpPath);
+        OpenPathInDefaultFileManager(tmpPath);
+    }
+    str::Free(data);
+}
+
+void LinkHandler::GotoLink(IPageDestination* dest) {
+    ReportIf(!win || win->linkHandler != this);
+    if (!dest || !win || !win->IsDocLoaded()) {
+        return;
+    }
+
+    Kind kind = dest->GetKind();
+
+    if (kindDestinationScrollTo == kind) {
+        ScrollTo(dest);
+        return;
+    }
+    if (kindDestinationLaunchURL == kind) {
+        auto* d = (PageDestinationURL*)dest;
+        LaunchURL(d->url);
+        return;
+    }
+    if (kindDestinationLaunchFile == kind) {
+        PageDestinationFile* fileDest = (PageDestinationFile*)dest;
+        this->LaunchFile(fileDest->path, dest);
+        return;
+    }
+    if (kindDestinationLaunchEmbedded == kind) {
+        LaunchEmbeddedDestination(win, (PageDestination*)dest);
+        return;
+    }
+    if (kindDestinationAttachment == kind) {
+        // Not handled here. Must use context menu to trigger launching
+        // embedded files
+        return;
+    }
+    // ng: kindDestinationJsMenu needs a popup menu at the cursor.
+    logf("LinkHandler::GotoLink: unhandled kind %s\n", Str(kind));
+}
+
+// for safety, only handle relative paths and only open them in SumatraPDF
+// (unless they're of an allowed perceived type)
+void LinkHandler::LaunchFile(Str pathOrig, IPageDestination* remoteLink) {
+    if (!CanAccessDisk()) {
+        return;
+    }
+
+#if OS_WIN
+    TempStr path = str::ReplaceTemp(pathOrig, StrL("/"), StrL("\\"));
+    str::TrimPrefix(path, StrL(".\\"));
+#else
+    // A native absolute path. Rewriting '/' to '\\' makes it miss the file.
+    TempStr path = str::DupTemp(pathOrig);
+    str::TrimPrefix(path, StrL("./"));
+#endif
+
+    TempStr fullPath = path;
+#if OS_WIN
+    bool isAbsPath = str::StartsWith(path, StrL("\\"));
+    if (len(path) >= 2 && path.s[1] == ':') {
+        /* technically c: is not abs, only c:\\ */
+        isAbsPath = true;
+    }
+#else
+    bool isAbsPath = path::IsAbsolute(path);
+#endif
+    if (!isAbsPath) {
+        auto dir = path::GetDirTemp(win->ctrl->GetFilePath());
+        fullPath = path::JoinTemp(dir, path);
+        fullPath = path::NormalizeTemp(fullPath);
+    }
+    path::Type pathType = path::GetType(fullPath);
+    if (pathType == path::Type::None) {
+        TempStr msg = fmt(Tr("Error loading %s").s, fullPath);
+        ShowWarningNotification(win, msg, kNotif5SecsTimeOut);
+        return;
+    }
+    // a directory or a file we can't open is shown in the file manager, never
+    // handed to the shell to open (it could be an executable)
+    if (pathType == path::Type::Dir || !IsFileSupportedByContent(fullPath)) {
+        OpenPathInDefaultFileManager(fullPath);
+        return;
+    }
+
+    MainWindow* targetWin = LoadDocument(win, fullPath);
+    if (!targetWin || !targetWin->IsDocLoaded() || !remoteLink) {
+        return;
+    }
+
+    // remoteLink's page and rect are in the source document: only its name means
+    // something in the target
+    Str destName = remoteLink->GetName();
+    if (len(destName) == 0) {
+        return;
+    }
+    CleanRemoteDestNameInPlace(destName);
+    IPageDestination* dest = targetWin->ctrl->GetNamedDest(destName);
+    if (dest) {
+        ((LinkHandler*)targetWin->linkHandler)->ScrollTo(dest);
+    }
+}
+
+// Select and scroll the ToC tree to tocItem.
+void SelectTocItemInTree(MainWindow* win, TocItem* tocItem) {
+    if (!win || !tocItem || !win->tocLoaded) {
+        return;
+    }
+    SidebarSetTocSelection(win, tocItem);
+}
+
+MainWindow::MainWindow(gpui::Window* w) {
+    gpuiWin = w;
+    sidebarBottomContent =
+        SidebarContentFromStr(gSettings ? gSettings->sidebarBottomView : Str{}, SidebarContent::Favorites);
+    sidebarDx = gSettings ? gSettings->sidebarDx : 0;
+    if (sidebarDx < kSidebarMinDx) {
+        sidebarDx = kSidebarMinDx;
+    }
+    linkHandler = new LinkHandler(this);
+    cbHandler = CreateControllerCallbackHandler(this);
+    tabSelectionHistory = new Vec<WindowTab*>();
+}
+
+MainWindow::~MainWindow() {
+    isBeingClosed = true;
+    FinishStressTest(this);
+    // the find / count workers hold this window; join them before it goes away
+    AbortFinding(this, true);
+    ClearFindMatches(this);
+    str::Free(findCountText);
+    str::Free(findPageRangeText);
+    str::Free(findCountRangeText);
+    str::Free(findCountPendingText);
+    str::Free(browserFindTerm);
+    VecReset(findCountPositions);
+    DeleteFindBar(this);
+    DeleteFindWindow(this);
+    DestroyToolbar(this);
+    DeleteSelectionToolbar(this);
+    DeleteAnnotEditToolbar(this);
+    DeleteAnnotFilterToolbar(this);
+    DeleteAnnotationTextPopup(this);
+    DeleteAnnotationHoverOverlay(this);
+    RefHoverDestroy(refHover);
+    refHover = nullptr;
+    ReadingAutoScrollDestroy(this);
+    ReadAloudPlaybackBarDestroy(this);
+    OverlayScrollbarsDelete(this);
+    SidebarDelete(this);
+    TabsUIDelete(this);
+    TabSwitcherDelete(this);
+    DocCanvasDelete(this);
+    HomePageDelete(this);
+    AppShellDeleteWindow(this);
+    delete tocFilteredTree;
+    tocFilteredTree = nullptr;
+    VecReset(tocMatchingItems);
+    VecReset(expandedFavorites);
+    // the tabs own their controllers; ctrl points into the current one
+    ctrl = nullptr;
+    currentTabTemp = nullptr;
+    for (WindowTab* tab : tabs) {
+        delete tab;
+    }
+    VecReset(tabs);
+    delete tabSelectionHistory;
+    tabSelectionHistory = nullptr;
+    DeleteMenuModel(menu);
+    menu = nullptr;
+    delete cbHandler;
+    cbHandler = nullptr;
+    delete linkHandler;
+    linkHandler = nullptr;
+    str::Free(linkTooltip);
+    VecReset(linkFollowTargets);
+}
+
+bool MainWindow::IsDocLoaded() const {
+    return ctrl != nullptr;
+}
+
+WindowTab* MainWindow::CurrentTab() const {
+    return currentTabTemp;
+}
+
+int MainWindow::TabCount() const {
+    return tabs.len;
+}
+
+WindowTab* MainWindow::GetTab(int idx) const {
+    if (idx < 0 || idx >= tabs.len) {
+        return nullptr;
+    }
+    return tabs[idx];
+}
+
+int MainWindow::GetTabIdx(WindowTab* tab) const {
+    for (int i = 0; i < tabs.len; i++) {
+        if (tabs[i] == tab) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+Vec<WindowTab*> MainWindow::Tabs() const {
+    Vec<WindowTab*> res;
+    for (int i = 0; i < tabs.len; i++) {
+        VecAppend(res, tabs[i]);
+    }
+    return res;
+}
+
+Size MainWindow::GetViewPortSize() const {
+    return Size{canvasRc.dx, canvasRc.dy};
+}
+
+// orig's deferred canvas repaint: here every repaint is the next frame
+void ScheduleRepaint(MainWindow* win, int) {
+    AppShellInvalidate(win);
+}
+
+void MainWindow::RedrawCanvas() const {
+    AppShellInvalidate(const_cast<MainWindow*>(this));
+}
+
+void MainWindow::RedrawAll(bool) const {
+    AppShellInvalidate(const_cast<MainWindow*>(this));
+}
+
+void MainWindow::Focus() const {
+    AppShellActivateWindow(const_cast<MainWindow*>(this));
+}
+
+void MainWindow::MoveDocBy(int dx, int dy) const {
+    WindowTab* tab = CurrentTab();
+    if (tab) {
+        tab->MoveDocBy(dx, dy);
+    }
+}
+
+void MainWindow::ChangePresentationMode(PresentationMode mode) {
+    presentation = mode;
+    if (PM_BLACK_SCREEN == mode || PM_WHITE_SCREEN == mode) {
+        DeleteLinkTooltip(this);
+    }
+    RedrawAll();
+}
+
+// ng: orig has these in CommandAvailability.cpp; they are the only part of it
+// that needs MainWindow / WindowTab, and keeping them out lets the command
+// policy link into the console tools. Bodies are orig's.
+static void PopulateTabCloseFlags(AppCommandCtx& ctx) {
+    if (!ctx.win) {
+        return;
+    }
+    int nTabs = ctx.win->TabCount();
+    ctx.nTabs = nTabs;
+    WindowTab* currTab = ctx.tab;
+    int tabIdx = ctx.win->GetTabIdx(currTab);
+    ctx.canCloseTabsToRight = tabIdx < (nTabs - 1);
+    ctx.canCloseTabsToLeft = false;
+    int nFirstDocTab = 0;
+    for (int i = 0; i < nTabs; i++) {
+        WindowTab* t = ctx.win->GetTab(i);
+        if (t->IsAboutTab()) {
+            nFirstDocTab = 1;
+            continue;
+        }
+        ctx.hasDocTabs = true;
+        if (t == currTab) {
+            if (i > nFirstDocTab) {
+                ctx.canCloseTabsToLeft = true;
+            }
+            continue;
+        }
+        ctx.canCloseOtherTabs = true;
+    }
+}
+
+AppCommandCtx NewAppCommandCtx(MainWindow* win, Point cursorPos) {
+    AppCommandCtx ctx;
+    ctx.win = win;
+    ctx.cursorPos = cursorPos;
+    if (!win) {
+        return ctx;
+    }
+
+    ctx.tab = win->CurrentTab();
+    ctx.isDocLoaded = win->IsDocLoaded();
+    ctx.filePath = ctx.tab ? ctx.tab->filePath : Str();
+    ctx.allowToggleMenuBar = true;
+    ctx.hasOpenDocuments = HasOpenedDocuments(win);
+    ctx.debugDpiOverrideAvailable = true;
+
+    if (ctx.tab) {
+        ctx.autoScrollOn = ctx.tab->autoScroll.on;
+        ctx.readingBarOn = ctx.tab->readingBar.on;
+        ctx.isChm = ctx.tab->AsChm() || ctx.tab->AsMarkdown();
+        Str currentPath = win->ctrl ? win->ctrl->GetFilePath() : ctx.filePath;
+        ctx.isMarkdown = str::EndsWithI(currentPath, StrL(".md")) || str::EndsWithI(currentPath, StrL(".markdown"));
+        EngineBase* engine = ctx.tab->GetEngine();
+        if (engine && engine->kind == kindEngineComicBooks) {
+            ctx.isCbx = true;
+        }
+        if (engine && engine->isImageCollection) {
+            ctx.isImageCollection = true;
+        }
+        ctx.isReflowable = engine && engine->isReflowable;
+        ctx.engineKind = ctx.tab->GetEngineType();
+        ctx.engineHasErrors = engine && engine->HasErrors();
+        ctx.canSendEmail = CanSendAsEmailAttachment(ctx.tab);
+#ifndef DISABLE_DOCUMENT_RESTRICTIONS
+        ctx.allowsPrinting = !win->AsFixed() || (engine && engine->AllowsPrinting());
+#endif
+        ctx.isPdf = IsPdfDoc(ctx.tab);
+        if (ctx.isPdf && engine) {
+            ctx.isPdfEncrypted = EngineMupdfIsEncrypted(engine);
+        }
+        ctx.hideAnnotations = ctx.tab->hideAnnotations;
+        ctx.selectedAnnotation = ctx.tab->selectedAnnotation;
+        ctx.canContinueReadAloud = CanContinueReadAloud(ctx.tab);
+    }
+    ctx.ttsAvailable = TtsIsAvailable();
+    ctx.isSpeaking = TtsIsSpeaking();
+    ctx.clipboardHasImage = ImageEditHasClipboard(win);
+    ctx.clipboardReadAsync = OS_WASM;
+
+    ctx.aiChatAvailable = IsAIChatAvailable();
+    ctx.aiChatSupported = IsAIChatSupportedForTab(ctx.tab);
+    ctx.grokInstalled = IsBackendInstalled(AIChatBackend::Grok);
+    ctx.claudeInstalled = IsBackendInstalled(AIChatBackend::Claude);
+    ctx.codexInstalled = IsBackendInstalled(AIChatBackend::Codex);
+    ctx.antiGravityInstalled = IsBackendInstalled(AIChatBackend::AntiGravity);
+
+    ctx.hasSelection = ctx.isDocLoaded && ctx.tab && win->showSelection && ctx.tab->selectionOnPage;
+
+    if (ctx.isDocLoaded && win->ctrl) {
+        ctx.isSinglePage = IsSingle(win->ctrl->GetDisplayMode());
+        ctx.pageCount = win->ctrl->PageCount();
+        ctx.hasToc = win->ctrl->HasToc();
+    }
+
+    DisplayModel* dm = win->AsFixed();
+    if (dm) {
+        ctx.isFixedPage = true;
+        auto* engine = dm->GetEngine();
+        ctx.hasTextSelection = ctx.hasSelection && dm->textSelection->result.len > 0;
+        ctx.supportsAnnots = EngineSupportsAnnotations(engine);
+        ctx.hasUnsavedAnnotations = EngineHasUnsavedAnnotations(engine);
+        ctx.hasRedactMarks = EngineHasRedactMarks(engine);
+        ctx.hasUserRedactMarks = EngineHasUserRedactMarks(engine);
+        ctx.canUndo = EngineMupdfCanUndo(engine);
+        ctx.canRedo = EngineMupdfCanRedo(engine);
+        int pageNoUnderCursor = dm->GetPageNoByPoint(cursorPos);
+        if (pageNoUnderCursor > 0) {
+            ctx.isCursorOnPage = true;
+        }
+        // (0, 0) is "no point": keep the hover. A real point is hit-tested
+        // and must not reuse a stale hover.
+        if (cursorPos.IsEmpty()) {
+            ctx.annotationUnderCursor = win->annotationUnderCursor;
+        } else {
+            ctx.annotationUnderCursor = dm->GetAnnotationAtPos(cursorPos, win->annotationUnderCursor);
+        }
+        IPageElement* pageEl = dm->GetElementAtPos(cursorPos, nullptr);
+        if (pageEl) {
+            Str value = pageEl->GetValue();
+            ctx.cursorOnLinkTarget = pageEl->Is(kindPageElementDest) && PageDestHasAddress(pageEl->AsLink());
+            ctx.cursorOnComment = value && pageEl->Is(kindPageElementComment);
+            ctx.cursorOnImage = pageEl->Is(kindPageElementImage);
+        }
+        if (ctx.annotationUnderCursor) {
+            ctx.cursorOnComment = !str::IsEmptyOrWhiteSpace(Contents(ctx.annotationUnderCursor));
+        }
+    }
+
+    if (!CanAccessDisk()) {
+        ctx.supportsAnnots = false;
+        ctx.hasUnsavedAnnotations = false;
+    }
+
+    PopulateTabCloseFlags(ctx);
+    return ctx;
+}
+
+#if OS_WIN
+HWND MainWindowHwnd(MainWindow* win) {
+    return AppShellNativeHwnd(win);
+}
+
+MainWindow* FindMainWindowByHwnd(HWND hwnd) {
+    return AppShellWindowFromHwnd(hwnd);
+}
+#endif
+
+// ng: orig's FindMainWindowByHwnd; the gpui window is what identifies a window
+MainWindow* FindMainWindowByGpuiWindow(gpui::Window* gw) {
+    if (!gw) {
+        return nullptr;
+    }
+    for (MainWindow* win : gWindows) {
+        if (win->gpuiWin == gw) {
+            return win;
+        }
+    }
+    return nullptr;
+}
+
+WindowTab* FindTabByFilePath(Str path, MainWindow* limitWin) {
+    if (len(path) == 0) {
+        return nullptr;
+    }
+    for (MainWindow* win : gWindows) {
+        if (limitWin && win != limitWin) {
+            continue;
+        }
+        for (WindowTab* tab : win->Tabs()) {
+            if (path::IsSame(tab->filePath, path)) {
+                return tab;
+            }
+        }
+    }
+    return nullptr;
+}

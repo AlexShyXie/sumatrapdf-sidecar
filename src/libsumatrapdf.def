@@ -28,6 +28,8 @@ EXPORTS
 
 	mudraw_main
 
+	mubar_main
+
 	mutrace_main
 
 	murun_main
@@ -187,6 +189,7 @@ EXPORTS
 	fz_get_pixmap_from_image
 
 	fz_new_device_of_size
+	fz_new_passthrough_device_of_size
 
 	fz_load_outline
 	fz_new_outline_iterator
@@ -209,6 +212,11 @@ EXPORTS
 	pdf_obj_num_is_stream
 
 	pdf_dict_get_inheritable
+	pdf_dict_get_int
+	pdf_dict_put_int
+	pdf_dict_put_dict
+	pdf_dict_put_array
+	pdf_signature_byte_range
 
 	pdf_new_utf8_from_pdf_string_obj
 
@@ -223,6 +231,8 @@ EXPORTS
 	install_load_windows_font_funcs
 
 	fz_set_builtin_font_loader
+
+	sumatra_lookup_font_url
 
 	pdf_page_transform
 
@@ -283,6 +293,7 @@ EXPORTS
 	fz_set_warning_callback
 
 	fz_set_error_callback
+	fz_set_stddbg
 
 	fz_new_buffer_from_shared_data
 
@@ -398,6 +409,8 @@ EXPORTS
 	fz_compressed_buffer_size
 
 	fz_compressed_image_buffer
+
+	fz_unwrap_display_list_image
 
 	fz_open_compressed_buffer
 

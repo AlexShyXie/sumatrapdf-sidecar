@@ -142,10 +142,13 @@ function extractTranslationStrings(s: string): string[] {
 
 function getFilesToProcess(): string[] {
   const res: string[] = [];
-  const entries = readdirSync("src", { withFileTypes: true });
-  for (const entry of entries) {
-    if (entry.isFile() && extname(entry.name).toLowerCase() === ".cpp") {
-      res.push(join("src", entry.name));
+  // src/shared has what orig and ng have in common, e.g. MenuDefs.cpp
+  for (const dir of ["src", join("src", "shared")]) {
+    const entries = readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile() && extname(entry.name).toLowerCase() === ".cpp") {
+        res.push(join(dir, entry.name));
+      }
     }
   }
   return res;

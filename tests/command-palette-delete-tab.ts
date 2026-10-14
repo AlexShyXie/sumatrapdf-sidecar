@@ -4,12 +4,11 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ControlClient, ControlCommand } from "./control.ts";
+import { IS_MAC } from "./host.ts";
 import { ROOT, cmdId, runStandalone, tmpPath } from "./util.ts";
 import {
   enumWindows,
   getClassName,
-  getFocusedHwnd,
-  getRootWindow,
   getWindowPid,
   isWindowVisible,
   postMessage,
@@ -19,7 +18,14 @@ import {
   VK_DOWN,
   WM_KEYDOWN,
 } from "./winapi.ts";
-import { FRAME_CLASS, killAndWait, launchControlled, sendCommand, sendCommandSync } from "./win-automation.ts";
+import {
+  FRAME_CLASS,
+  killAndWait,
+  launchControlled,
+  sendCommand,
+  sendCommandSync,
+  findPalette,
+} from "./win-automation.ts";
 
 const SETTINGS = `UiLanguage = en
 Theme = Light
@@ -43,13 +49,12 @@ async function paletteState(client: ControlClient): Promise<Palette> {
   return { open: true, items: +m[1]! };
 }
 
-function findPalette(frame: number): { palette: number; edit: number } {
-  const edit = getFocusedHwnd(frame);
-  if (!edit || getClassName(edit) !== "Edit") {
-    return { palette: 0, edit: 0 };
+async function frameCount(client: ControlClient, pid: number): Promise<number> {
+  if (IS_MAC) {
+    const raw = String((await client.request(ControlCommand.TestUiState, []))[1] ?? "");
+    return Number(/windows=(\d+)/.exec(raw)?.[1] ?? "0");
   }
-  const palette = getRootWindow(edit);
-  return { palette: palette === frame ? 0 : palette, edit };
+  return getFrames(pid).length;
 }
 
 function getFrames(pid: number): number[] {
@@ -91,20 +96,28 @@ export async function testit(): Promise<void> {
     sendCommandSync(frame, cmdId("CmdDuplicateInNewWindow"));
 
     const twoDeadline = Date.now() + 8000;
-    while (getFrames(proc.pid!).length < 2 && Date.now() < twoDeadline) {
+    while ((await frameCount(client, proc.pid!)) < 2 && Date.now() < twoDeadline) {
       await sleep(50);
     }
-    if (getFrames(proc.pid!).length !== 2) {
-      throw new Error(`command-palette-delete-tab: expected 2 frames, got ${getFrames(proc.pid!).length}`);
+    const opened = await frameCount(client, proc.pid!);
+    if (opened !== 2) {
+      throw new Error(`command-palette-delete-tab: expected 2 frames, got ${opened}`);
     }
 
     sendCommand(frame, cmdId("CmdCommandPalette"));
     const openDeadline = Date.now() + 8000;
     let handles = { palette: 0, edit: 0 };
     while (Date.now() < openDeadline) {
-      handles = findPalette(frame);
-      if (handles.palette && handles.edit) {
-        break;
+      if (IS_MAC) {
+        if ((await paletteState(client)).open) {
+          handles = { palette: frame, edit: frame };
+          break;
+        }
+      } else {
+        handles = findPalette(frame);
+        if (handles.palette && handles.edit) {
+          break;
+        }
       }
       await sleep(50);
     }
@@ -127,7 +140,7 @@ export async function testit(): Promise<void> {
       } catch (e) {
         throw new Error(`command-palette-delete-tab: process died (${String((e as Error)?.message ?? e)})`);
       }
-      nFrames = getFrames(proc.pid!).length;
+      nFrames = await frameCount(client, proc.pid!);
       if (nFrames === 1) {
         break;
       }

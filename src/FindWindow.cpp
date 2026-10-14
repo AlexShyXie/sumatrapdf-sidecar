@@ -36,12 +36,9 @@
 #include "Theme.h"
 #include "DarkMode.h"
 #include "FindWindow.h"
+#include "AppHelpersCommon.h"
+#include "FindWindowCommon.h"
 
-// command ids for the window's toolbar buttons (handled in OnCommand)
-constexpr int kFindWinPinCmdId = (int)CmdLast + 51;
-
-constexpr int kFindWinPadding = 8;
-constexpr int kFindWinGap = 6;
 constexpr int kFindWinMinEditDx = 48;
 
 namespace {
@@ -127,18 +124,6 @@ struct FindResultsModel : ListBoxModel {
     int ItemsCount() override { return len(win->findMatches); }
     Str Item(int i) override { return win->findMatches[i].snippet; }
 };
-
-// list index of the match starting at (page, glyph), or -1 if there is none
-static int FindMatchIndex(MainWindow* win, int page, int glyph) {
-    int n = len(win->findMatches);
-    for (int i = 0; i < n; i++) {
-        const FindMatch& fm = win->findMatches[i];
-        if (fm.startPage == page && fm.startGlyph == glyph) {
-            return i;
-        }
-    }
-    return -1;
-}
 
 struct FindWindowWnd : WindowBase {
     MainWindow* win = nullptr;
@@ -1088,9 +1073,11 @@ void ShowFindWindow(MainWindow* win) {
     if (CbGetTextLen(win->findEdit) == 0 || win->findThread) {
         return;
     }
-    // finish off a completed search's rows, but don't start a new search: the
-    // term restored into the box is a starting point, not a request
-    if (len(win->findMatches) > 0 && !win->findCountHasSnippets) {
+    // finish off a completed search's rows (the compact bar built no snippets,
+    // and hiding it dropped the rows), but don't start a new search: a term
+    // merely restored into the box is a starting point, not a request
+    bool finished = len(win->findMatches) > 0 || HasFindCountFor(win, win->findEdit->GetTextTemp());
+    if (finished && !win->findCountHasSnippets) {
         EnsureFindSnippets(win);
     }
 }

@@ -22,6 +22,7 @@
 #include "Translations.h"
 #include "DarkMode.h"
 #include "SumatraDialogs.h"
+#include "AppHelpersCommon.h"
 
 // Label and buttons are VirtCtrl; the name field is a real HWND Edit.
 // Same WindowBase layout pattern as Change Theme / Change Language.
@@ -53,14 +54,6 @@ AddFavoriteWnd::~AddFavoriteWnd() {
 
 static void ClearAddFavoriteWnd() {
     gAddFavoriteWnd = nullptr;
-}
-
-static TempStr FavoritePromptTemp(Str pageLabel) {
-    int chapter = 0, page = 0;
-    if (str::Parse(pageLabel, "%d/%d%$", &chapter, &page)) {
-        return fmt(Tr("Name for chapter %d page %d (optional):").s, chapter, page);
-    }
-    return fmt(Tr("Name for page %s (optional):").s, pageLabel);
 }
 
 void AddFavoriteWnd::SetTarget(MainWindow* win, Str path, int page, Str labelIn, Str name) {

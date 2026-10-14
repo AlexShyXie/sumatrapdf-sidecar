@@ -35,9 +35,11 @@
 #include "Theme.h"
 #include "DarkMode.h"
 #include "FindBar.h"
+#include "AppHelpersCommon.h"
 
 // command ids for the bar's toolbar buttons; must not collide with real commands
 constexpr int kFindBarCloseCmdId = (int)CmdLast + 50;
+
 constexpr int kFindBarPinCmdId = (int)CmdLast + 52;
 
 namespace {
@@ -103,15 +105,6 @@ void FindStatusBox::SetBounds(Rect r) {
 }
 
 } // namespace
-
-static int DecimalDigits(int n) {
-    int digits = 1;
-    while (n >= 10) {
-        n /= 10;
-        digits++;
-    }
-    return digits;
-}
 
 // width of the "n / m" status slot, wide enough for the largest count it will
 // show. Shared with the floating find window so both size it the same way.
@@ -320,13 +313,6 @@ bool FindBarWnd::Create(MainWindow* mainWin) {
     win->RegisterOnWindowMoved(&onWindowMoved);
     return true;
 }
-
-constexpr int kFindBarPadding = 6;
-constexpr int kFindBarGap = 4;
-constexpr int kFindBarDefaultEditDx = 220;
-constexpr int kFindBarMinEditDx = 80;
-// how wide the drag zone along the left edge is
-constexpr int kFindBarResizeGripDx = 6;
 
 void FindBarWnd::BuildLayout() {
     int p = DpiScale(kFindBarPadding);
@@ -722,7 +708,7 @@ static void PositionFindBar(FindBarWnd* bar) {
     SetWindowPos(bar->hwnd, HWND_TOP, r.x, r.y, r.dx, r.dy, SWP_NOACTIVATE);
 }
 
-static void ShowCompactBar(MainWindow* win) {
+void ShowCompactBar(MainWindow* win) {
     TempStr term = CurrentFindTermTemp(win);
     if (!win->findBar) {
         win->findBar = CreateFindBar(win);
@@ -747,16 +733,6 @@ static void ShowCompactBar(MainWindow* win) {
     CbEditSelectAll(win->findEdit);
     // the restored term is only a starting point, not a search request: hitting
     // Ctrl+F must not re-run the last search behind the user's back
-}
-
-// "ShowFindBar" is the entry point used by FindFirst/Ctrl+F; it shows whichever
-// find UI the user has chosen (compact overlay or floating window)
-void ShowFindBar(MainWindow* win) {
-    if (gSettings->searchUIFloating) {
-        ShowFindWindow(win);
-        return;
-    }
-    ShowCompactBar(win);
 }
 
 void HideFindBar(MainWindow* win) {
@@ -796,12 +772,38 @@ bool IsFindBarVisible(MainWindow* win) {
     return win->findBar && HwndIsVisible(win->findBar->hwnd);
 }
 
-// true if either the compact bar or the floating find window is visible
-bool IsFindUIVisible(MainWindow* win) {
-    return IsFindBarVisible(win) || IsFindWindowVisible(win);
+// focus the find edit and select all text (Ctrl+F when find UI is already open)
+// The find box under the names ng uses for its text field (FindBar.h).
+TempStr FindEditTextTemp(MainWindow* win) {
+    if (!win || !win->findEdit) {
+        return {};
+    }
+    return win->findEdit->GetTextTemp();
 }
 
-// focus the find edit and select all text (Ctrl+F when find UI is already open)
+int FindEditTextLen(MainWindow* win) {
+    if (!win || !win->findEdit) {
+        return 0;
+    }
+    return CbGetTextLen(win->findEdit);
+}
+
+void FindEditSetText(MainWindow* win, Str s) {
+    if (win && win->findEdit) {
+        win->findEdit->SetText(s);
+    }
+}
+
+bool FindEditIsModified(MainWindow* win) {
+    return win && win->findEdit && CbEditIsModified(win->findEdit);
+}
+
+void FindEditSetModified(MainWindow* win, bool modified) {
+    if (win && win->findEdit) {
+        CbEditSetModified(win->findEdit, modified);
+    }
+}
+
 void FocusFindEditSelectAll(MainWindow* win) {
     if (!win->findEdit) {
         return;
@@ -881,70 +883,6 @@ void ToggleFloatingFindUI(MainWindow* win) {
         str::Free(state.text);
         str::Free(state.pages);
     }
-}
-
-// Exercise and report find-UI state for focused integration tests.
-TempStr FindUiStateResultTemp(Str action, int* exitCodeOut) {
-    str::Builder out;
-    auto finish = [&](int code) -> Str {
-        if (exitCodeOut) {
-            *exitCodeOut = code;
-        }
-        return ToStrTemp(out);
-    };
-    if (len(gWindows) == 0) {
-        out.Append(StrL("ERROR no-window\n"));
-        return finish(1);
-    }
-    if (str::Eq(action, StrL("show-all"))) {
-        for (MainWindow* w : gWindows) {
-            ShowFindBar(w);
-        }
-    } else if (str::Eq(action, StrL("toggle-first"))) {
-        ToggleFloatingFindUI(gWindows[0]);
-    } else if (str::Eq(action, StrL("set-first-text"))) {
-        if (gWindows[0]->findEdit) {
-            gWindows[0]->findEdit->SetText(StrL("stale-term"));
-        }
-    } else if (str::Eq(action, StrL("clear-first"))) {
-        if (gWindows[0]->findEdit) {
-            gWindows[0]->findEdit->SetText(StrL(""));
-        }
-    } else if (str::Eq(action, StrL("hide-first"))) {
-        HideFindBar(gWindows[0]);
-    } else if (str::Eq(action, StrL("theme-recreate-first"))) {
-        // RecreateFindBar is the compact bar's theme-change path.
-        RecreateFindBar(gWindows[0]);
-    } else if (!str::Eq(action, StrL("state"))) {
-        out.Append(StrL("ERROR invalid action\n"));
-        return finish(1);
-    }
-    int docs = 0;
-    int compact = 0;
-    int floating = 0;
-    for (MainWindow* w : gWindows) {
-        docs += w->IsDocLoaded() ? 1 : 0;
-        compact += IsFindBarVisible(w) ? 1 : 0;
-        floating += IsFindWindowVisible(w) ? 1 : 0;
-    }
-    int firstTextLen = gWindows[0]->findEdit ? CbGetTextLen(gWindows[0]->findEdit) : -1;
-    // search state of the first window: highlighted matches, page of the
-    // active hit (0: none) and whether a search is still running
-    MainWindow* first = gWindows[0];
-    int matches = len(first->findMatches);
-    int hitPage = 0;
-    DisplayModel* dm = first->AsFixed();
-    if (dm && dm->textSearch && dm->textSearch->result.len > 0) {
-        hitPage = dm->textSearch->result.pages[0];
-    }
-    bool busy = first->findThread || first->findCountThread || first->findDebouncePending;
-    int page = first->ctrl ? first->ctrl->CurrentPageNo() : 0;
-    out.Append(
-        fmt("OK windows=%d docs=%d pref=%d compact=%d floating=%d firstTextLen=%d matches=%d hitPage=%d "
-            "busy=%d page=%d\n",
-            len(gWindows), docs, gSettings->searchUIFloating ? 1 : 0, compact, floating, firstTextLen, matches, hitPage,
-            busy ? 1 : 0, page));
-    return finish(0);
 }
 
 // reposition over the search toolbar icon (no-op if not visible)

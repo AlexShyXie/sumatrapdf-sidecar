@@ -42,49 +42,8 @@ constexpr int kAutoReloadDelayInMs = 500;
 // stop waiting for the writer after this long and reload whatever is there
 constexpr u64 kAutoReloadMaxWaitMs = 5000;
 
-// permissions that can be revoked through sumatrapdfrestrict.ini or the -restrict command line flag
-enum class Perm : uint {
-    // enables Update checks, crash report submitting and hyperlinks
-    InternetAccess = 1 << 0,
-    // enables opening and saving documents and launching external viewers
-    DiskAccess = 1 << 1,
-    // enables persistence of preferences to disk (includes the Frequently Read page and Favorites)
-    SavePreferences = 1 << 2,
-    // enables setting as default viewer
-    RegistryAccess = 1 << 3,
-    // enables printing
-    PrinterAccess = 1 << 4,
-    // enables image/text selections and selection copying (if permitted by the document)
-    CopySelection = 1 << 5,
-    // enables fullscreen and presentation view modes
-    FullscreenAccess = 1 << 6,
-    // enables all of the above
-    All = 0x0FFFFFF,
-    // set if either sumatrapdfrestrict.ini or the -restrict command line flag is present
-    RestrictedUse = 0x1000000,
-};
-
-constexpr Perm operator|(Perm lhs, Perm rhs) {
-    using T = std::underlying_type_t<Perm>;
-    return static_cast<Perm>(static_cast<T>(lhs) | static_cast<T>(rhs));
-}
-
-constexpr Perm operator&(Perm lhs, Perm rhs) {
-    using T = std::underlying_type_t<Perm>;
-    return static_cast<Perm>(static_cast<T>(lhs) & static_cast<T>(rhs));
-}
-
-constexpr Perm operator<<(Perm lhs, uint rhs) {
-    using T = std::underlying_type_t<Perm>;
-    return static_cast<Perm>(static_cast<T>(lhs) << static_cast<T>(rhs));
-}
-
-constexpr Perm operator~(Perm lhs) {
-    using T = std::underlying_type_t<Perm>;
-    T v = static_cast<T>(lhs);
-    v = ~v;
-    return static_cast<Perm>(v);
-}
+#include "Permissions.h"
+#include "SidebarMetrics.h"
 
 struct Favorites;
 struct FileHistory;
@@ -232,6 +191,9 @@ void CopyLocationToClipboard(WindowTab*);
 MainWindow* FindMainWindowByFile(Str file, bool focusTab, MainWindow* limitWin = nullptr);
 MainWindow* FindMainWindowBySyncFile(Str path, bool focusTab);
 WindowTab* FindTabByFile(Str file, MainWindow* limitWin = nullptr);
+WindowTab* FindTabByFilePath(Str path, MainWindow* limitWin);
+void ExecuteCmd(MainWindow* win, int cmdId);
+void OpenNextPrevFileInFolder(MainWindow* win, bool forward, Str pathToDelete = {});
 void SelectTabInWindow(WindowTab*);
 
 bool IsDocumentOpenOrLoading(Str file);
@@ -312,6 +274,8 @@ struct LoadArgs {
 struct PasswordUI;
 
 MainWindow* LoadDocument(LoadArgs* args);
+MainWindow* LoadDocument(MainWindow* win, Str path);
+void RememberDefaultWindowPosition(MainWindow* win);
 MainWindow* LoadDocumentFinish(LoadArgs* args);
 void StartLoadDocument(LoadArgs* args);
 void StartLoadDocuments(StrVec& paths, MainWindow* win, bool skipHistory = false);
@@ -342,6 +306,10 @@ struct SettingsApplyState {
     bool explorerQuickLook = false;
     // owned copy of the ebook layout inputs; ApplyChangedSettingsAndRelayout frees it
     Str ebookLayout;
+    // owned copy of the AI chat look (AIChat section, BgColor); freed the same way
+    Str aiChatStyle;
+    // owned copy of ThumbnailsType; freed the same way
+    Str thumbnailsType;
 };
 SettingsApplyState GetSettingsApplyState();
 void ApplyChangedSettingsAndRelayout(const SettingsApplyState& before);
@@ -357,7 +325,7 @@ EngineBase* CreatePdfEngineForDialog(Str path, HWND hwnd);
 TempStr PageInfoOverlayResultTemp(Str pathTwoPages, Str pathOnePage, int* exitCodeOut = nullptr);
 TempStr WindowStateDuringLoadResultTemp(int* exitCodeOut = nullptr);
 TempStr SaveFileAsResultTemp(Str dstPath, int* exitCodeOut);
-bool DocIsSupportedFileType(FileType);
+TempStr RenameFileResultTemp(Str dstPath, int* exitCodeOut);
 void ShowErrorLoadingNotification(MainWindow* win, Str path, bool noSavePrefs, bool showWin = true);
 void ShowFileInFolder(MainWindow* win, Str path);
 void SmartZoom(MainWindow* win, float factor, Point* pt, bool smartZoom);

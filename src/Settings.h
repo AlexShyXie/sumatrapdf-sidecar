@@ -349,9 +349,7 @@ struct FileState {
 struct TabState {
     // path of the document
     Str filePath;
-    // layout of pages in this tab. valid values: automatic, single page,
-    // facing, book view, continuous, continuous facing, continuous book
-    // view
+    // layout of pages in this tab
     Str displayMode;
     // number of the last read page, or `bm:<bookmark>` for documents with
     // chapters (see PagePosition.cpp)
@@ -390,6 +388,9 @@ struct SessionData {
     // width of the favorites / bookmarks sidebar in screen pixels (0 if it
     // wasn't shown)
     int sidebarDx;
+    // GUID of the virtual desktop the window was on; the window is
+    // restored there (Windows 10+)
+    Str virtualDesktopId;
 };
 
 // customization options for CHM UI. UseFixedPageUI switches to the
@@ -449,9 +450,7 @@ struct Fullscreen {
     bool showMenubar;
     // page layout in presentation (Ctrl+L) and windowed fullscreen
     // (Shift+Ctrl+L / F11). empty keeps the current behavior: presentation
-    // uses single page, windowed fullscreen keeps the existing layout.
-    // valid values: automatic, single page, facing, book view, continuous,
-    // continuous facing, continuous book view
+    // uses single page, windowed fullscreen keeps the existing layout
     Str displayMode;
 };
 
@@ -541,6 +540,22 @@ struct AntiGravity {
     ParsedColor bgColor;
 };
 
+// appearance of the AI chat sidebar, shared by all backends
+struct AIChat {
+    // font of the chat messages; empty uses Segoe UI
+    Str fontName;
+    // font size of the chat messages in pixels; 0 means the default (13)
+    int fontSize;
+    // line-height multiplier for chat text (e.g. 1.6); 0 means the default
+    // (1.5). values from 1 to 3 are accepted
+    float lineSpacing;
+    // space inside a message box in pixels; -1 means the default (8)
+    int messagePadding;
+    // if true, your questions and the replies are shown in message boxes;
+    // if false, as plain text separated by lines
+    bool bubbles;
+};
+
 // customization options for the ebook UI (EPUB, MOBI, FB2, PDB and
 // plain text)
 struct EBookUI {
@@ -580,8 +595,7 @@ struct EBookUI {
     // (epub, mobi etc.)
     ParsedColor windowBgCol;
     // default page layout for ebooks; empty uses the global
-    // DefaultDisplayMode. valid values: automatic, single page, facing,
-    // book view, continuous, continuous facing, continuous book view
+    // DefaultDisplayMode
     Str defaultDisplayMode;
 };
 
@@ -625,9 +639,14 @@ struct ComicBookUI {
     // if true, absolute zoom never makes a page taller than the window
     // (each page is capped at Fit Height)
     bool limitToWindowHeight;
+    // if true, in single-page layouts a page wider than it is tall (a
+    // double-page spread) is rotated so its long side follows the
+    // window's, and Fit Page shows it as large as the other pages. With
+    // the document rotated 90 degrees the spread shows upright (issue
+    // #6305)
+    bool autoRotateWidePages;
     // default page layout for comic books; empty uses the global
-    // DefaultDisplayMode. valid values: automatic, single page, facing,
-    // book view, continuous, continuous facing, continuous book view
+    // DefaultDisplayMode
     Str defaultDisplayMode;
     // default zoom for comic books; empty uses fit page. valid values: fit
     // page, fit width, fit height, fit content, fit visible, shrink to fit
@@ -777,17 +796,17 @@ struct Annotations {
     // Windows user name is used; set it to (none) to leave the author out
     // entirely
     Str defaultAuthor;
-    // SIDECAR: persist annotations as a separate JSON file next to the PDF
-    // (or under CentralFolder) instead of inside the PDF. The PDF itself is
-    // never modified; see Sidecar.h
+    // if true, annotations are saved as a separate JSON file next to the
+    // PDF (or under CentralFolder) instead of inside the PDF; the PDF is
+    // never modified
     bool separateSave;
-    // SIDECAR: with SeparateSave, persist the sidecar as Markdown (.md)
-    // instead of JSON - annotations become Obsidian-style callouts and
-    // everything that is not an annotation callout is preserved verbatim
-    // for the user's own notes (see the MD format comment in Sidecar.cpp)
+    // if true, sidecar files are Markdown (.md) instead of JSON:
+    // annotations are stored as Obsidian-style callouts and everything
+    // else in the file is preserved for your own notes
     bool separateSaveAsMd;
-    // SIDECAR: central folder for JSON sidecar files, used when no sibling
-    // file exists: <CentralFolder>/<pdf parent folder name>/<pdf name>.json
+    // central folder for JSON annotation files, used when no such file
+    // exists next to the PDF: the file is looked up in
+    // <CentralFolder>/<pdf parent folder name>/<pdf name>.json
     Str centralFolder;
     // image (e.g. a transparent .png of your signature) that Sign With
     // Image stamps on the page. If not set, or the file is missing, Sign
@@ -842,6 +861,9 @@ struct Settings {
     // predefined text inserted as a free text annotation from the context
     // menu or the command palette
     Vec<TextSnippet*>* textSnippets;
+    // if true, the Annotations window shows the selected annotation's note
+    // under the list
+    bool annotationsWindowShowNote;
     // zoom levels which zooming steps through in addition to Fit Page and
     // Fit Width. The largest value is also the highest zoom that can be
     // set at all, so listing levels above 6400 (up to 1000000) is how you
@@ -883,6 +905,12 @@ struct Settings {
     // how the home page shows the document history: thumbnails (a grid of
     // page previews) or list (one row per file)
     Str homePageViewMode;
+    // how the home page thumbnail is made from a document's first page:
+    // legacy (the top of the page, cropped to a 212x150 frame) or full
+    // (the whole page, scaled to fit a 150x212 frame). Changing it
+    // re-creates the thumbnails of the files that still exist in a
+    // background process
+    Str thumbnailsType;
     // file open dialog used by Open File: empty or os (standard Windows
     // file picker), or sumatrapdf (Navigate Files in Folder). Toggled by
     // Settings / SumatraPDF File Picker
@@ -994,6 +1022,8 @@ struct Settings {
     CodexBuild codexBuild;
     // settings for the Antigravity chat sidebar
     AntiGravity antiGravity;
+    // appearance of the AI chat sidebar, shared by all backends
+    AIChat aiChat;
     // customization options for the ebook UI (EPUB, MOBI, FB2, PDB and
     // plain text)
     EBookUI eBookUI;

@@ -1,7 +1,7 @@
 import { $, Glob } from "bun";
 import { basename } from "node:path";
 import { cpus } from "node:os";
-import { detectVisualStudio } from "./util";
+import { findClangFormat } from "./util";
 
 async function globFiles(patterns: string[]): Promise<string[]> {
   const files: string[] = [];
@@ -66,12 +66,12 @@ async function main() {
     return;
   }
 
-  const { clangFormatPath: cfPath } = detectVisualStudio();
-  const clangFormatPath = cfPath || "clang-format.exe";
+  const clangFormatPath = findClangFormat();
   console.log(`using '${clangFormatPath}'`);
 
   const patterns = [
     "src/*.cpp",
+    "src/shared/**/*.{cpp,c,h}",
     "src/*.h",
     "src/mui/*.cpp",
     "src/mui/*.h",

@@ -18,31 +18,11 @@
 
 import { writeFileSync } from "node:fs";
 import { deflateSync } from "node:zlib";
-import { cmdId, tmpPath } from "./util.ts";
+import { ControlCommand } from "./control.ts";
+import { IS_MAC } from "./host.ts";
+import { cmdId, tmpPath, USE_NG, pngChunk } from "./util.ts";
 import { findCanvas, launchControlled, killAndWait, sendCommandSync } from "./win-automation.ts";
-import { captureWindowPixels } from "./winapi.ts";
-
-function crc32(buf: Buffer): number {
-  let c: number;
-  let crc = 0xffffffff;
-  for (let n = 0; n < buf.length; n++) {
-    c = (crc ^ buf[n]!) & 0xff;
-    for (let k = 0; k < 8; k++) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    crc = (crc >>> 8) ^ c;
-  }
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-function pngChunk(type: string, data: Buffer): Buffer {
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(data.length);
-  const body = Buffer.concat([Buffer.from(type, "latin1"), data]);
-  const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(body));
-  return Buffer.concat([len, body, crc]);
-}
+import { captureWindowPixels, getClientRect } from "./winapi.ts";
 
 // RGBA PNG: opaque red on the left half, alpha = 0 on the right half
 function makeHalfTransparentPng(w: number, h: number): Buffer {
@@ -74,27 +54,64 @@ function makeHalfTransparentPng(w: number, h: number): Buffer {
 
 type Color = { b: number; g: number; r: number };
 
+// ng draws the page in the frame, under the toolbar. canvas= from TestUiState
+// is that area in dips; the capture is the whole frame in pixels.
+type Crop = { x: number; y: number; dx: number; dy: number };
+
+async function documentCrop(
+  client: { request: (cmd: number, args: unknown[]) => Promise<unknown[]> },
+  frame: number,
+): Promise<Crop | undefined> {
+  if (!USE_NG) {
+    return undefined;
+  }
+  const raw = String((await client.request(ControlCommand.TestUiState, []))[1] ?? "");
+  const m = /canvas=(\d+),(\d+),(\d+),(\d+)/.exec(raw);
+  if (!m) {
+    throw new Error(`issue-5844: no canvas rect in ${raw}`);
+  }
+  const rc = getClientRect(frame);
+  const dipW = Number(m[1]) + Number(m[3]);
+  const dipH = Number(m[2]) + Number(m[4]);
+  const sx = dipW > 0 ? (rc.right - rc.left) / dipW : 1;
+  const sy = dipH > 0 ? (rc.bottom - rc.top) / dipH : 1;
+  return {
+    x: Math.round(Number(m[1]) * sx),
+    y: Math.round(Number(m[2]) * sy),
+    dx: Math.round(Number(m[3]) * sx),
+    dy: Math.round(Number(m[4]) * sy),
+  };
+}
+
 // average color of a small block at (fx, fy) inside the page. The page is found
 // as the bounding box of everything that isn't the (black) image-engine
 // backdrop - but with the bug the transparent half is black too and melts into
 // that backdrop, so only half of the page is inside the box. The image is
 // square, so the longer side of the box is the page's side either way.
-function pageColorAt(canvas: number, fx: number, fy: number): Color {
+function pageColorAt(canvas: number, fx: number, fy: number, crop?: Crop): Color {
   const cap = captureWindowPixels(canvas);
   if (!cap) {
     throw new Error("issue-5844: could not capture the canvas");
   }
-  const { w, h, data } = cap;
+  const ox = crop?.x ?? 0;
+  const oy = crop?.y ?? 0;
+  const w = crop?.dx ?? cap.w;
+  const h = crop?.dy ?? cap.h;
+  const { data } = cap;
+  const fullW = cap.w;
+  const at = (x: number, y: number) => ((y + oy) * fullW + (x + ox)) * 4;
   const lit = (x: number, y: number) => {
-    const i = (y * w + x) * 4;
+    const i = at(x, y);
     return data[i]! + data[i + 1]! + data[i + 2]! > 120;
   };
+  // A light border on the ng canvas edge would stretch the page box across the frame.
+  const inset = crop ? 2 : 0;
   let x0 = w;
   let y0 = h;
   let x1 = -1;
   let y1 = -1;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
+  for (let y = inset; y < h - inset; y++) {
+    for (let x = inset; x < w - inset; x++) {
       if (!lit(x, y)) {
         continue;
       }
@@ -116,7 +133,7 @@ function pageColorAt(canvas: number, fx: number, fy: number): Color {
   let n = 0;
   for (let y = cy - 4; y <= cy + 4; y++) {
     for (let x = cx - 4; x <= cx + 4; x++) {
-      const i = (y * w + x) * 4;
+      const i = at(x, y);
       b += data[i]!;
       g += data[i + 1]!;
       r += data[i + 2]!;
@@ -132,12 +149,17 @@ function fmt(c: Color): string {
 
 // average colour of a block at a fraction of the whole canvas, for sampling the
 // background outside the page
-function canvasColorAt(canvas: number, fx: number, fy: number): Color {
+function canvasColorAt(canvas: number, fx: number, fy: number, crop?: Crop): Color {
   const cap = captureWindowPixels(canvas);
   if (!cap) {
     throw new Error("issue-5844: could not capture the canvas");
   }
-  const { w, h, data } = cap;
+  const ox = crop?.x ?? 0;
+  const oy = crop?.y ?? 0;
+  const w = crop?.dx ?? cap.w;
+  const h = crop?.dy ?? cap.h;
+  const { data } = cap;
+  const fullW = cap.w;
   const cx = Math.round(w * fx);
   const cy = Math.round(h * fy);
   let b = 0;
@@ -146,7 +168,7 @@ function canvasColorAt(canvas: number, fx: number, fy: number): Color {
   let n = 0;
   for (let y = cy - 3; y <= cy + 3; y++) {
     for (let x = cx - 3; x <= cx + 3; x++) {
-      const i = (y * w + x) * 4;
+      const i = ((y + oy) * fullW + (x + ox)) * 4;
       b += data[i]!;
       g += data[i + 1]!;
       r += data[i + 2]!;
@@ -165,6 +187,10 @@ function isRed(c: Color): boolean {
 }
 
 export async function testit(): Promise<void> {
+  if (IS_MAC) {
+    console.log("SKIP issue-5844: transparent-image colors are read from a window DC");
+    return;
+  }
   const png = tmpPath("issue-5844.png");
   writeFileSync(png, makeHalfTransparentPng(400, 400));
 
@@ -176,13 +202,14 @@ export async function testit(): Promise<void> {
     if (!canvas) {
       throw new Error("issue-5844: could not find the canvas window");
     }
+    const crop = await documentCrop(client, frame);
 
     // the canvas background, sampled well outside the page
-    const bg = canvasColorAt(canvas, 0.02, 0.02);
+    const bg = canvasColorAt(canvas, 0.02, 0.02, crop);
 
     // as opened: mupdf fast path (no rotation, whole page in one bitmap)
-    const opaque = pageColorAt(canvas, 0.25, 0.5);
-    const transparent = pageColorAt(canvas, 0.75, 0.5);
+    const opaque = pageColorAt(canvas, 0.25, 0.5, crop);
+    const transparent = pageColorAt(canvas, 0.75, 0.5, crop);
     if (!isRed(opaque)) {
       throw new Error(`issue-5844: the opaque half of the png isn't red: ${fmt(opaque)}`);
     }
@@ -198,8 +225,8 @@ export async function testit(): Promise<void> {
     // transparent half at the bottom. The two paths have to agree.
     sendCommandSync(frame, cmdId("CmdRotateRight"));
     await client.waitForRenderIdle();
-    const opaqueRot = pageColorAt(canvas, 0.5, 0.25);
-    const transparentRot = pageColorAt(canvas, 0.5, 0.75);
+    const opaqueRot = pageColorAt(canvas, 0.5, 0.25, crop);
+    const transparentRot = pageColorAt(canvas, 0.5, 0.75, crop);
     if (!isRed(opaqueRot)) {
       throw new Error(`issue-5844: after rotating, the opaque half isn't red: ${fmt(opaqueRot)}`);
     }

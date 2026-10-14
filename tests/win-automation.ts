@@ -12,13 +12,16 @@
 // These are for *ad-hoc* tests (not checked in). Put reusable helpers here, not
 // in the individual ad-hoc scripts.
 
-import { cmdId, drainProcStderr, EXE, setFailureContext } from "./util.ts";
+import { IS_MAC } from "./host.ts";
+import { macClick } from "./mac-control.ts";
+import { cmdId, drainProcStderr, EXE, setFailureContext, USE_NG } from "./util.ts";
 import {
   testWindowPos,
   waitForWindowIdle,
   enumWindows,
   getClassName,
   findChildWindow,
+  findOwnedWindow,
   findVisibleChildWindow,
   waitForTopWindow,
   packCoords,
@@ -28,12 +31,16 @@ import {
   sendText,
   captureWindowToPng,
   getSystemMetrics,
+  getWindowOwner,
   getWindowRect,
+  isWindowVisible,
   readWindowDCColumn,
   SM_CXVSCROLL,
   WM_LBUTTONDOWN,
   WM_LBUTTONUP,
   WM_KEYDOWN,
+  WM_KEYUP,
+  getRootWindow,
   WM_CONTEXTMENU,
   WM_COMMAND,
   MK_LBUTTON,
@@ -56,7 +63,7 @@ import {
 } from "./winapi.ts";
 
 export { ensureModifierKeysUp };
-import { ControlClient, uniquePipeName } from "./control.ts";
+import { ControlClient, ControlCommand, uniquePipeName } from "./control.ts";
 
 export { captureWindowToPng, killProcessesNamed };
 
@@ -106,6 +113,10 @@ async function lastProcStderrTail(): Promise<string> {
 setFailureContext(lastProcStderrTail);
 
 export function beginSharedControlledSession(): void {
+  // macOS has no WM_COPYDATA open, so each test launches its own process.
+  if (IS_MAC) {
+    return;
+  }
   if (sharedSession || sharedSessionRequested) {
     throw new Error("a shared controlled session is already active");
   }
@@ -128,7 +139,9 @@ export async function killAndWait(proc: Bun.Subprocess): Promise<void> {
   await killAndWaitProcess(proc);
 }
 
-export const FRAME_CLASS = "SUMATRA_PDF_FRAME";
+// ng's frame is gpui's window. Tests import this binding, so the assignment
+// is visible to them.
+export let FRAME_CLASS = USE_NG ? "GpuiSystemMonitor" : "SUMATRA_PDF_FRAME";
 export const CANVAS_CLASS = "SUMATRA_PDF_CANVAS";
 
 // -window-pos for the right half of the screen (see testWindowPos)
@@ -148,7 +161,16 @@ export function windowPosArgs(): string[] {
 // restoring a remembered position - so the app picks the position itself.
 export function launchSumatra(args: string[], opts?: { defaultWindowPos?: boolean }): Bun.Subprocess {
   const posArgs = opts?.defaultWindowPos || args.includes("-window-pos") ? [] : windowPosArgs();
-  return Bun.spawn([EXE, "-for-testing", ...posArgs, ...args], { stdout: "ignore", stderr: "ignore" });
+  const proc = Bun.spawn([EXE, "-for-testing", ...posArgs, ...args], {
+    stdout: "ignore",
+    // ASan writes its report to stderr. "ignore" closes that pipe and the
+    // next write kills the process.
+    stderr: IS_MAC ? "pipe" : "ignore",
+  });
+  if (IS_MAC) {
+    drainStderr(proc);
+  }
+  return proc;
 }
 
 // Launch with -dbg-control so the test can wait for render-idle (and other
@@ -194,7 +216,9 @@ export async function launchControlled(
   gLastProc = proc;
   try {
     const client = await ControlClient.connect(pipe);
-    const frame = await waitForFrame(proc.pid!);
+    // macOS has no HWND. The control socket is the ready signal; 1 stands in
+    // for the frame so callers that only check it is non-zero keep going.
+    const frame = IS_MAC ? 1 : await waitForFrame(proc.pid!);
     if (!frame) {
       client.close();
       throw new Error("SumatraPDF main window did not appear");
@@ -272,11 +296,32 @@ export function waitForFrame(pid: number, timeoutMs = 12000): Promise<number> {
 
 // the document canvas (child of the frame)
 export function findCanvas(frame: number): number {
-  return findChildWindow(frame, CANVAS_CLASS);
+  if (IS_MAC) {
+    return frame;
+  }
+  const canvas = findChildWindow(frame, CANVAS_CLASS);
+  if (canvas) {
+    return canvas;
+  }
+  // ng's frame swapchain has no redirection bitmap, so GetPixel on it is
+  // CLR_INVALID. The page copy is an owned top-level window of this class.
+  if (USE_NG) {
+    const owned = findOwnedWindow(frame, CANVAS_CLASS);
+    if (owned) {
+      return owned;
+    }
+    return frame;
+  }
+  return canvas;
 }
 
 export function findChildByClass(parent: number, className: string): number {
-  return findChildWindow(parent, className);
+  const child = findChildWindow(parent, className);
+  // ng draws the toolbar in the frame; there is no SUMATRA_VIRT_TOOLBAR child
+  if (!child && USE_NG && className === "SUMATRA_VIRT_TOOLBAR") {
+    return parent;
+  }
+  return child;
 }
 
 // the floating in-place form-field editor: a visible "Edit" child of the canvas
@@ -307,16 +352,29 @@ export async function waitForFormEditor(canvas: number, timeoutMs = 1500): Promi
 // WM_MOUSEMOVE at the real cursor, and if that is far from (x,y) the app treats
 // the click as a drag (ClickEdgeToTurnPage and similar then no-op).
 export async function clickAt(hwnd: number, x: number, y: number, settleMs = 350, extraMk = 0): Promise<void> {
+  if (IS_MAC) {
+    macClick(x, y, extraMk);
+    await sleep(settleMs);
+    return;
+  }
+  // the app also reads the live key state: a Ctrl stuck down mid-run (RDP)
+  // turns a plain click into Ctrl+click
+  await ensureModifierKeysUp();
   const screen = clientToScreen(hwnd, x, y);
   setCursorPos(screen.x, screen.y);
   const lp = packCoords(x, y);
   sendMessage(hwnd, WM_LBUTTONDOWN, MK_LBUTTON | extraMk, lp);
   sendMessage(hwnd, WM_LBUTTONUP, extraMk, lp);
 
-  // someone moving the real mouse (e.g. over RDP) mid-click turns it into a drag
-  const at = getCursorPos();
-  if (at.x !== screen.x || at.y !== screen.y) {
-    console.log(`⚠ clickAt: real mouse moved during the click (to ${at.x},${at.y}, click at ${screen.x},${screen.y})`);
+  // someone moving the real mouse (e.g. over RDP) mid-click turns it into a drag.
+  // macOS has no GetCursorPos; the click coordinates went out as TestInput.
+  if (!IS_MAC) {
+    const at = getCursorPos();
+    if (at.x !== screen.x || at.y !== screen.y) {
+      console.log(
+        `⚠ clickAt: real mouse moved during the click (to ${at.x},${at.y}, click at ${screen.x},${screen.y})`,
+      );
+    }
   }
   await sleep(settleMs);
 }
@@ -501,4 +559,92 @@ export function findSubMenu(items: MenuItem[], label: string): MenuItem | null {
     }
   }
   return null;
+}
+
+// The Command Palette window and its edit, found through the focused control.
+export function findPalette(frame: number): { palette: number; edit: number } {
+  const edit = getFocusedHwnd(frame);
+  if (!edit || getClassName(edit) !== "Edit") {
+    return { palette: 0, edit: 0 };
+  }
+  if (USE_NG) {
+    return { palette: findNgPalette(frame), edit };
+  }
+  const palette = getRootWindow(edit);
+  return { palette: palette === frame ? 0 : palette, edit };
+}
+
+// ng's query edit sits in a 0x0 helper window; the palette is the visible GPUI
+// window the frame owns. Posted keys and pixel captures work on it.
+function findNgPalette(frame: number): number {
+  let found = 0;
+  enumWindows((hwnd) => {
+    if (getWindowOwner(hwnd) !== frame || !isWindowVisible(hwnd) || getClassName(hwnd) !== FRAME_CLASS) {
+      return true;
+    }
+    const r = getWindowRect(hwnd);
+    if (r.right - r.left < 100) {
+      return true;
+    }
+    found = hwnd;
+    return false;
+  });
+  return found;
+}
+
+// A posted, unmodified key press that doesn't wait for the app.
+export function pressVKey(hwnd: number, vk: number): void {
+  postMessage(hwnd, WM_KEYDOWN, vk, 0);
+  postMessage(hwnd, WM_KEYUP, vk, 0);
+}
+
+async function ngInput(client: ControlClient, args: (string | number)[]): Promise<void> {
+  const res = await client.request(ControlCommand.TestInput, args);
+  const raw = String(res[1] ?? "");
+  if (res[0] !== 0 || !raw.startsWith("OK")) {
+    throw new Error(`TestInput ${args.join(" ")} failed: ${raw}`);
+  }
+}
+
+// ng has no window to post keys to: they go through TestInput.
+export function ngKey(client: ControlClient, vk: number): Promise<void> {
+  return ngInput(client, ["key", vk, 0]);
+}
+
+export async function ngType(client: ControlClient, text: string): Promise<void> {
+  for (const ch of text) {
+    await ngInput(client, ["char", ch.codePointAt(0)!]);
+  }
+}
+
+type Pt = { x: number; y: number };
+
+// Pixels in the placement-preview blue within 8px of the start-end box.
+export function countPreviewBlue(shot: { w: number; h: number; data: Uint8Array } | null, start: Pt, end: Pt): number {
+  if (!shot) {
+    return 0;
+  }
+  const left = Math.max(0, Math.min(start.x, end.x) - 8);
+  const right = Math.min(shot.w - 1, Math.max(start.x, end.x) + 8);
+  const top = Math.max(0, Math.min(start.y, end.y) - 8);
+  const bottom = Math.min(shot.h - 1, Math.max(start.y, end.y) + 8);
+  let count = 0;
+  for (let y = top; y <= bottom; y++) {
+    for (let x = left; x <= right; x++) {
+      const off = (y * shot.w + x) * 4;
+      const b = shot.data[off]!;
+      const g = shot.data[off + 1]!;
+      const r = shot.data[off + 2]!;
+      if (b > 150 && b > g + 50 && g > r + 30 && r < 80) {
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
+// A pixel of the filter-match underlay: the accent (yellow) tinted over the
+// row, so it is lighter than the accent but still clearly short of blue.
+export function isFilterMatchTint(r: number, g: number, b: number): boolean {
+  return r > 225 && g > 200 && b < 215 && r - b > 35;
 }

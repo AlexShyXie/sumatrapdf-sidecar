@@ -21,6 +21,7 @@
 #include "Translations.h"
 #include "DarkMode.h"
 #include "SumatraDialogs.h"
+#include "AppHelpersCommon.h"
 
 // Mode list and buttons are VirtCtrl. Same WindowBase layout as Change Theme.
 struct ChangeScrollbarWnd : WindowBase {
@@ -40,19 +41,6 @@ struct ChangeScrollbarWnd : WindowBase {
 };
 
 static ChangeScrollbarWnd* gChangeScrollbarWnd = nullptr;
-
-static Str ScrollbarModeDisplayName(int idx) {
-    if (idx == kScrollbarSmart) {
-        return Tr("Smart Overlay");
-    }
-    if (idx == kScrollbarOverlay) {
-        return Tr("Overlay");
-    }
-    if (idx == kScrollbarHidden) {
-        return Tr("Hidden");
-    }
-    return Tr("Windows");
-}
 
 static void ClearChangeScrollbarWnd() {
     gChangeScrollbarWnd = nullptr;

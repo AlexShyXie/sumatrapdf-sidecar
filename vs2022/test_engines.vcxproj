@@ -1160,43 +1160,43 @@
     </CustomBuild>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="..\src\CachedObjects.h" />
-    <ClInclude Include="..\src\ChapterTable.h" />
-    <ClInclude Include="..\src\DocProperties.h" />
-    <ClInclude Include="..\src\EngineAll.h" />
-    <ClInclude Include="..\src\EngineBase.h" />
-    <ClInclude Include="..\src\LitDoc.h" />
-    <ClInclude Include="..\src\PdfCad.h" />
-    <ClInclude Include="..\src\PdfDarkMode.h" />
-    <ClInclude Include="..\src\TextSearch.h" />
-    <ClInclude Include="..\src\TextSelection.h" />
-    <ClInclude Include="..\src\gui\UIModels.h" />
+    <ClInclude Include="..\src\shared\CachedObjects.h" />
+    <ClInclude Include="..\src\shared\ChapterTable.h" />
+    <ClInclude Include="..\src\shared\DocProperties.h" />
+    <ClInclude Include="..\src\shared\EngineAll.h" />
+    <ClInclude Include="..\src\shared\EngineBase.h" />
+    <ClInclude Include="..\src\shared\LitDoc.h" />
+    <ClInclude Include="..\src\shared\PdfCad.h" />
+    <ClInclude Include="..\src\shared\PdfDarkMode.h" />
+    <ClInclude Include="..\src\shared\TextSearch.h" />
+    <ClInclude Include="..\src\shared\TextSelection.h" />
+    <ClInclude Include="..\src\shared\gui\UIModels.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\src\AvifReader.cpp" />
     <ClCompile Include="..\src\CachedObjects.cpp" />
-    <ClCompile Include="..\src\ChapterTable.cpp" />
-    <ClCompile Include="..\src\DocProperties.cpp" />
-    <ClCompile Include="..\src\EbookDoc.cpp" />
-    <ClCompile Include="..\src\EmbeddedResources.cpp" />
-    <ClCompile Include="..\src\EngineBase.cpp" />
-    <ClCompile Include="..\src\EngineDjvuDec.cpp" />
     <ClCompile Include="..\src\EngineImages.cpp" />
-    <ClCompile Include="..\src\EngineMupdf.cpp" />
     <ClCompile Include="..\src\GumboHelpers.cpp" />
-    <ClCompile Include="..\src\GumboHtmlParser.cpp" />
     <ClCompile Include="..\src\ImageReader.cpp" />
-    <ClCompile Include="..\src\JxlReader.cpp" />
-    <ClCompile Include="..\src\LitDoc.cpp" />
-    <ClCompile Include="..\src\MobiDoc.cpp" />
-    <ClCompile Include="..\src\PalmDbReader.cpp" />
-    <ClCompile Include="..\src\PdfCad.cpp" />
     <ClCompile Include="..\src\PdfDarkModeNoOp.cpp" />
-    <ClCompile Include="..\src\TextSearch.cpp" />
-    <ClCompile Include="..\src\TextSelection.cpp" />
-    <ClCompile Include="..\src\WebpReader.cpp" />
     <ClCompile Include="..\src\base\GuessFileType.cpp" />
-    <ClCompile Include="..\src\gui\UIModels.cpp" />
+    <ClCompile Include="..\src\shared\AvifReader.cpp" />
+    <ClCompile Include="..\src\shared\ChapterTable.cpp" />
+    <ClCompile Include="..\src\shared\DocProperties.cpp" />
+    <ClCompile Include="..\src\shared\EbookDoc.cpp" />
+    <ClCompile Include="..\src\shared\EmbeddedResources.cpp" />
+    <ClCompile Include="..\src\shared\EngineBase.cpp" />
+    <ClCompile Include="..\src\shared\EngineDjvuDec.cpp" />
+    <ClCompile Include="..\src\shared\EngineMupdf.cpp" />
+    <ClCompile Include="..\src\shared\GumboHtmlParser.cpp" />
+    <ClCompile Include="..\src\shared\JxlReader.cpp" />
+    <ClCompile Include="..\src\shared\LitDoc.cpp" />
+    <ClCompile Include="..\src\shared\MobiDoc.cpp" />
+    <ClCompile Include="..\src\shared\PalmDbReader.cpp" />
+    <ClCompile Include="..\src\shared\PdfCad.cpp" />
+    <ClCompile Include="..\src\shared\TextSearch.cpp" />
+    <ClCompile Include="..\src\shared\TextSelection.cpp" />
+    <ClCompile Include="..\src\shared\WebpReader.cpp" />
+    <ClCompile Include="..\src\shared\gui\UIModels.cpp" />
     <ClCompile Include="..\src\tools\test_engines.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -1217,6 +1217,15 @@
     </ProjectReference>
     <ProjectReference Include="mupdf.vcxproj">
       <Project>{2181F50F-8D95-1DC1-5617-C120C2EA19F2}</Project>
+    </ProjectReference>
+    <ProjectReference Include="tesseract.vcxproj">
+      <Project>{D31E8798-3F89-3B0F-88C7-ECB4F4701964}</Project>
+    </ProjectReference>
+    <ProjectReference Include="leptonica.vcxproj">
+      <Project>{A4EEBC10-1059-7187-5997-222DC5404FDC}</Project>
+    </ProjectReference>
+    <ProjectReference Include="zxing.vcxproj">
+      <Project>{5548E210-C15C-0AC2-8ADE-AD21F6B106F3}</Project>
     </ProjectReference>
     <ProjectReference Include="a-libwebp.vcxproj">
       <Project>{38708512-A4DA-3989-ED18-EB2E59C217DE}</Project>

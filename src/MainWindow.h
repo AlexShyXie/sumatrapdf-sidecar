@@ -210,6 +210,22 @@ struct AnnotPlacement {
 /* Describes position, the target (URL or file path) and infotip of a "hyperlink" */
 /* Describes information related to one window with (optional) a document
    on the screen */
+// Resize handle positions used when resizing annotations
+enum class ResizeHandle {
+    None = 0,
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+    LineStart,
+    LineEnd,
+    Vertex,
+};
+
 struct MainWindow { // NOLINT(clang-analyzer-optin.performance.Padding)
     explicit MainWindow(HWND hwnd);
     MainWindow(const MainWindow&) = delete;
@@ -592,6 +608,10 @@ struct MainWindow { // NOLINT(clang-analyzer-optin.performance.Padding)
     struct OverlayScrollbar* overlayScrollH = nullptr;
 
     int wheelAccumDelta = 0;
+    // travel since the last wheel scroll that moved; turns the page at an edge
+    int wheelEdgeAccumDelta = 0;
+    // last wheel delta that was a fraction of a notch (a precision touchpad)
+    LARGE_INTEGER wheelFineDeltaTime{};
     LARGE_INTEGER wheelPageTurnTime{};
     UINT_PTR delayedRepaintTimer = 0;
 
@@ -712,6 +732,8 @@ struct MainWindow { // NOLINT(clang-analyzer-optin.performance.Padding)
 
     ReadAloudPlaybackBar* readAloudPlaybackBar = nullptr;
     ReadingAutoScrollBar* readingAutoScrollBar = nullptr;
+    // the tab the bar scrolls, null while it is hidden
+    WindowTab* readingAutoScrollTab = nullptr;
 
     ReadingBarDrag readingBarDrag = ReadingBarDrag::None;
     int readingBarDragOff = 0;
@@ -720,6 +742,8 @@ struct MainWindow { // NOLINT(clang-analyzer-optin.performance.Padding)
     // small floating toolbar shown after a text selection in fixed-page
     // floating selection actions bar (controlled by the SelectionToolbar setting)
     SelectionToolbar* selectionToolbar = nullptr;
+    // an action was picked for the current selection: stay hidden until it changes
+    bool selectionToolbarDismissed = false;
     // a debounced show of the selection toolbar is waiting on its timer
     bool selectionToolbarShowPending = false;
 
@@ -748,6 +772,7 @@ struct MainWindow { // NOLINT(clang-analyzer-optin.performance.Padding)
 
     void UpdateCanvasSize();
     Size GetViewPortSize() const;
+    void RedrawCanvas() const;
     void RedrawAll(bool update = false) const;
     void RedrawAllIncludingNonClient() const;
 
@@ -780,9 +805,13 @@ void CreateMovePatternLazy(MainWindow*);
 void ClearMouseState(MainWindow*);
 bool IsRightDragging(MainWindow*);
 MainWindow* FindMainWindowByTab(WindowTab*);
+#if OS_WIN
+HWND MainWindowHwnd(MainWindow*);
 MainWindow* FindMainWindowByHwnd(HWND);
+#endif
 bool IsMainWindowValid(MainWindow*);
 bool IsMainWindowValidAndNotClosing(MainWindow*);
+bool IsCurrentTab(MainWindow* win, WindowTab* tab);
 bool IsWindowTabValid(WindowTab*);
 extern Vec<MainWindow*> gWindows;
 extern bool gShowFrameRate;

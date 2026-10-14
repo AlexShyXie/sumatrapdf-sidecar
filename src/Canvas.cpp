@@ -58,6 +58,9 @@
 #include "SelectionToolbar.h"
 #include "AnnotEditToolbar.h"
 #include "AnnotTextPopup.h"
+#include "OleDragDropCommon.h"
+#include "CanvasCommon.h"
+#include "LaserPointerCursor.h"
 #include "ReadAloud.h"
 #include "ReadingAutoScroll.h"
 #include "ReadingBar.h"
@@ -68,6 +71,7 @@
 
 #include "RefHover.h"
 #include "Canvas.h"
+#include "PageGridDialogCommon.h"
 #include "SumatraLog.h"
 
 // if set instead of trying to render pages we don't have, we simply do nothing
@@ -90,126 +94,6 @@ Kind kNotifAnnotation = "notifAnnotation";
 constexpr int kRenderDelayShowNotif = 500;
 
 //--- laser pointer (CmdToggleLaserPointer)
-
-// A laser pointer is a session mode, not a setting: it's turned on to point
-// things out during a presentation and off again afterwards, and an app that
-// started up with the mouse cursor replaced by a red dot would look broken.
-static bool gLaserPointer = false;
-
-// logical size of the cursor bitmap. The dot itself is a small part of it,
-// the rest is the glow fading out to fully transparent
-constexpr int kLaserPointerCursorSize = 32;
-
-static HCURSOR gCursorLaserPointer = nullptr;
-static int gCursorLaserPointerSize = 0;
-
-// A laser dot: a white-hot center inside a saturated red core, surrounded by a
-// glow that fades to transparent so the dot is visible on light and dark pages
-// alike. The hotspot is the center of the dot, unlike an arrow's tip.
-static HCURSOR CreateLaserPointerCursor(int size) {
-    BITMAPINFO bmi{};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = size;
-    bmi.bmiHeader.biHeight = -size; // top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* bits = nullptr;
-    HBITMAP hbmpColor = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!hbmpColor || !bits) {
-        DeleteObject(hbmpColor);
-        return nullptr;
-    }
-
-    float center = (float)size / 2.f;
-    float glowR = center;
-    float coreR = (float)size * 0.16f;
-    float hotR = (float)size * 0.07f;
-    DWORD* pixels = (DWORD*)bits;
-    for (int y = 0; y < size; y++) {
-        for (int x = 0; x < size; x++) {
-            float dx = ((float)x + 0.5f) - center;
-            float dy = ((float)y + 0.5f) - center;
-            float d = sqrtf((dx * dx) + (dy * dy));
-
-            // the glow, densest where it meets the core and quadratically
-            // fading out; it also fills the core, so that anti-aliasing the
-            // core's edge blends it into the glow rather than into a gap
-            float t = limitValue((d - coreR) / (glowR - coreR), 0.f, 1.f);
-            float glowA = (d < glowR) ? 0.45f * (1.f - t) * (1.f - t) : 0.f;
-            // the dot itself, white-hot in the middle, saturated red at the edge
-            float coreA = limitValue(coreR + 0.5f - d, 0.f, 1.f);
-            float hot = limitValue(d / hotR, 0.f, 1.f);
-            float coreG = 255.f - (200.f * hot);
-
-            // core over glow, written out premultiplied (as 32bpp cursors want)
-            float glowW = glowA * (1.f - coreA);
-            float alpha = coreA + glowW;
-            if (alpha <= 0.f) {
-                pixels[(y * size) + x] = 0;
-                continue;
-            }
-            u8 a = (u8)(alpha * 255.f);
-            u8 r = (u8)((255.f * coreA) + (255.f * glowW));
-            u8 g = (u8)((coreG * coreA) + (16.f * glowW));
-            u8 b = g;
-            pixels[(y * size) + x] = ((DWORD)a << 24) | ((DWORD)r << 16) | ((DWORD)g << 8) | b;
-        }
-    }
-
-    // 32bpp cursors carry their own alpha, but CreateIconIndirect still wants a
-    // mask bitmap; an all-zero AND mask leaves the color bitmap in charge
-    int maskBytesPerRow = ((size + 15) / 16) * 2;
-    u8* maskBits = AllocArray<u8>(maskBytesPerRow * size);
-    HBITMAP hbmpMask = CreateBitmap(size, size, 1, 1, maskBits);
-    HCURSOR res = nullptr;
-    if (hbmpMask) {
-        ICONINFO ii{};
-        ii.fIcon = FALSE;
-        ii.xHotspot = (DWORD)(size / 2);
-        ii.yHotspot = (DWORD)(size / 2);
-        ii.hbmMask = hbmpMask;
-        ii.hbmColor = hbmpColor;
-        res = (HCURSOR)CreateIconIndirect(&ii);
-        DeleteObject(hbmpMask);
-    }
-    DeleteObject(hbmpColor);
-    free(maskBits);
-    return res;
-}
-
-// the cursor is sized for the DPI of the window it's shown in, so it's
-// re-created when the canvas moves to a monitor with a different scaling
-static HCURSOR GetLaserPointerCursor() {
-    int size = DpiScale(kLaserPointerCursorSize);
-    if (gCursorLaserPointer && (gCursorLaserPointerSize == size)) {
-        return gCursorLaserPointer;
-    }
-    HCURSOR cur = CreateLaserPointerCursor(size);
-    if (!cur) {
-        // a cursor of the wrong size beats no cursor at all
-        return gCursorLaserPointer;
-    }
-    if (gCursorLaserPointer) {
-        DestroyCursor(gCursorLaserPointer);
-    }
-    gCursorLaserPointer = cur;
-    gCursorLaserPointerSize = size;
-    return cur;
-}
-
-void DeleteLaserPointerCursor() {
-    if (gCursorLaserPointer) {
-        DestroyCursor(gCursorLaserPointer);
-        gCursorLaserPointer = nullptr;
-        gCursorLaserPointerSize = 0;
-    }
-}
-
-bool IsLaserPointerActive() {
-    return gLaserPointer;
-}
 
 // while on, the canvas cursor is the laser dot no matter what is under it:
 // links, text and annotations still work, they just don't change the cursor
@@ -244,329 +128,6 @@ void ToggleLaserPointer(MainWindow* win) {
     SendMessageW(win->hwndCanvas, WM_SETCURSOR, 0, 0);
 }
 
-// OLE drag-drop support for dragging selected text out of the window
-class TextDropSource : public IDropSource {
-    AtomicInt refCount = 1;
-
-  public:
-    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-        if (riid == IID_IUnknown || riid == IID_IDropSource) {
-            *ppv = this;
-            AddRef();
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return AtomicIntInc(&refCount); }
-    ULONG STDMETHODCALLTYPE Release() override {
-        LONG r = InterlockedDecrement(&refCount);
-        if (r == 0) {
-            delete this;
-        }
-        return r;
-    }
-    STDMETHODIMP QueryContinueDrag(BOOL fEscapePressed, DWORD grfKeyState) override {
-        if (fEscapePressed) {
-            return DRAGDROP_S_CANCEL;
-        }
-        if (!(grfKeyState & MK_LBUTTON)) {
-            return DRAGDROP_S_DROP;
-        }
-        return S_OK;
-    }
-    STDMETHODIMP GiveFeedback(__unused DWORD dwEffect) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
-};
-
-// Drop source that paints a proportional thumbnail via ImageList_BeginDrag
-// (IDragSourceHelper does not show a drag image for our custom IDataObject).
-class ImageDropSource : public IDropSource {
-    AtomicInt refCount = 1;
-    HIMAGELIST himl = nullptr;
-    bool dragStarted = false;
-
-  public:
-    explicit ImageDropSource(HIMAGELIST list) : himl(list) {}
-    ~ImageDropSource() {
-        EndImageListDrag();
-        if (himl) {
-            ImageList_Destroy(himl);
-            himl = nullptr;
-        }
-    }
-
-    bool BeginImageListDrag(int hotX, int hotY) {
-        if (!himl) {
-            return false;
-        }
-        if (!ImageList_BeginDrag(himl, 0, hotX, hotY)) {
-            return false;
-        }
-        Point pt = GetCursorPosition();
-        // Desktop HWND so the drag image is not clipped to our canvas
-        if (!ImageList_DragEnter(GetDesktopWindow(), pt.x, pt.y)) {
-            ImageList_EndDrag();
-            return false;
-        }
-        dragStarted = true;
-        return true;
-    }
-
-    void EndImageListDrag() {
-        if (!dragStarted) {
-            return;
-        }
-        ImageList_DragLeave(GetDesktopWindow());
-        ImageList_EndDrag();
-        dragStarted = false;
-    }
-
-    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-        if (riid == IID_IUnknown || riid == IID_IDropSource) {
-            *ppv = this;
-            AddRef();
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return AtomicIntInc(&refCount); }
-    ULONG STDMETHODCALLTYPE Release() override {
-        LONG r = InterlockedDecrement(&refCount);
-        if (r == 0) {
-            delete this;
-        }
-        return r;
-    }
-    STDMETHODIMP QueryContinueDrag(BOOL fEscapePressed, DWORD grfKeyState) override {
-        if (fEscapePressed) {
-            return DRAGDROP_S_CANCEL;
-        }
-        if (!(grfKeyState & MK_LBUTTON)) {
-            return DRAGDROP_S_DROP;
-        }
-        return S_OK;
-    }
-    STDMETHODIMP GiveFeedback(__unused DWORD dwEffect) override {
-        if (dragStarted) {
-            Point pt = GetCursorPosition();
-            ImageList_DragMove(pt.x, pt.y);
-            // S_OK: we supply the drag visual via ImageList (not the OLE default cursor)
-            return S_OK;
-        }
-        return DRAGDROP_S_USEDEFAULTCURSORS;
-    }
-};
-
-class SimpleEnumFormatEtc : public IEnumFORMATETC {
-    AtomicInt refCount = 1;
-    const FORMATETC* formats = nullptr;
-    ULONG count = 0;
-    ULONG index = 0;
-
-  public:
-    SimpleEnumFormatEtc(const FORMATETC* fmts, ULONG n) : formats(fmts), count(n) {}
-
-    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-        if (riid == IID_IUnknown || riid == IID_IEnumFORMATETC) {
-            *ppv = this;
-            AddRef();
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return AtomicIntInc(&refCount); }
-    ULONG STDMETHODCALLTYPE Release() override {
-        LONG r = InterlockedDecrement(&refCount);
-        if (r == 0) {
-            delete this;
-        }
-        return r;
-    }
-
-    STDMETHODIMP Next(ULONG celt, FORMATETC* rgelt, ULONG* pceltFetched) override {
-        if (!rgelt) {
-            return E_POINTER;
-        }
-        ULONG fetched = 0;
-        while (fetched < celt && index < count) {
-            rgelt[fetched++] = formats[index++];
-        }
-        if (pceltFetched) {
-            *pceltFetched = fetched;
-        }
-        return fetched == celt ? S_OK : S_FALSE;
-    }
-    STDMETHODIMP Skip(ULONG celt) override {
-        if (index + celt < count) {
-            index += celt;
-            return S_OK;
-        }
-        index = count;
-        return S_FALSE;
-    }
-    STDMETHODIMP Reset() override {
-        index = 0;
-        return S_OK;
-    }
-    STDMETHODIMP Clone(IEnumFORMATETC** ppEnum) override {
-        if (!ppEnum) {
-            return E_POINTER;
-        }
-        auto* e = new SimpleEnumFormatEtc(formats, count);
-        e->index = index;
-        *ppEnum = e;
-        return S_OK;
-    }
-};
-
-class TextDataObject : public IDataObject {
-    AtomicInt refCount = 1;
-    HGLOBAL hText = nullptr;
-
-  public:
-    explicit TextDataObject(WStr text) {
-        if (len(text) == 0) {
-            return;
-        }
-        size_t cb = (size_t)(text.len + 1) * sizeof(WCHAR);
-        hText = GlobalAlloc(GMEM_MOVEABLE, cb);
-        if (hText) {
-            void* p = GlobalLock(hText);
-            if (p) {
-                memcpy(p, text.s, text.len * sizeof(WCHAR));
-                ((WCHAR*)p)[text.len] = 0;
-                GlobalUnlock(hText);
-            } else {
-                GlobalFree(hText);
-                hText = nullptr;
-            }
-        }
-    }
-    ~TextDataObject() {
-        if (hText) {
-            GlobalFree(hText);
-        }
-    }
-
-    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-        if (riid == IID_IUnknown || riid == IID_IDataObject) {
-            *ppv = this;
-            AddRef();
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return AtomicIntInc(&refCount); }
-    ULONG STDMETHODCALLTYPE Release() override {
-        LONG r = InterlockedDecrement(&refCount);
-        if (r == 0) {
-            delete this;
-        }
-        return r;
-    }
-
-    STDMETHODIMP GetData(FORMATETC* pFE, STGMEDIUM* pMedium) override {
-        if (!hText) {
-            return E_UNEXPECTED;
-        }
-        if (pFE->cfFormat != CF_UNICODETEXT || !(pFE->tymed & TYMED_HGLOBAL)) {
-            return DV_E_FORMATETC;
-        }
-        size_t cb = GlobalSize(hText);
-        HGLOBAL hCopy = GlobalAlloc(GMEM_MOVEABLE, cb);
-        if (!hCopy) {
-            return E_OUTOFMEMORY;
-        }
-        void* src = GlobalLock(hText);
-        void* dst = GlobalLock(hCopy);
-        if (!src || !dst) {
-            if (src) {
-                GlobalUnlock(hText);
-            }
-            if (dst) {
-                GlobalUnlock(hCopy);
-            }
-            GlobalFree(hCopy);
-            return E_OUTOFMEMORY;
-        }
-        memcpy(dst, src, cb);
-        GlobalUnlock(hCopy);
-        GlobalUnlock(hText);
-        pMedium->tymed = TYMED_HGLOBAL;
-        pMedium->hGlobal = hCopy;
-        pMedium->pUnkForRelease = nullptr;
-        return S_OK;
-    }
-    STDMETHODIMP GetDataHere(__unused FORMATETC* pFE, __unused STGMEDIUM* pMed) override { return E_NOTIMPL; }
-    STDMETHODIMP QueryGetData(FORMATETC* pFE) override {
-        if (pFE->cfFormat == CF_UNICODETEXT && (pFE->tymed & TYMED_HGLOBAL)) {
-            return S_OK;
-        }
-        return DV_E_FORMATETC;
-    }
-    STDMETHODIMP GetCanonicalFormatEtc(__unused FORMATETC* pIn, FORMATETC* pOut) override {
-        pOut->ptd = nullptr;
-        return E_NOTIMPL;
-    }
-    STDMETHODIMP SetData(__unused FORMATETC* pFE, __unused STGMEDIUM* pMed, __unused BOOL fRelease) override {
-        return E_NOTIMPL;
-    }
-    STDMETHODIMP EnumFormatEtc(__unused DWORD dwDirection, __unused IEnumFORMATETC** ppEnum) override {
-        return E_NOTIMPL;
-    }
-    STDMETHODIMP DAdvise(__unused FORMATETC* pFE, __unused DWORD advf, __unused IAdviseSink* pAdvSink,
-                         __unused DWORD* pdwConn) override {
-        return E_NOTIMPL;
-    }
-    STDMETHODIMP DUnadvise(__unused DWORD dwConn) override { return E_NOTIMPL; }
-    STDMETHODIMP EnumDAdvise(__unused IEnumSTATDATA** ppEnumAdvise) override { return E_NOTIMPL; }
-};
-
-static bool IsPointInSelection(MainWindow* win, Point pt) {
-    WindowTab* tab = win->CurrentTab();
-    if (!tab || !tab->selectionOnPage) {
-        return false;
-    }
-    DisplayModel* dm = win->AsFixed();
-    if (!dm) {
-        return false;
-    }
-    for (SelectionOnPage& sel : *tab->selectionOnPage) {
-        Rect r = sel.GetRect(dm);
-        if (r.Contains(pt)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// data object of the most recent drag-out, kept connected because cross-process
-// drop targets can still extract data after DoDragDrop returns (e.g. Explorer
-// fetches CFSTR_FILECONTENTS after IDropTarget::Drop returns)
-static IDataObject* gLastDragDataObj = nullptr;
-
-// DoDragDrop marshals the data object (CoMarshalInterface) for cross-process
-// targets and never releases the stub's references, not even in
-// OleUninitialize, which would leak the object. Disconnecting right after
-// DoDragDrop returns breaks targets that extract data after Drop() returns,
-// so we keep the object connected until the next drag-out or app exit.
-void DisconnectLastDragDataObject() {
-    if (!gLastDragDataObj) {
-        return;
-    }
-    CoDisconnectObject(gLastDragDataObj, 0);
-    gLastDragDataObj->Release();
-    gLastDragDataObj = nullptr;
-}
-
-static void FinishDragDrop(IDataObject* dataObj) {
-    DisconnectLastDragDataObject();
-    gLastDragDataObj = dataObj; // transfers our reference
-}
-
 static void StartTextDragDrop(MainWindow* win) {
     WindowTab* tab = win->CurrentTab();
     bool isTextOnly = false;
@@ -583,337 +144,8 @@ static void StartTextDragDrop(MainWindow* win) {
     FinishDragDrop(dataObj);
 }
 
-// encode HBITMAP to PNG in memory using GDI+ IStream
-static HGLOBAL EncodeBitmapToPngGlobal(HBITMAP hbmp) {
-    Gdiplus::Bitmap gdipBmp(hbmp, nullptr);
-    if (gdipBmp.GetLastStatus() != Gdiplus::Ok) {
-        return nullptr;
-    }
-    CLSID pngClsid = GetGdiPlusEncoderClsid(L"image/png");
-    IStream* stream = nullptr;
-    HRESULT hr = CreateStreamOnHGlobal(nullptr, FALSE, &stream);
-    if (FAILED(hr) || !stream) {
-        return nullptr;
-    }
-    Gdiplus::Status status = gdipBmp.Save(stream, &pngClsid, nullptr);
-    HGLOBAL hMem = nullptr;
-    if (status == Gdiplus::Ok) {
-        GetHGlobalFromStream(stream, &hMem);
-    }
-    stream->Release();
-    if (status != Gdiplus::Ok) {
-        return nullptr;
-    }
-    return hMem;
-}
-
-// IDataObject that provides an image as a virtual file (CFSTR_FILEDESCRIPTOR + CFSTR_FILECONTENTS)
-// without creating any temporary files on disk.
-class ImageDataObject : public IDataObject {
-    AtomicInt refCount = 1;
-    HGLOBAL hPngData = nullptr; // PNG-encoded image data
-    size_t pngSize = 0;
-    UINT cfFileDescriptor = 0;
-    UINT cfFileContents = 0;
-    UINT cfPreferredDropEffect = 0;
-    FORMATETC fmts[3]{};
-    ULONG fmtCount = 0;
-
-    bool QueryFormatSupported(FORMATETC* pFE) const {
-        for (ULONG i = 0; i < fmtCount; i++) {
-            const FORMATETC& fmt = fmts[i];
-            if (pFE->cfFormat != fmt.cfFormat) {
-                continue;
-            }
-            if (fmt.lindex >= 0 && pFE->lindex != fmt.lindex) {
-                continue;
-            }
-            if (pFE->tymed & fmt.tymed) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-  public:
-    explicit ImageDataObject(HGLOBAL hPng) {
-        hPngData = hPng;
-        pngSize = GlobalSize(hPng);
-        cfFileDescriptor = RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
-        cfFileContents = RegisterClipboardFormatW(CFSTR_FILECONTENTS);
-        cfPreferredDropEffect = RegisterClipboardFormatW(L"Preferred DropEffect");
-
-        fmts[0] = {(CLIPFORMAT)cfFileDescriptor, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-        fmts[1] = {(CLIPFORMAT)cfFileContents, nullptr, DVASPECT_CONTENT, 0, TYMED_ISTREAM | TYMED_HGLOBAL};
-        fmts[2] = {(CLIPFORMAT)cfPreferredDropEffect, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-        fmtCount = 3;
-    }
-    ~ImageDataObject() {
-        if (hPngData) {
-            GlobalFree(hPngData);
-        }
-    }
-
-    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-        if (riid == IID_IUnknown || riid == IID_IDataObject) {
-            *ppv = this;
-            AddRef();
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return AtomicIntInc(&refCount); }
-    ULONG STDMETHODCALLTYPE Release() override {
-        LONG r = InterlockedDecrement(&refCount);
-        if (r == 0) {
-            delete this;
-        }
-        return r;
-    }
-
-    STDMETHODIMP GetData(FORMATETC* pFE, STGMEDIUM* pMedium) override {
-        if (!hPngData) {
-            return E_UNEXPECTED;
-        }
-
-        // CFSTR_FILEDESCRIPTORW: describe one virtual file "image.png"
-        if (pFE->cfFormat == cfFileDescriptor && (pFE->tymed & TYMED_HGLOBAL)) {
-            size_t cb = offsetof(FILEGROUPDESCRIPTORW, fgd) + sizeof(FILEDESCRIPTORW);
-            HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, cb);
-            if (!h) {
-                return E_OUTOFMEMORY;
-            }
-            auto* fgd = (FILEGROUPDESCRIPTORW*)GlobalLock(h);
-            if (!fgd) {
-                GlobalFree(h);
-                return E_OUTOFMEMORY;
-            }
-            fgd->cItems = 1;
-            fgd->fgd[0].dwFlags = FD_FILESIZE | FD_ATTRIBUTES;
-            fgd->fgd[0].dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-            fgd->fgd[0].nFileSizeLow = (DWORD)pngSize;
-            fgd->fgd[0].nFileSizeHigh = 0;
-            wstr::BufSet(WStr(fgd->fgd[0].cFileName, MAX_PATH), WStrL(L"image.png"));
-            GlobalUnlock(h);
-            pMedium->tymed = TYMED_HGLOBAL;
-            pMedium->hGlobal = h;
-            pMedium->pUnkForRelease = nullptr;
-            return S_OK;
-        }
-
-        // CFSTR_FILECONTENTS: provide the PNG data as an IStream or HGLOBAL
-        if (pFE->cfFormat == cfFileContents && pFE->lindex == 0) {
-            if (pFE->tymed & TYMED_HGLOBAL) {
-                HGLOBAL hCopy = GlobalAlloc(GMEM_MOVEABLE, pngSize);
-                if (!hCopy) {
-                    return E_OUTOFMEMORY;
-                }
-                void* src = GlobalLock(hPngData);
-                void* dst = GlobalLock(hCopy);
-                if (!src || !dst) {
-                    if (src) {
-                        GlobalUnlock(hPngData);
-                    }
-                    if (dst) {
-                        GlobalUnlock(hCopy);
-                    }
-                    GlobalFree(hCopy);
-                    return E_OUTOFMEMORY;
-                }
-                memcpy(dst, src, pngSize);
-                GlobalUnlock(hCopy);
-                GlobalUnlock(hPngData);
-                pMedium->tymed = TYMED_HGLOBAL;
-                pMedium->hGlobal = hCopy;
-                pMedium->pUnkForRelease = nullptr;
-                return S_OK;
-            }
-            if (pFE->tymed & TYMED_ISTREAM) {
-                IStream* stream = nullptr;
-                HRESULT hr = CreateStreamOnHGlobal(nullptr, TRUE, &stream);
-                if (FAILED(hr) || !stream) {
-                    return E_OUTOFMEMORY;
-                }
-                void* src = GlobalLock(hPngData);
-                if (!src) {
-                    stream->Release();
-                    return E_OUTOFMEMORY;
-                }
-                ULONG written = 0;
-                stream->Write(src, (ULONG)pngSize, &written);
-                GlobalUnlock(hPngData);
-                LARGE_INTEGER zero{};
-                stream->Seek(zero, STREAM_SEEK_SET, nullptr);
-                pMedium->tymed = TYMED_ISTREAM;
-                pMedium->pstm = stream;
-                pMedium->pUnkForRelease = nullptr;
-                return S_OK;
-            }
-        }
-
-        if (pFE->cfFormat == cfPreferredDropEffect && (pFE->tymed & TYMED_HGLOBAL)) {
-            HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
-            if (!h) {
-                return E_OUTOFMEMORY;
-            }
-            auto* effect = (DWORD*)GlobalLock(h);
-            if (!effect) {
-                GlobalFree(h);
-                return E_OUTOFMEMORY;
-            }
-            *effect = DROPEFFECT_COPY;
-            GlobalUnlock(h);
-            pMedium->tymed = TYMED_HGLOBAL;
-            pMedium->hGlobal = h;
-            pMedium->pUnkForRelease = nullptr;
-            return S_OK;
-        }
-
-        return DV_E_FORMATETC;
-    }
-    STDMETHODIMP GetDataHere(__unused FORMATETC* pFE, __unused STGMEDIUM* pMed) override { return E_NOTIMPL; }
-    STDMETHODIMP QueryGetData(FORMATETC* pFE) override { return QueryFormatSupported(pFE) ? S_OK : DV_E_FORMATETC; }
-    STDMETHODIMP GetCanonicalFormatEtc(__unused FORMATETC* pIn, FORMATETC* pOut) override {
-        pOut->ptd = nullptr;
-        return E_NOTIMPL;
-    }
-    STDMETHODIMP SetData(__unused FORMATETC* pFE, __unused STGMEDIUM* pMed, __unused BOOL fRelease) override {
-        return E_NOTIMPL;
-    }
-    STDMETHODIMP EnumFormatEtc(DWORD dwDirection, IEnumFORMATETC** ppEnum) override {
-        if (!ppEnum) {
-            return E_POINTER;
-        }
-        if (dwDirection != DATADIR_GET) {
-            return E_NOTIMPL;
-        }
-        *ppEnum = new SimpleEnumFormatEtc(fmts, fmtCount);
-        return S_OK;
-    }
-    STDMETHODIMP DAdvise(__unused FORMATETC* pFE, __unused DWORD advf, __unused IAdviseSink* pAdvSink,
-                         __unused DWORD* pdwConn) override {
-        return E_NOTIMPL;
-    }
-    STDMETHODIMP DUnadvise(__unused DWORD dwConn) override { return E_NOTIMPL; }
-    STDMETHODIMP EnumDAdvise(__unused IEnumSTATDATA** ppEnumAdvise) override { return E_NOTIMPL; }
-};
-
 // Longest edge of the proportional drag-out thumbnail (logical px; DPI-scaled).
 constexpr int kDragImageThumbnailSize = 220;
-
-// Proportional drag thumbnail (longest edge capped), Chrome-like.
-// GDI+ scales the source (StretchBlt on some DIB/mapped bitmaps leaves pure white).
-// Top-down 32bpp DIB with a 1px border so light pages stay visible. Caller owns HBITMAP.
-static HBITMAP CreateProportionalDragThumbnail(HBITMAP src, int maxEdge) {
-    if (!src || maxEdge < 16) {
-        return nullptr;
-    }
-    BITMAP bm{};
-    if (!GetObject(src, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) {
-        return nullptr;
-    }
-    int sw = bm.bmWidth;
-    int sh = bm.bmHeight;
-    int maxDim = sw > sh ? sw : sh;
-    int dw = sw;
-    int dh = sh;
-    if (maxDim > maxEdge) {
-        dw = (int)((i64)sw * maxEdge / maxDim);
-        dh = (int)((i64)sh * maxEdge / maxDim);
-        dw = std::max(dw, 1);
-        dh = std::max(dh, 1);
-    }
-
-    Gdiplus::Bitmap srcGdip(src, nullptr);
-    if (srcGdip.GetLastStatus() != Gdiplus::Ok) {
-        return nullptr;
-    }
-    Gdiplus::Bitmap scaled(dw, dh, PixelFormat32bppARGB);
-    if (scaled.GetLastStatus() != Gdiplus::Ok) {
-        return nullptr;
-    }
-    {
-        Gdiplus::Graphics g(&scaled);
-        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-        g.Clear(Gdiplus::Color(255, 255, 255, 255));
-        g.DrawImage(&srcGdip, 0, 0, dw, dh);
-        Gdiplus::Pen border(Gdiplus::Color(255, 60, 60, 60), 1.0f);
-        g.DrawRectangle(&border, 0, 0, dw - 1, dh - 1);
-    }
-
-    Gdiplus::BitmapData bd{};
-    Gdiplus::Rect lockRc(0, 0, dw, dh);
-    if (scaled.LockBits(&lockRc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) != Gdiplus::Ok) {
-        return nullptr;
-    }
-
-    BITMAPINFO bmi{};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = dw;
-    bmi.bmiHeader.biHeight = -dh; // top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* bits = nullptr;
-    HDC screenDc = GetDC(nullptr);
-    HBITMAP dib = screenDc ? CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
-    if (screenDc) {
-        ReleaseDC(nullptr, screenDc);
-    }
-    if (!dib || !bits) {
-        scaled.UnlockBits(&bd);
-        if (dib) {
-            DeleteObject(dib);
-        }
-        return nullptr;
-    }
-
-    auto* dst = (BYTE*)bits;
-    const auto* srcRow = (const BYTE*)bd.Scan0;
-    for (int y = 0; y < dh; y++) {
-        const auto* s = srcRow + ((size_t)y * bd.Stride);
-        auto* d = dst + ((size_t)y * dw * 4);
-        for (int x = 0; x < dw; x++) {
-            // GDI+ 32bppARGB is B,G,R,A in memory on Windows; full opacity
-            d[0] = s[0];
-            d[1] = s[1];
-            d[2] = s[2];
-            d[3] = 0xFF;
-            s += 4;
-            d += 4;
-        }
-    }
-    scaled.UnlockBits(&bd);
-    return dib;
-}
-
-// Build an imagelist from the thumbnail for ImageList_BeginDrag.
-// Takes ownership of hbmp (always destroyed before return).
-static HIMAGELIST CreateDragImageList(HBITMAP hbmp) {
-    if (!hbmp) {
-        return nullptr;
-    }
-    BITMAP bm{};
-    if (!GetObject(hbmp, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) {
-        DeleteObject(hbmp);
-        return nullptr;
-    }
-    HIMAGELIST himl = ImageList_Create(bm.bmWidth, bm.bmHeight, ILC_COLOR32, 1, 1);
-    if (!himl) {
-        DeleteObject(hbmp);
-        return nullptr;
-    }
-    int idx = ImageList_Add(himl, hbmp, nullptr);
-    DeleteObject(hbmp);
-    if (idx < 0) {
-        ImageList_Destroy(himl);
-        return nullptr;
-    }
-    return himl;
-}
 
 static void StartImageDragDrop(MainWindow* win) {
     DisplayModel* dm = win->AsFixed();
@@ -981,25 +213,6 @@ static void StartImageDragDrop(MainWindow* win) {
     FinishDragDrop(dataObj);
 }
 
-// Resize handle positions that used in resizing annotations
-enum class ResizeHandle {
-    None = 0,
-    TopLeft,
-    Top,
-    TopRight,
-    Right,
-    BottomRight,
-    Bottom,
-    BottomLeft,
-    Left,
-    LineStart,
-    LineEnd,
-    Vertex,
-};
-
-// Size of resize handle hit area (in pixels)
-constexpr int kResizeHandleSize = 8;
-
 // Smooth wheel scrolling: frame-rate–independent exponential chase of the
 // target offset (common browser-style "lerp toward destination").
 //
@@ -1017,10 +230,6 @@ static int gDeltaPerLine = 0;
 // set when WM_MOUSEWHEEL has been passed on (to prevent recursion)
 static bool gWheelMsgRedirect = false;
 static bool gInMouseWheelScroll = false;
-
-static int ScrollLineAmount(int configuredAmount) {
-    return configuredAmount > 0 ? configuredAmount : 16;
-}
 
 #if IS_DEBUG
 bool Canvas_UnitTestScrollLineAmount() {
@@ -1369,116 +578,6 @@ static void StartMouseDrag(MainWindow* win, int x, int y, bool right = false) {
     }
 }
 
-static bool IsLineEndpointHandle(ResizeHandle handle) {
-    return handle == ResizeHandle::LineStart || handle == ResizeHandle::LineEnd;
-}
-
-static bool IsVertexHandle(ResizeHandle handle) {
-    return handle == ResizeHandle::Vertex;
-}
-
-static bool IsPolyVertexType(AnnotationType tp) {
-    return tp == AnnotationType::PolyLine || tp == AnnotationType::Polygon;
-}
-
-// Line annotations: hit-test the two endpoints, not the bounding-box handles.
-static ResizeHandle GetLineEndpointHandleAt(DisplayModel* dm, Point pt, Annotation* annot) {
-    PointF start, end;
-    if (!GetLinePoints(annot, start, end)) {
-        return ResizeHandle::None;
-    }
-    Point startPt = dm->CvtToScreen(annot->pageNo, start);
-    Point endPt = dm->CvtToScreen(annot->pageNo, end);
-    int hs = kResizeHandleSize;
-    auto dist = [&](Point p) { return std::max(abs(pt.x - p.x), abs(pt.y - p.y)); };
-    int dStart = dist(startPt);
-    int dEnd = dist(endPt);
-    if (dStart <= hs && dStart <= dEnd) {
-        return ResizeHandle::LineStart;
-    }
-    if (dEnd <= hs) {
-        return ResizeHandle::LineEnd;
-    }
-    return ResizeHandle::None;
-}
-
-// PolyLine / Polygon: hit-test each vertex. Returns index, or -1.
-static int GetPolyVertexAt(DisplayModel* dm, Point pt, Annotation* annot) {
-    if (!annot || !IsPolyVertexType(annot->type)) {
-        return -1;
-    }
-    Vec<PointF> pts = GetVertices(annot);
-    int n = len(pts);
-    if (n == 0) {
-        return -1;
-    }
-    int hs = kResizeHandleSize;
-    int best = -1;
-    int bestDist = hs + 1;
-    for (int i = 0; i < n; i++) {
-        Point p = dm->CvtToScreen(annot->pageNo, pts[i]);
-        int d = std::max(abs(pt.x - p.x), abs(pt.y - p.y));
-        if (d <= hs && d < bestDist) {
-            best = i;
-            bestDist = d;
-        }
-    }
-    return best;
-}
-
-// Get the resize handle at the given point for the selected annotation
-static ResizeHandle GetResizeHandleAt(MainWindow* win, Point pt, Annotation* annot) {
-    if (!annot) {
-        return ResizeHandle::None;
-    }
-
-    DisplayModel* dm = win->AsFixed();
-    if (!dm) {
-        return ResizeHandle::None;
-    }
-
-    int pageNo = annot->pageNo;
-    if (!dm->PageVisible(pageNo)) {
-        return ResizeHandle::None;
-    }
-
-    if (annot->type == AnnotationType::Line) {
-        return GetLineEndpointHandleAt(dm, pt, annot);
-    }
-    if (IsPolyVertexType(annot->type)) {
-        return GetPolyVertexAt(dm, pt, annot) >= 0 ? ResizeHandle::Vertex : ResizeHandle::None;
-    }
-    if (annot->type == AnnotationType::Redact && len(GetQuadPointsAsRect(annot)) > 0) {
-        // text-selection marks are a set of quads, not a stretchable rect
-        return ResizeHandle::None;
-    }
-
-    Rect rect = dm->CvtToScreen(pageNo, GetRect(annot));
-    int hs = kResizeHandleSize;
-
-    bool nearLeft = pt.x >= rect.x - hs && pt.x <= rect.x + hs;
-    bool nearRight = pt.x >= rect.x + rect.dx - hs && pt.x <= rect.x + rect.dx + hs;
-    bool nearTop = pt.y >= rect.y - hs && pt.y <= rect.y + hs;
-    bool nearBottom = pt.y >= rect.y + rect.dy - hs && pt.y <= rect.y + rect.dy + hs;
-    bool betweenX = pt.x >= rect.x + hs && pt.x <= rect.x + rect.dx - hs;
-    bool betweenY = pt.y >= rect.y + hs && pt.y <= rect.y + rect.dy - hs;
-
-    // clang-format off
-    // corners have priority over edges
-    if (nearLeft  && nearTop)    return ResizeHandle::TopLeft;
-    if (nearRight && nearTop)    return ResizeHandle::TopRight;
-    if (nearRight && nearBottom) return ResizeHandle::BottomRight;
-    if (nearLeft  && nearBottom) return ResizeHandle::BottomLeft;
-    // edges
-    if (betweenX  && nearTop)    return ResizeHandle::Top;
-    if (nearRight && betweenY)   return ResizeHandle::Right;
-    if (betweenX  && nearBottom) return ResizeHandle::Bottom;
-    if (nearLeft  && betweenY)   return ResizeHandle::Left;
-    // clang-format on
-
-    return ResizeHandle::None;
-}
-
 // Get the appropriate cursor for a resize handle
 static LPWSTR GetCursorForResizeHandle(ResizeHandle handle) {
     switch (handle) {
@@ -1675,7 +774,6 @@ bool IsDragDistance(int x1, int x2, int y1, int y2) {
 }
 
 // Forward declaration
-static RectF CalculateResizedRect(MainWindow* win, int x, int y);
 
 // --- touch text selection (issue #538) --------------------------------------
 // Everything here logs under "touch:" so a session on a real touchscreen can be
@@ -1825,17 +923,6 @@ static bool OnTouchLongPress(MainWindow* win, int x, int y) {
     return true;
 }
 
-// Edit PDF with an annotation selected (its toolbar is up): the mouse works only
-// on that annotation, and a click anywhere else just deselects it
-static Annotation* AnnotationLockingMouse(MainWindow* win) {
-    WindowTab* tab = win ? win->CurrentTab() : nullptr;
-    Annotation* annot = tab ? tab->selectedAnnotation : nullptr;
-    if (!win || !win->pdfAnnotationsToolbarEnabled || !AnnotationIsLive(annot)) {
-        return nullptr;
-    }
-    return annot;
-}
-
 // the last left press only deselected an annotation, so a double-click it
 // started must not act on the page
 static bool gPressOnlyDeselected = false;
@@ -1963,7 +1050,7 @@ static void OnMouseMove(MainWindow* win, int x, int y, WPARAM key) {
         dm->GetEngine()->RequestTextExtraction(pageNo);
     }
 
-    NotificationWnd* cursorPosNotif = GetNotificationForGroup(win->hwndCanvas, kNotifCursorPos);
+    NotificationWnd* cursorPosNotif = GetNotificationForGroup(win, kNotifCursorPos);
 
     if (win->textDragPending) {
         if (!IsDragDistance(x, win->dragStart.x, y, win->dragStart.y)) {
@@ -2014,7 +1101,7 @@ static void OnMouseMove(MainWindow* win, int x, int y, WPARAM key) {
                 if (win->annotationUnderCursor != prev) {
                     ScheduleRepaint(win, 0);
                 }
-                RemoveNotificationsForGroup(win->hwndCanvas, kNotifAnnotation);
+                RemoveNotificationsForGroup(win, kNotifAnnotation);
                 HideAnnotationHoverOverlay(win);
                 break;
             }
@@ -2033,7 +1120,7 @@ static void OnMouseMove(MainWindow* win, int x, int y, WPARAM key) {
                     ScheduleRepaint(win, 0);
                 }
             }
-            RemoveNotificationsForGroup(win->hwndCanvas, kNotifAnnotation);
+            RemoveNotificationsForGroup(win, kNotifAnnotation);
             win->annotationUnderCursor = annot;
             if (editPdf) {
                 UpdateAnnotationHoverOverlay(win);
@@ -2138,97 +1225,6 @@ static void StartAnnotationDrag(MainWindow* win, Annotation* annot, Point& pt) {
     DrawMovePattern(win, pt, win->annotationBeingMovedSize);
 }
 
-// Helper function to calculate new rectangle during resize
-static RectF CalculateResizedRect(MainWindow* win, int x, int y) {
-    DisplayModel* dm = win->AsFixed();
-    Annotation* annot = win->annotationBeingDragged;
-    int pageNo = PageNo(annot);
-
-    // Convert screen coordinates to page coordinates
-    Rect screenPt{x, y, 1, 1};
-    RectF pagePt = dm->CvtFromScreen(screenPt, pageNo);
-
-    RectF orig = win->annotationOriginalRect;
-    RectF r = orig;
-
-    Point startPt = win->dragStart;
-    Rect startScreen{startPt.x, startPt.y, 1, 1};
-    RectF startPage = dm->CvtFromScreen(startScreen, pageNo);
-
-    float deltaX = pagePt.x - startPage.x;
-    float deltaY = pagePt.y - startPage.y;
-
-    const float minSize = 10.0F;
-    auto handle = (ResizeHandle)win->resizeHandle;
-
-    bool moveLeft =
-        handle == ResizeHandle::TopLeft || handle == ResizeHandle::Left || handle == ResizeHandle::BottomLeft;
-    bool moveRight =
-        handle == ResizeHandle::TopRight || handle == ResizeHandle::Right || handle == ResizeHandle::BottomRight;
-    bool moveTop = handle == ResizeHandle::TopLeft || handle == ResizeHandle::Top || handle == ResizeHandle::TopRight;
-    bool moveBottom =
-        handle == ResizeHandle::BottomLeft || handle == ResizeHandle::Bottom || handle == ResizeHandle::BottomRight;
-
-    if (moveLeft) {
-        r.x = orig.x + deltaX;
-        r.dx = orig.dx - deltaX;
-        if (r.dx < minSize) {
-            r.x = orig.x + orig.dx - minSize;
-            r.dx = minSize;
-        }
-    }
-    if (moveRight) {
-        r.dx = orig.dx + deltaX;
-        r.dx = std::max(r.dx, minSize);
-    }
-    if (moveTop) {
-        r.y = orig.y + deltaY;
-        r.dy = orig.dy - deltaY;
-        if (r.dy < minSize) {
-            r.y = orig.y + orig.dy - minSize;
-            r.dy = minSize;
-        }
-    }
-    if (moveBottom) {
-        r.dy = orig.dy + deltaY;
-        r.dy = std::max(r.dy, minSize);
-    }
-
-    float aspect = win->annotationResizeAspectRatio;
-    if (aspect > 0) {
-        bool widthDriven = moveLeft || moveRight;
-        if (widthDriven && (moveTop || moveBottom)) {
-            float widthChange = orig.dx > 0 ? fabsf(r.dx - orig.dx) / orig.dx : 0;
-            float heightChange = orig.dy > 0 ? fabsf(r.dy - orig.dy) / orig.dy : 0;
-            widthDriven = widthChange >= heightChange;
-        }
-        if (widthDriven) {
-            r.dx = std::max(r.dx, minSize * aspect);
-            r.dy = r.dx / aspect;
-        } else {
-            r.dy = std::max(r.dy, minSize);
-            r.dx = r.dy * aspect;
-        }
-
-        if (moveLeft) {
-            r.x = orig.x + orig.dx - r.dx;
-        } else if (moveRight) {
-            r.x = orig.x;
-        } else {
-            r.x = orig.x + ((orig.dx - r.dx) / 2);
-        }
-        if (moveTop) {
-            r.y = orig.y + orig.dy - r.dy;
-        } else if (moveBottom) {
-            r.y = orig.y;
-        } else {
-            r.y = orig.y + ((orig.dy - r.dy) / 2);
-        }
-    }
-
-    return r;
-}
-
 static void StartAnnotationResize(MainWindow* win, Annotation* annot, Point& pt, ResizeHandle handle) {
     CancelAnnotationResizeRerender(win);
     // the drag rewrites the annotation on every mouse move; one undo step
@@ -2331,29 +1327,6 @@ static bool IsTripleClick(int x, int y) {
     int dx = abs(x - gLastWordSelectPos.x);
     int dy = abs(y - gLastWordSelectPos.y);
     return dx <= GetSystemMetrics(SM_CXDOUBLECLK) && dy <= GetSystemMetrics(SM_CYDOUBLECLK);
-}
-
-// a full-page image (e.g. a scanned page) shouldn't start an image drag-out:
-// there click-and-drag is expected to pan the page (issue #5754). detect it by
-// comparing the image's area to the page's.
-static bool IsFullPageImage(DisplayModel* dm, IPageElement* el, int pageNo) {
-    // in image documents every page is a full-page image and dragging
-    // it out to another app is the expected behavior
-    Kind k = dm->GetEngine()->kind;
-    if (k == kindEngineImage || k == kindEngineImageDir || k == kindEngineComicBooks) {
-        return false;
-    }
-    if (!dm->ValidPageNo(pageNo)) {
-        return false;
-    }
-    RectF pageRc = dm->GetEngine()->PageMediabox(pageNo);
-    float pageArea = pageRc.dx * pageRc.dy;
-    if (pageArea <= 0) {
-        return false;
-    }
-    RectF imgRc = el->GetRect();
-    float imgArea = imgRc.dx * imgRc.dy;
-    return imgArea >= 0.8f * pageArea;
 }
 
 static bool MouseHasCtrl(WPARAM key) {
@@ -2818,7 +1791,7 @@ static void OnMouseLeftButtonUp(MainWindow* win, int x, int y, WPARAM key) {
         /* follow an active link */
         // highlight the clicked link (as a reminder of the last action once the user returns)
         Kind kind = destKind;
-        if ((kindDestinationLaunchURL == kind || kindDestinationLaunchFile == kind)) {
+        if (IsLaunchLinkKind(kind)) {
             DeleteOldSelectionInfo(win, true);
             tab->selectionOnPage = SelectionOnPage::FromRectangle(dm, dm->CvtToScreen(pageNo, link->GetRect()));
             win->showSelection = tab->selectionOnPage != nullptr;
@@ -2827,8 +1800,7 @@ static void OnMouseLeftButtonUp(MainWindow* win, int x, int y, WPARAM key) {
         SetCanvasCursor(win, IDC_ARROW);
 
         // Ctrl+click on internal link: open in new tab and navigate there
-        bool isInternal =
-            (kindDestinationLaunchURL != kind && kindDestinationLaunchFile != kind && kindDestinationJsMenu != kind);
+        bool isInternal = !IsLaunchLinkKind(kind) && kindDestinationJsMenu != kind;
         if (IsCtrlPressed() && dest && isInternal && tab->filePath) {
             LoadArgs args(tab->filePath, win);
             args.showWin = true;
@@ -3174,32 +2146,6 @@ static void PaintPageFrameAndShadow(HDC hdc, Rect& bounds, Rect& /*pageRect*/, b
 }
 #endif
 
-// CmdToggleImages. Like showLinks this is a debug aid (both live in the debug
-// menu, so both are debug / pre-release only), and like it the outlines are
-// only drawn, never saved - see CmdToggleImages in FrameOnCommand
-static bool gShowImages = false;
-
-// CmdToggleImages: outline images the way showLinks outlines links (debug aid)
-bool ShowImageOutlines() {
-    return gShowImages;
-}
-
-void ToggleShowImageOutlines() {
-    gShowImages = !gShowImages;
-}
-
-// CmdToggleTransparencyGrid: Acrobat-style checkerboard under the page so
-// transparent PDFs (white art on a hole) are visible. Session-only, not saved.
-static bool gShowTransparencyGrid = false;
-
-bool ShowTransparencyGrid() {
-    return gShowTransparencyGrid;
-}
-
-void ToggleTransparencyGrid() {
-    gShowTransparencyGrid = !gShowTransparencyGrid;
-}
-
 // CmdTogglePageGrid: dotted graph paper on the page (issue #4398).
 // Session-only, not saved. Overlay on top of the page bitmap (normal PDFs
 // are opaque, so this cannot sit under glyphs). Fixed-page documents only.
@@ -3215,14 +2161,6 @@ void TogglePageGrid() {
 
 void SetShowPageGrid(bool on) {
     gShowPageGrid = on;
-}
-
-void RedrawPageGridWindows() {
-    for (MainWindow* w : gWindows) {
-        if (w) {
-            w->RedrawAll(true);
-        }
-    }
 }
 
 /* debug code to visualize links and images (can block while rendering) */
@@ -3269,54 +2207,9 @@ static void DebugShowLinks(DisplayModel* dm, HDC hdc) {
     DebugOutlinePageElements(dm, hdc, false);
 }
 
-// CmdDebugShowFitContentArea. Like gShowImages, a debug-only visualization that
-// is drawn but never saved to settings
-static bool gShowFitContentArea = false;
-
-void ToggleShowFitContentArea() {
-    gShowFitContentArea = !gShowFitContentArea;
-}
-
-bool ShowFitContentArea() {
-    return gShowFitContentArea;
-}
-
 /* debug code to visualize the area "Fit Content" zoom would fit to, without
    actually switching the zoom. When no content box is detected we outline the
    whole page, which is the same fallback PageSizeAfterRotation() uses */
-static Color ColorForPdfPageBox(PdfPageBoxKind kind) {
-    switch (kind) {
-        case PdfPageBoxKind::Media:
-            return MkRgb(0x20, 0x20, 0x20);
-        case PdfPageBoxKind::Crop:
-            return MkRgb(0xc0, 0x20, 0x20);
-        case PdfPageBoxKind::Bleed:
-            return MkRgb(0x20, 0x40, 0xc0);
-        case PdfPageBoxKind::Trim:
-            return MkRgb(0x10, 0x90, 0x20);
-        case PdfPageBoxKind::Art:
-            return MkRgb(0xc0, 0x80, 0x00);
-    }
-    return kColBlack;
-}
-
-// Place the label so coincident boxes (crop == media, etc.) stay readable.
-static Point PdfPageBoxLabelPos(const Rect& r, PdfPageBoxKind kind) {
-    constexpr int kPad = 3;
-    switch (kind) {
-        case PdfPageBoxKind::Media:
-            return Point(r.x + kPad, r.y + kPad);
-        case PdfPageBoxKind::Crop:
-            return Point(r.x + r.dx - kPad, r.y + kPad);
-        case PdfPageBoxKind::Bleed:
-            return Point(r.x + kPad, r.y + r.dy - kPad);
-        case PdfPageBoxKind::Trim:
-            return Point(r.x + r.dx - kPad, r.y + r.dy - kPad);
-        case PdfPageBoxKind::Art:
-            return Point(r.x + (r.dx / 2), r.y + kPad);
-    }
-    return r.TL();
-}
 
 static uint PdfPageBoxLabelFormat(PdfPageBoxKind kind) {
     switch (kind) {
@@ -3386,7 +2279,6 @@ constexpr int kPageGridMinMinorPx = 6;
 constexpr int kPageGridMinMajorPx = 4;
 constexpr int kPageGridMaxDots = 8000;
 constexpr int kPageGridMaxLines = 800;
-constexpr Color kPageGridDefaultColor = MkRgb(128, 128, 255);
 
 enum class PageGridStyleKind {
     Dots,
@@ -3438,24 +2330,6 @@ static PageGridDraw GetPageGridDraw() {
     return d;
 }
 
-static float PageGridAlignDown(float v, float origin, float step) {
-    if (step <= 0) {
-        return origin;
-    }
-    return origin + (floorf((v - origin) / step) * step);
-}
-
-static bool PageGridIsMajor(float v, float origin, float minorPt, int subdiv) {
-    if (minorPt <= 0.f || subdiv < 1) {
-        return true;
-    }
-    int i = (int)floorf(((v - origin) / minorPt) + 0.5f);
-    if (i < 0) {
-        i = -i;
-    }
-    return (i % subdiv) == 0;
-}
-
 static int PageGridScreenDist(Point a, Point b) {
     int dx = a.x - b.x;
     int dy = a.y - b.y;
@@ -3480,7 +2354,7 @@ static void PageGridStroke(HDC hdc, DisplayModel* dm, int pageNo, PointF a, Poin
 // Style "dotted" / "solid": H/V lines (major heavier). Skips comics.
 static void PaintPageGrid(DisplayModel* dm, HDC hdc) {
     EngineBase* engine = dm->GetEngine();
-    if (!engine || engine->IsImageCollection()) {
+    if (!engine || engine->isImageCollection) {
         return;
     }
     PageGridDraw g = GetPageGridDraw();
@@ -3846,7 +2720,7 @@ static bool DrawDocument(MainWindow* win, HDC hdc, Rect rcArea) {
     // logf("DrawDocument RenderCache:\n");
 
     auto* engine = dm->GetEngine();
-    bool isImage = engine->IsImageCollection();
+    bool isImage = engine->isImageCollection;
     // draw comic books and single images on a black background
     // (without frame and shadow)
     bool paintOnBlackWithoutShadow = win->presentation || isImage;
@@ -3995,7 +2869,7 @@ static bool DrawDocument(MainWindow* win, HDC hdc, Rect rcArea) {
 
         Rect bounds = pi->pageOnScreen.Intersect(screen);
         // don't paint the frame background for images
-        if (!dm->GetEngine()->IsImageCollection()) {
+        if (!dm->GetEngine()->isImageCollection) {
             if (ShowTransparencyGrid()) {
                 HdcPaintCheckerboard(hdc, bounds.x, bounds.y, bounds.dx, bounds.dy);
             } else {
@@ -4225,7 +3099,7 @@ static LRESULT OnSetCursorMouseNone(MainWindow* win, HWND hwnd) {
         win->DeleteToolTip();
         return FALSE;
     }
-    if (GetNotificationForGroup(win->hwndCanvas, kNotifCursorPos)) {
+    if (GetNotificationForGroup(win, kNotifCursorPos)) {
         SetCursorCached(IDC_CROSS);
         return TRUE;
     }
@@ -4464,6 +3338,59 @@ static int WheelScrollPosOrTarget(MainWindow* win) {
     return GetScrollPos(win->hwndCanvas, SB_VERT);
 }
 
+// a fractional delta keeps the wheel "fine" this long, so the odd whole notch
+// in a touchpad swipe doesn't turn a page by itself
+constexpr double kWheelFineDeltaMs = 500;
+
+// A mouse wheel reports whole notches (WHEEL_DELTA). A precision touchpad
+// reports finger travel in fractions of a notch and a swipe adds up to many
+// notches, so a page per notch races through a document (#3755)
+static bool IsFineWheel(MainWindow* win, int delta) {
+    if (delta % WHEEL_DELTA != 0) {
+        win->wheelFineDeltaTime = TimeGet();
+        return true;
+    }
+    return win->wheelFineDeltaTime.QuadPart != 0 && TimeSinceInMs(win->wheelFineDeltaTime) < kWheelFineDeltaMs;
+}
+
+// the wheel travel that turns a page: a notch, or for a fine wheel as much as
+// scrolling a window's height takes in continuous mode
+static int WheelPageTurnDelta(MainWindow* win, int delta) {
+    if (!IsFineWheel(win, delta)) {
+        return WHEEL_DELTA;
+    }
+    int perLine = gDeltaPerLine > 0 ? gDeltaPerLine : WHEEL_DELTA / 3;
+    int lineHeight = std::max(DpiScale(ScrollLineAmount(gSettings->scrollLineAmount)), 1);
+    int lines = win->canvasRc.dy / lineHeight;
+    return std::max(WHEEL_DELTA, lines * perLine);
+}
+
+// accumulates wheel travel; 1 to turn to the previous page, -1 to the next, 0 to stay
+static int WheelPageTurnDir(MainWindow* win, int delta) {
+    win->wheelAccumDelta += delta;
+    int turnDelta = WheelPageTurnDelta(win, delta);
+    if (win->wheelAccumDelta >= turnDelta) {
+        win->wheelAccumDelta -= turnDelta;
+        return 1;
+    }
+    if (win->wheelAccumDelta <= -turnDelta) {
+        win->wheelAccumDelta += turnDelta;
+        return -1;
+    }
+    return 0;
+}
+
+static void WheelTurnPage(MainWindow* win, int dir) {
+    if (dir > 0) {
+        win->ctrl->GoToPrevPage();
+    } else if (dir < 0) {
+        win->ctrl->GoToNextPage();
+    }
+    if (dir != 0) {
+        ReadAloudOnUserViewChanged(win);
+    }
+}
+
 // Fit Content used to turn the mouse wheel into page flipping in every view mode.
 // That is right when a whole page is on screen - there is nothing to scroll to -
 // but in the continuous modes it silently replaced continuous scrolling with
@@ -4491,13 +3418,13 @@ constexpr double kWheelPageTurnGapMs = 250;
 
 static bool WheelMayTurnPage(MainWindow* win) {
     DisplayModel* dm = win->AsFixed();
-    if (!dm || !dm->GetEngine() || !dm->GetEngine()->IsImageCollection()) {
+    if (!dm || !dm->GetEngine() || !dm->GetEngine()->isImageCollection) {
         return true;
     }
     if (win->wheelPageTurnTime.QuadPart != 0 && TimeSinceInMs(win->wheelPageTurnTime) < kWheelPageTurnGapMs) {
         return false;
     }
-    if (gRenderCache && !gRenderCache->Exists(dm, dm->CurrentPageNo(), dm->GetRotation())) {
+    if (gRenderCache && !gRenderCache->Exists(dm, dm->CurrentPageNo(), dm->PageRotation(dm->CurrentPageNo()))) {
         return false;
     }
     return true;
@@ -4626,31 +3553,13 @@ static LRESULT CanvasOnMouseWheel(MainWindow* win, UINT msg, WPARAM wp, LPARAM l
     // the keyboard. Alt + wheel still scrolls, so the rest of the page is
     // reachable; Shift + wheel and Ctrl + wheel are unchanged
     if (vScroll && !isAlt && gSettings->mouseWheelTurnsPage) {
-        win->wheelAccumDelta += delta;
-        if (win->wheelAccumDelta >= WHEEL_DELTA) {
-            win->ctrl->GoToPrevPage();
-            win->wheelAccumDelta -= WHEEL_DELTA;
-            ReadAloudOnUserViewChanged(win);
-        } else if (win->wheelAccumDelta <= -WHEEL_DELTA) {
-            win->ctrl->GoToNextPage();
-            win->wheelAccumDelta += WHEEL_DELTA;
-            ReadAloudOnUserViewChanged(win);
-        }
+        WheelTurnPage(win, WheelPageTurnDir(win, delta));
         return 0;
     }
 
     // fit content: flip page on wheel, regardless of scrollbar state
     if (vScroll && dm && FitContentWheelFlipsPage(dm) && IsSingle(dm->GetDisplayMode())) {
-        win->wheelAccumDelta += delta;
-        if (win->wheelAccumDelta >= WHEEL_DELTA) {
-            win->ctrl->GoToPrevPage();
-            win->wheelAccumDelta -= WHEEL_DELTA;
-            ReadAloudOnUserViewChanged(win);
-        } else if (win->wheelAccumDelta <= -WHEEL_DELTA) {
-            win->ctrl->GoToNextPage();
-            win->wheelAccumDelta += WHEEL_DELTA;
-            ReadAloudOnUserViewChanged(win);
-        }
+        WheelTurnPage(win, WheelPageTurnDir(win, delta));
         return 0;
     }
 
@@ -4665,20 +3574,7 @@ static LRESULT CanvasOnMouseWheel(MainWindow* win, UINT msg, WPARAM wp, LPARAM l
             // Fall through to the default scrolling behavior below
         } else {
             // Content fits in viewport, use page-by-page navigation
-            int pageFlipDelta = WHEEL_DELTA; // One wheel click = one page
-            win->wheelAccumDelta += delta;
-            if (win->wheelAccumDelta >= pageFlipDelta) {
-                win->ctrl->GoToPrevPage();
-                win->wheelAccumDelta -= pageFlipDelta;
-                ReadAloudOnUserViewChanged(win);
-                return 0;
-            }
-            if (win->wheelAccumDelta <= -pageFlipDelta) {
-                win->ctrl->GoToNextPage();
-                win->wheelAccumDelta += pageFlipDelta;
-                ReadAloudOnUserViewChanged(win);
-                return 0;
-            }
+            WheelTurnPage(win, WheelPageTurnDir(win, delta));
             return 0;
         }
     }
@@ -4692,25 +3588,9 @@ static LRESULT CanvasOnMouseWheel(MainWindow* win, UINT msg, WPARAM wp, LPARAM l
             // logf("  flipping page because !dm->NeedVScroll()\n");
             flipPage = true;
         }
-        // fit content/page: one wheel click = one page; otherwise 3 clicks
-        int pageFlipDelta = flipPage ? WHEEL_DELTA : WHEEL_DELTA * 3;
-
-        // int scrolLPos = GetScrollPos(win->hwndCanvas, SB_VERT);
-        //  Note: pre 3.6 didn't care about horizontallScroll and kZoomFitPage was handled below
+        // Note: pre 3.6 didn't care about horizontallScroll and kZoomFitPage was handled below
         if (flipPage) {
-            win->wheelAccumDelta += delta;
-            if (win->wheelAccumDelta >= pageFlipDelta) {
-                win->ctrl->GoToPrevPage();
-                win->wheelAccumDelta -= pageFlipDelta;
-                ReadAloudOnUserViewChanged(win);
-                return 0;
-            }
-            if (win->wheelAccumDelta <= -pageFlipDelta) {
-                win->ctrl->GoToNextPage();
-                win->wheelAccumDelta += pageFlipDelta;
-                ReadAloudOnUserViewChanged(win);
-                return 0;
-            }
+            WheelTurnPage(win, WheelPageTurnDir(win, delta));
             return 0;
         }
     }
@@ -4819,17 +3699,24 @@ static LRESULT CanvasOnMouseWheel(MainWindow* win, UINT msg, WPARAM wp, LPARAM l
     if (!vScroll || !isCont || !gSettings->scrollEdgeTurnsPage) {
         return 0;
     }
-    if (!didScrollByLine) {
+    bool didScroll = WheelScrollPosOrTarget(win) != prevScrollPos;
+    if (didScroll) {
+        // we don't flip a page if we did scroll by line
+        win->wheelEdgeAccumDelta = 0;
+        return 0;
+    }
+    // at an edge: a notch that moved nothing turns the page; a fine wheel
+    // turns it after a window's height of travel, like a page that fits
+    win->wheelEdgeAccumDelta += delta;
+    if (IsFineWheel(win, delta)) {
+        if (std::abs(win->wheelEdgeAccumDelta) < WheelPageTurnDelta(win, delta)) {
+            return 0;
+        }
+    } else if (!didScrollByLine) {
         // we haven't reached accumulated delta to scroll by line
         return 0;
     }
-
-    int currScrollPos = WheelScrollPosOrTarget(win);
-    bool didScroll = (currScrollPos != prevScrollPos);
-    if (didScroll) {
-        // we don't flip a page if we did scroll by line
-        return 0;
-    }
+    win->wheelEdgeAccumDelta = 0;
     if (!WheelMayTurnPage(win)) {
         win->wheelAccumDelta = 0;
         return 0;
@@ -5943,87 +4830,7 @@ static void OnDropFiles(MainWindow* win, HDROP hDrop, bool dragFinish) {
     StartLoadDocuments(files, win);
 }
 
-// returns true if url looks like it could be an image URL
-static bool IsImageUrl(Str url) {
-    // strip query string / fragment for extension check
-    int qIdx = str::IndexOfChar(url, '?');
-    int hIdx = str::IndexOfChar(url, '#');
-    int n = url.len;
-    if (qIdx >= 0 && qIdx < n) {
-        n = qIdx;
-    }
-    if (hIdx >= 0 && hIdx < n) {
-        n = hIdx;
-    }
-    // check for common image extensions
-    Str exts[] = {StrL(".png"),  StrL(".jpg"),  StrL(".jpeg"), StrL(".gif"), StrL(".bmp"), StrL(".tiff"), StrL(".tif"),
-                  StrL(".webp"), StrL(".avif"), StrL(".heic"), StrL(".jxr"), StrL(".jp2"), StrL(".tga"),  StrL(".ico")};
-    for (Str ext : exts) {
-        if (n >= ext.len) {
-            Str ending(url.s + n - ext.len, ext.len);
-            if (str::EqI(ending, ext)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// Get the user's Downloads folder path
-static TempStr GetDownloadsDirTemp() {
-    WCHAR* pathW = nullptr;
-    HRESULT hr = SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &pathW);
-    if (FAILED(hr) || !pathW) {
-        CoTaskMemFree(pathW);
-        return {};
-    }
-    TempStr res = ToUtf8Temp(pathW);
-    CoTaskMemFree(pathW);
-    return res;
-}
-
-static void AdvanceUrlPathUntilSuffix(Str& p, Str& lastSlash) {
-    while (len(p) > 0 && p.s[0] != '?' && p.s[0] != '#') {
-        if (p.s[0] == '/') {
-            lastSlash = p;
-        }
-        p.s++;
-        p.len--;
-    }
-}
-
-// Extract a file name from a URL (last path component, without query/fragment)
-static TempStr FileNameFromUrlTemp(Str url) {
-    // skip past scheme
-    Str path = url;
-    Str slash = str::SliceFromChar(url, '/');
-    if (slash) {
-        path = slash;
-        if (path.len >= 2 && path.s[0] == '/' && path.s[1] == '/') {
-            path.s += 2;
-            path.len -= 2;
-        }
-    }
-    // find last '/' before any '?' or '#'
-    Str lastSlash;
-    Str p = path;
-    AdvanceUrlPathUntilSuffix(p, lastSlash);
-    if (len(lastSlash) == 0) {
-        return {};
-    }
-    int nameLen = (int)(p.s - lastSlash.s - 1);
-    if (nameLen <= 0) {
-        return {};
-    }
-    return str::DupTemp(Str(lastSlash.s + 1, nameLen));
-}
-
-struct DownloadAndOpenUrlData {
-    Str url;
-    HWND hwndCanvas;
-};
-
-static void OpenDownloadedPath(Str* path) {
+void OpenDownloadedPath(Str* path) {
     MainWindow* win = FindMainWindowByHwnd(GetForegroundWindow());
     if (!win && len(gWindows) > 0) {
         win = gWindows[0];
@@ -6034,162 +4841,6 @@ static void OpenDownloadedPath(Str* path) {
     }
     str::Free(*path);
     delete path;
-}
-
-static void DownloadAndOpenUrl(DownloadAndOpenUrlData* data) {
-    Str url = data->url;
-
-    TempStr downloadsDir = GetDownloadsDirTemp();
-    if (len(downloadsDir) == 0) {
-        logf("DownloadAndOpenUrl: failed to get Downloads folder\n");
-        str::Free(data->url);
-        delete data;
-        return;
-    }
-
-    TempStr fileName = FileNameFromUrlTemp(url);
-    if (len(fileName) == 0 || str::Eq(fileName, StrL(".")) || str::Eq(fileName, StrL("..")) ||
-        str::Contains(fileName, StrL("/")) || str::Contains(fileName, StrL("\\")) ||
-        str::Contains(fileName, StrL(":"))) {
-        // generate a fallback name
-        fileName = str::DupTemp(StrL("dropped_image.png"));
-    }
-
-    TempStr destPath = path::JoinTemp(downloadsDir, fileName);
-
-    // avoid overwriting: if file exists, add a numeric suffix
-    if (file::Exists(destPath)) {
-        TempStr ext = path::GetExtTemp(destPath);
-        TempStr base = str::DupTemp(Str(fileName.s, len(fileName) - len(ext)));
-        for (int i = 1; i < 1000; i++) {
-            TempStr newName = fmt("%s_%d%s", base, i, ext);
-            destPath = path::JoinTemp(downloadsDir, newName);
-            if (!file::Exists(destPath)) {
-                break;
-            }
-        }
-    }
-
-    logf("DownloadAndOpenUrl: downloading '%s' to '%s'\n", url, destPath);
-
-    Func1<HttpProgress*> emptyProgress;
-    bool ok = HttpGetToFile(url, destPath, emptyProgress);
-    if (!ok) {
-        logf("DownloadAndOpenUrl: download failed for '%s'\n", url);
-        str::Free(data->url);
-        delete data;
-        return;
-    }
-
-    // verify the downloaded file is a supported image type
-    FileType kind = GuessFileTypeFromFile(destPath);
-    if (!IsEngineImageSupportedFileType(kind)) {
-        logf("DownloadAndOpenUrl: downloaded file is not a supported image type: '%s'\n", destPath);
-        file::Delete(destPath);
-        str::Free(data->url);
-        delete data;
-        return;
-    }
-
-    // ensure it has a good extension, some urls are like:
-    // https://pbs.twimg.com/media/HEwit7bbQAAWiIO?format=jpg&name=large
-    TempStr ext = GetExtForFileTypeTemp(kind);
-    if (!str::EndsWithI(destPath, ext)) {
-        TempStr newDest = str::JoinTemp(destPath, ext);
-        ok = file::Rename(newDest, destPath);
-        if (ok) {
-            destPath = newDest;
-        }
-    }
-
-    // open the file on the UI thread
-    auto* pathDup = new Str(str::Dup(destPath));
-    auto fn = MkFunc0<Str>(OpenDownloadedPath, pathDup);
-    uitask::Post(fn, "DownloadAndOpenUrl");
-
-    str::Free(data->url);
-    delete data;
-}
-
-// Extract text from IDataObject (tries CF_UNICODETEXT, then CF_TEXT)
-static TempStr GetTextFromDataObject(IDataObject* dataObj) {
-    FORMATETC fmtUnicode = {CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    FORMATETC fmtAnsi = {CF_TEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    STGMEDIUM medium{};
-    HRESULT hr = dataObj->GetData(&fmtUnicode, &medium);
-    TempStr res;
-    if (SUCCEEDED(hr) && medium.hGlobal) {
-        WCHAR* w = (WCHAR*)GlobalLock(medium.hGlobal);
-        res = w ? ToUtf8Temp(w) : TempStr();
-        goto Cleanup;
-    }
-    hr = dataObj->GetData(&fmtAnsi, &medium);
-    if (SUCCEEDED(hr) && medium.hGlobal) {
-        char* s = (char*)GlobalLock(medium.hGlobal);
-        res = s ? str::DupTemp(Str(s)) : TempStr();
-        goto Cleanup;
-    }
-    return {};
-Cleanup:
-    GlobalUnlock(medium.hGlobal);
-    ReleaseStgMedium(&medium);
-    return res;
-}
-
-// Check if IDataObject contains a URL (registered format "UniformResourceLocatorW" or "UniformResourceLocator")
-static TempStr GetUrlFromDataObject(IDataObject* dataObj) {
-    // try wide URL format first
-    static CLIPFORMAT cfUrlW = (CLIPFORMAT)RegisterClipboardFormatW(L"UniformResourceLocatorW");
-    if (cfUrlW) {
-        FORMATETC fmt = {cfUrlW, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-        STGMEDIUM medium{};
-        HRESULT hr = dataObj->GetData(&fmt, &medium);
-        if (SUCCEEDED(hr) && medium.hGlobal) {
-            WCHAR* w = (WCHAR*)GlobalLock(medium.hGlobal);
-            TempStr res = w ? ToUtf8Temp(w) : TempStr();
-            GlobalUnlock(medium.hGlobal);
-            ReleaseStgMedium(&medium);
-            if (res && (str::StartsWithI(res, StrL("http://")) || str::StartsWithI(res, StrL("https://")))) {
-                return res;
-            }
-        }
-    }
-    // try ANSI URL format
-    static CLIPFORMAT cfUrl = (CLIPFORMAT)RegisterClipboardFormatW(L"UniformResourceLocator");
-    if (cfUrl) {
-        FORMATETC fmt = {cfUrl, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-        STGMEDIUM medium{};
-        HRESULT hr = dataObj->GetData(&fmt, &medium);
-        if (SUCCEEDED(hr) && medium.hGlobal) {
-            char* s = (char*)GlobalLock(medium.hGlobal);
-            TempStr res = s ? str::DupTemp(Str(s)) : TempStr();
-            GlobalUnlock(medium.hGlobal);
-            ReleaseStgMedium(&medium);
-            if (res && (str::StartsWithI(res, StrL("http://")) || str::StartsWithI(res, StrL("https://")))) {
-                return res;
-            }
-        }
-    }
-    return {};
-}
-
-static bool DataObjectHasFiles(IDataObject* dataObj) {
-    FORMATETC fmt = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    return dataObj->QueryGetData(&fmt) == S_OK;
-}
-
-static bool DataObjectHasUrl(IDataObject* dataObj) {
-    TempStr url = GetUrlFromDataObject(dataObj);
-    if (url && IsImageUrl(url)) {
-        return true;
-    }
-    // also check plain text that looks like an image URL
-    TempStr text = GetTextFromDataObject(dataObj);
-    if (text && (str::StartsWithI(text, StrL("http://")) || str::StartsWithI(text, StrL("https://"))) &&
-        IsImageUrl(text)) {
-        return true;
-    }
-    return false;
 }
 
 class CanvasDropTarget : public IDropTarget {

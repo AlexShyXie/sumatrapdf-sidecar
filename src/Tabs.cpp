@@ -38,47 +38,8 @@
 #include "Theme.h"
 #include "Translations.h"
 #include "Tabs.h"
-
-// always full path (FullPathInTitle only affects tab/window title text).
-// Append size when GetSize succeeds (may fail for offline network paths).
-// Used by Tabs and Toolbar (toolbar was overwriting tooltips with path-only).
-// full path + size (if available); optional dirty suffix for unsaved annotations
-TempStr MakeTabTooltipTemp(Str path, bool dirty) {
-    if (len(path) == 0) {
-        return Str{};
-    }
-    TempStr tip;
-    i64 size = file::GetSize(path);
-    if (size >= 0) {
-        tip = fmt("%s  %s", path, str::FormatSizeShortTemp(size, nullptr));
-    } else {
-        tip = path;
-    }
-    if (dirty) {
-        tip = str::JoinTemp(tip, StrL(" "), Tr("(unsaved annotations)"));
-    }
-    return tip;
-}
-
-static TempStr TabPageSuffixTemp(WindowTab* tab) {
-    if (!gSettings || !gSettings->showPageNumberInTabs) {
-        return {};
-    }
-    if (!tab || !tab->IsDocLoaded() || !tab->ctrl) {
-        return {};
-    }
-    int curr = tab->ctrl->CurrentPageNo();
-    int count = tab->ctrl->PageCount();
-    if (count <= 0 || curr < 1) {
-        return {};
-    }
-    if (ShowChapterUi(tab->ctrl)) {
-        Location loc = tab->ctrl->CurrentLocation();
-        int chapterPages = tab->ctrl->ChapterPageCount(loc.chapter);
-        return fmt(" %d/%d · %d/%d", loc.chapter, tab->ctrl->ChapterCount(), loc.page, chapterPages);
-    }
-    return fmt(" %d/%d", curr, count);
-}
+#include "MenuDefs.h"
+#include "TabsCommon.h"
 
 void UpdateTabPageText(WindowTab* tab) {
     if (!tab || !tab->win || !tab->win->tabsCtrl) {
@@ -110,25 +71,6 @@ int GetTabbarHeight(HWND hwnd, float factor) {
     int tabDy = DpiScale(kTabBarDy);
     int fontDyWithPadding = PlatformFontLineHeight(font) + DpiScale(2);
     tabDy = std::max(fontDyWithPadding, tabDy);
-    // Guard against the bad per-window DPI Wine reports (93e5b4e47: the tab bar
-    // and caption came out tiny). Wine only, deliberately: we are PerMonitorV2,
-    // so DpiScale(HWND_DESKTOP) is the *system* (primary monitor) DPI, which
-    // doesn't follow the window between monitors. Using it as a floor made the
-    // tab bar too tall on any monitor scaled lower than the primary
-    // (discussion #4831).
-    if (IsRunningOnWine()) {
-        int minDy = DpiScaleByDpi(DpiGetForHwnd(HWND_DESKTOP), kTabBarDy);
-        int minFontDy = PlatformFontLineHeight(font) + DpiScaleByDpi(DpiGetForHwnd(HWND_DESKTOP), 2);
-        minDy = std::max(minFontDy, minDy);
-        tabDy = std::max(tabDy, minDy);
-        int res = (int)((float)tabDy * factor);
-        logf(
-            "GetTabbarHeight: hwnd=%p factor=%g dpi=%d desktopDpi=%d tabDyScaled=%d fontDy=%d "
-            "minDy=%d result=%d\n",
-            hwnd, factor, DpiGetForHwnd(hwnd), DpiGetForHwnd(HWND_DESKTOP), DpiScale(kTabBarDy), fontDyWithPadding,
-            minDy, res);
-        return res;
-    }
     return (int)((float)tabDy * factor);
 }
 
@@ -190,7 +132,7 @@ void RemoveTab(WindowTab* tab) {
     VecRemove(*win->tabSelectionHistory, tab);
     // ask before removing: afterwards CurrentTab() follows the strip's new
     // selection unless currentTabTemp happens to be set
-    bool closedCurrentTab = (tab == win->CurrentTab());
+    bool closedCurrentTab = IsCurrentTab(win, tab);
     WindowTab* tab2 = win->tabsCtrl->RemoveTab<WindowTab*>(idx);
     ReportIf(tab != tab2);
     if (closedCurrentTab) {
@@ -240,16 +182,6 @@ void RemoveTab(WindowTab* tab) {
 #endif
 }
 
-static void CloseWindowIfNoDocuments(MainWindow* win) {
-    for (auto& tab : win->Tabs()) {
-        if (!tab->IsAboutTab()) {
-            return;
-        }
-    }
-    // no tabs or only about tab
-    CloseWindow(win, true, false);
-}
-
 static void MaybeMigrateTab(WindowTab* tab, MainWindow* newWin, Point releasePt) {
     MainWindow* oldWin = tab->win;
 
@@ -266,6 +198,12 @@ static void MaybeMigrateTab(WindowTab* tab, MainWindow* newWin, Point releasePt)
         nDocTabs++;
     }
     if (nDocTabs == 1 && !newWin) return;
+
+    // migration reloads by path; a document opened from memory (an embedded
+    // attachment) has none
+    if (len(tab->filePath) == 0) {
+        return;
+    }
 
     auto* engine = tab->GetEngine();
     if (EngineHasUnsavedAnnotations(engine)) {
@@ -364,128 +302,7 @@ void TabsSelect(MainWindow* win, int tabIndex) {
 extern bool SaveAnnotationsToExistingFile(WindowTab*);
 extern bool SaveAnnotationsToMaybeNewPdfFile(WindowTab*);
 
-static MenuDef menuDefContextTab[] = {
-    // these top items are removed unless the document has unsaved changes;
-    // text matches the "Unsaved changes" close dialog
-    {
-        TrN("&Save changes to existing PDF"),
-        CmdSaveAnnotations,
-    },
-    {
-        TrN("Save changes to &new PDF"),
-        CmdSaveAnnotationsNewFile,
-    },
-    {
-        TrN("&Discard changes"),
-        CmdDiscardChanges,
-    },
-    {
-        StrL(kMenuSeparator),
-        0,
-    },
-    {
-        TrN("Properties..."),
-        CmdProperties,
-    },
-    {
-        TrN("Show in folder"),
-        CmdShowInFolder,
-    },
-    {
-        TrN("Copy File Path"),
-        CmdCopyFilePath,
-    },
-    {
-        TrN("Open In New Window"),
-        CmdDuplicateInNewWindow,
-    },
-    {
-        TrN("Change Tab Color"),
-        CmdSetTabColor,
-    },
-    {
-        StrL(kMenuSeparator),
-        0,
-    },
-    {
-        TrN("Close"),
-        CmdClose,
-    },
-    {
-        TrN("Close Other Tabs"),
-        CmdCloseOtherTabs,
-    },
-    {
-        TrN("Close Tabs To The Right"),
-        CmdCloseTabsToTheRight,
-    },
-    {
-        TrN("Close Tabs To The Left"),
-        CmdCloseTabsToTheLeft,
-    },
-    {
-        TrN("Close All Tabs"),
-        CmdCloseAllTabs,
-    },
-    {
-        StrL(kMenuSeparator),
-        0,
-    },
-    {
-        TrN("Save Tab Group"),
-        CmdTabGroupSave,
-    },
-    {
-        TrN("Restore Tab Group"),
-        CmdTabGroupRestore,
-    },
-    {
-        {},
-        0,
-    },
-};
 // clang-format on
-
-// create a new window if win==nullptr
-void CollectTabsToClose(MainWindow* win, WindowTab* currTab, Vec<WindowTab*>& toCloseOther,
-                        Vec<WindowTab*>& toCloseRight, Vec<WindowTab*>& toCloseLeft) {
-    int nTabs = win->TabCount();
-    bool seenCurrent = false;
-    for (int i = 0; i < nTabs; i++) {
-        WindowTab* tab = win->Tabs()[i];
-        if (tab->IsAboutTab()) {
-            continue;
-        }
-        if (currTab == tab) {
-            seenCurrent = true;
-            continue;
-        }
-        VecAppend(toCloseOther, tab);
-        if (seenCurrent) {
-            VecAppend(toCloseRight, tab);
-        } else {
-            VecAppend(toCloseLeft, tab);
-        }
-    }
-}
-
-void CloseCollectedTabs(MainWindow* win, const Vec<WindowTab*>& toClose) {
-    // CloseTab can pump (DDE, SaveSettings, dialogs). A nested close may have
-    // already freed some of these pointers; GetTabIdx is pointer identity and
-    // does not dereference a freed WindowTab.
-    if (!win) {
-        return;
-    }
-    for (WindowTab* t : toClose) {
-        if (!IsMainWindowValid(win) || win->isBeingClosed) {
-            return;
-        }
-        if (win->GetTabIdx(t) < 0) {
-            continue;
-        }
-        CloseTab(t, false);
-    }
-}
 
 void CloseAllTabs(MainWindow* win) {
     if (!win) {
@@ -753,7 +570,7 @@ void SaveCurrentWindowTab(MainWindow* win) {
     if (-1 == current) {
         return;
     }
-    if (win->CurrentTab() != win->Tabs()[current]) {
+    if (!IsCurrentTab(win, win->Tabs()[current])) {
         return; // TODO: restore ReportIf() ?
     }
 
@@ -935,24 +752,6 @@ void SetTabsInTitlebar(MainWindow* win, bool inTitleBar) {
     }
     uint flags = SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOSIZE | SWP_NOMOVE;
     SetWindowPos(win->hwndFrame, nullptr, 0, 0, 0, 0, flags);
-}
-
-// Selects the next (or previous) tab.
-void TabsOnCtrlTab(MainWindow* win, bool reverse) {
-    if (!win) {
-        return;
-    }
-    int count = win->TabCount();
-    if (count < 2) {
-        return;
-    }
-    int idx = win->tabsCtrl->GetSelected() + 1;
-    if (reverse) {
-        idx -= 2;
-    }
-    idx += count; // ensure > 0
-    idx = idx % count;
-    TabsSelect(win, idx);
 }
 
 void MoveTab(MainWindow* win, int dir) {

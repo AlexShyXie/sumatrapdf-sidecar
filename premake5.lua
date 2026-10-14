@@ -138,6 +138,15 @@ function winver_defines()
   -- winver_latest_defines()
 end
 
+-- Build scripts pass PRE_RELEASE_VER, GIT_COMMIT_ID, BUILT_ON etc. (see
+-- src/shared/Version.h) as msbuild /p:SumatraBuildDefines=A=1%3BB=2
+-- Unescape turns %3B back into the ";" that splits the defines.
+function build_defines()
+  filter { "action:vs*" }
+  defines { "$([MSBuild]::Unescape($(SumatraBuildDefines)))" }
+  filter {}
+end
+
 -- WebView2 (manual viewer, SimpleBrowserWindow, BrowserDocView). gui/*.cpp is
 -- included via gui_files() in premake5.files.lua.
 -- ext/webview2 has the SDK headers plus our own replacement for the NuGet
@@ -351,6 +360,20 @@ function setup_base_pch()
   filter { "files:ext/**" }
     enablepch "Off"
   filter { "files:**.c" }
+    enablepch "Off"
+  filter { "files:src/shared/LinkFollow.cpp" }
+    enablepch "Off"
+  filter { "files:src/shared/OverlayScrollbarCommon.cpp" }
+    enablepch "Off"
+  filter { "files:src/shared/AIChatCommon.cpp" }
+    enablepch "Off"
+  filter { "files:src/shared/ReadingBar.cpp" }
+    enablepch "Off"
+  filter { "files:src/shared/Selection.cpp" }
+    enablepch "Off"
+  filter { "files:src/shared/SelectionHandlers.cpp" }
+    enablepch "Off"
+  filter { "files:src/shared/SelectTextKeyboard.cpp" }
     enablepch "Off"
   filter {}
 end
@@ -897,7 +920,63 @@ workspace "SumatraPDF"
       "ext/a-extract/extract/*.h", "ext/a-extract/version.txt",
     }
 
+  -- OCR and barcodes (#5446), built the way mupdf's own win32 projects do.
+  -- leptonica: no image codecs, memory through mupdf's allocator
+  project "leptonica"
+    static_intermediate_dirs()
+    kind "StaticLib"
+    language "C"
+    optimized_conf()
+    defines {
+      "_CRT_SECURE_NO_WARNINGS", "HAVE_LEPTONICA", "LEPTONICA_INTERCEPT_ALLOC=1",
+      "HAVE_LIBPNG=0", "HAVE_LIBTIFF=0", "HAVE_LIBJPEG=0", "HAVE_LIBZ=0", "HAVE_LIBGIF=0",
+      "HAVE_LIBUNGIF=0", "HAVE_LIBWEBP=0", "HAVE_LIBWEBP_ANIM=0", "HAVE_LIBJP2K=0",
+    }
+    warnings "Off"
+    includedirs { "ext/leptonica/src", "ext/mupdf/include", "ext/mupdf/scripts/tesseract" }
+    leptonica_files()
+
+  -- tesseract: the LSTM engine only (DISABLED_LEGACY_ENGINE), no debug UI.
+  -- The SIMD kernels are picked at run time by cpuid; the x86 defines let
+  -- their files compile
+  project "tesseract"
+    static_intermediate_dirs()
+    kind "StaticLib"
+    language "C++"
+    cppdialect "C++20"
+    optimized_conf()
+    exceptionhandling "On"
+    rtti "On"
+    defines {
+      "_CRT_SECURE_NO_WARNINGS", "HAVE_LEPTONICA", "HAVE_TESSERACT", "TESSERACT_IMAGEDATA_AS_PIX",
+      "TESSERACT_DISABLE_DEBUG_FONTS", "GRAPHICS_DISABLED", "DISABLED_LEGACY_ENGINE",
+    }
+    filter { "platforms:x86 or x64 or x64_asan" }
+    defines { "HAVE_AVX", "HAVE_AVX2", "HAVE_SSE4_1", "HAVE_FMA", "__AVX__", "__AVX2__", "__FMA__", "__SSE4_1__" }
+    filter {}
+    warnings "Off"
+    includedirs { "ext/tesseract/include", "ext/tesseract/src/api", "ext/tesseract/src/arch", "ext/tesseract/src/ccmain", "ext/tesseract/src/ccstruct", "ext/tesseract/src/ccutil", "ext/tesseract/src/classify", "ext/tesseract/src/dict", "ext/tesseract/src/lstm", "ext/tesseract/src/textord", "ext/tesseract/src/viewer", "ext/tesseract/src/wordrec", "ext/tesseract/src/cutil", "ext/leptonica/src", "ext/mupdf/include", "ext/mupdf/scripts/tesseract" }
+    tesseract_files()
+
+  -- zxing-cpp reads barcodes, zint writes them
+  project "zxing"
+    static_intermediate_dirs()
+    kind "StaticLib"
+    language "C++"
+    cppdialect "C++20"
+    optimized_conf()
+    exceptionhandling "On"
+    rtti "On"
+    defines {
+      "_CRT_SECURE_NO_WARNINGS", "ZXING_HAS_CHAR8", "ZXING_USE_ZINT", "ZXING_EXPERIMENTAL_API", "ZINT_NO_PNG",
+      "HAVE_ZXINGCPP", "FZ_ENABLE_BARCODE=1",
+    }
+    warnings "Off"
+    includedirs { "ext/zxing-cpp/core/src", "ext/mupdf/scripts/zxing-cpp", "ext/zint/backend", "ext/mupdf/include" }
+    zxing_files()
+
   project "mupdf"
+    cppdialect "C++latest"
     static_intermediate_dirs()
     kind "StaticLib"
     language "C"
@@ -914,11 +993,12 @@ workspace "SumatraPDF"
     -- so we can't double-define it
     defines { "USE_JPIP", "OPJ_EXPORTS", "HAVE_LCMS2MT=1", "HAVE_WEBP=1" }
     defines { "OPJ_STATIC", "SHARE_JPEG" }
-    -- built-in fonts come from IDR_EMBEDDED_PAK (src/mupdf/noto_sumatra.c);
-    -- Source Han is not packed, so skip its table entries and per-language retries
+    -- built-in fonts come from the loader (embedded pak, then cache, then
+    -- fonts_map.c). Source Han is not packed, so skip its table entries
     defines { "TOFU_CJK_LANG" }
-    defines { "FZ_ENABLE_PDF=1", "FZ_ENABLE_SVG=1", "FZ_ENABLE_BROTLI=1", "FZ_ENABLE_BARCODE=0", "FZ_ENABLE_JS=1", "FZ_ENABLE_HYPHEN=0", "FZ_ENABLE_MD=1" }
+    defines { "FZ_ENABLE_PDF=1", "FZ_ENABLE_SVG=1", "FZ_ENABLE_BROTLI=1", "FZ_ENABLE_BARCODE=1", "FZ_ENABLE_JS=1", "FZ_ENABLE_HYPHEN=0", "FZ_ENABLE_MD=1" }
     defines { "HAVE_LIBARCHIVE", "LIBARCHIVE_STATIC" }
+    defines { "HAVE_LEPTONICA", "HAVE_TESSERACT", "HAVE_ZXINGCPP" }
 
     filter { "platforms:arm64" }
     defines { "ARCH_HAS_NEON=1" }
@@ -933,7 +1013,11 @@ workspace "SumatraPDF"
 
     uses_zlib()
     includedirs {
+      "src",
       "src/mupdf",
+      "src/shared/mupdf",
+      "ext/mupdf/source/fitz",
+      "ext/jxldec",
       "ext/mupdf/include",
       "ext/mupdf/generated",
       "ext/a-jbig2dec",
@@ -959,7 +1043,8 @@ workspace "SumatraPDF"
     -- / SumatraPDF-static pick them up via project references.
     links {
       "cmark-gfm", "a-mujs", "a-extract", "a-harfbuzz", "a-freetype", "a-brotli",
-      "a-lcms2", "a-openjpeg", "a-jbig2dec", "libjpeg-turbo", "a-libarchive", "a-gumbo",
+      "a-lcms2", "a-openjpeg", "a-jbig2dec", "libjpeg-turbo", "a-libarchive", "a-gumbo", "jxldec",
+      "tesseract", "leptonica", "zxing",
     }
 
     -- mupdf
@@ -971,12 +1056,13 @@ workspace "SumatraPDF"
     defines { "_UCRT_NOISY_NAN", "CMARK_GFM_STATIC_DEFINE" }
 
   project "libsumatrapdf"
+    build_defines()
     dll_shared_lib_dirs()
     kind "SharedLib"
     language "C"
     optimized_conf()
     disablewarnings { "4206", "4701", "4702" }
-    defines { "FZ_ENABLE_PDF=1", "FZ_ENABLE_SVG=1", "FZ_ENABLE_BROTLI=1", "FZ_ENABLE_BARCODE=0", "FZ_ENABLE_JS=1", "FZ_ENABLE_HYPHEN=0", "FZ_ENABLE_MD=1" }
+    defines { "FZ_ENABLE_PDF=1", "FZ_ENABLE_SVG=1", "FZ_ENABLE_BROTLI=1", "FZ_ENABLE_BARCODE=1", "FZ_ENABLE_JS=1", "FZ_ENABLE_HYPHEN=0", "FZ_ENABLE_MD=1" }
 
     filter { "platforms:arm64" }
     defines { "ARCH_HAS_NEON=1" }
@@ -984,6 +1070,7 @@ workspace "SumatraPDF"
 
     -- premake has logic in vs2010_vcxproj.lua that only sets PlatformToolset
     -- if there is a c/c++ file, so we add a no-op cpp file to force This logic
+    includedirs { "src/shared" }
     files { "src/libsumatrapdf.rc", "src/libsumatrapdf.def", "src/no_op_for_premake.cpp" }
     implibname "libsumatrapdf"
     linkoptions { "/DEF:" .. rootDirWin .. "\\src\\libsumatrapdf.def", "-IGNORE:4701", "-IGNORE:4702" }
@@ -1000,7 +1087,7 @@ workspace "SumatraPDF"
     -- unrar is C++ with exceptions; keep them enabled so the DLL can host it.
     exceptionhandling "On"
     links {
-      "mupdf", "djvudec", "a-libwebp", "dav1d", "heicdec", "jxldec", "a-brotli", "a-unrar", "chmdec", "msdes",
+      "mupdf", "tesseract", "leptonica", "zxing", "djvudec", "a-libwebp", "dav1d", "heicdec", "jxldec", "a-brotli", "a-unrar", "chmdec", "msdes",
       "a-libarchive", "cmark-gfm", "a-gumbo",
       "a-mujs", "a-extract", "a-harfbuzz", "a-freetype", "a-lcms2", "a-openjpeg", "a-jbig2dec", "libjpeg-turbo",
     }
@@ -1039,7 +1126,7 @@ workspace "SumatraPDF"
     filter {}
     setup_base_pch()
 
-    filter { "files:src/PerfLog_x64.asm" }
+    filter { "files:src/shared/PerfLog_x64.asm" }
       buildmessage '%{file.relpath}'
       buildoutputs { '%{cfg.objdir}/%{file.basename}_asm.obj' }
       buildcommands {
@@ -1047,7 +1134,7 @@ workspace "SumatraPDF"
       }
     filter {}
     filter { "configurations:Profile", "platforms:x64 or x64_asan" }
-      files { "src/PerfLog_x64.asm" }
+      files { "src/shared/PerfLog_x64.asm" }
     filter {}
 
 ---- executables
@@ -1067,7 +1154,7 @@ workspace "SumatraPDF"
     test_engines_files()
     links_zlib()
     -- static link (no libsumatrapdf.dll): same image-codec set as libsumatrapdf.dll
-    links { "base", "djvudec", "a-libarchive", "a-unrar", "mupdf" }
+    links { "base", "djvudec", "a-libarchive", "a-unrar", "mupdf", "tesseract", "leptonica", "zxing" }
     links { "a-libwebp", "dav1d", "heicdec", "jxldec", "a-brotli" }
     -- LitDoc.cpp: DES decryption of DRM-free .lit sections, LZX section decompression
     links { "msdes", "chmdec" }
@@ -1180,6 +1267,7 @@ workspace "SumatraPDF"
   -- links libsumatrapdf.dll for everything, so the exe itself is tiny. It's embedded
   -- in SumatraPDF.exe's IDR_EMBEDDED_PAK (see the embedded.lzsa prebuild).
   project "sumatrapdf-tool"
+    build_defines()
     dll_app_objdir()
     dll_linker_intermediates()
     kind "ConsoleApp"
@@ -1194,6 +1282,7 @@ workspace "SumatraPDF"
     links { "shell32" }
 
   project "PdfFilter"
+    build_defines()
     dll_shared_lib_dirs()
     kind "SharedLib"
     language "C++"
@@ -1234,6 +1323,7 @@ workspace "SumatraPDF"
   --   links { "comctl32", "gdiplus", "msimg32", "shlwapi", "version", "wininet", "wintrust", "crypt32" }
 
   project "PdfPreview"
+    build_defines()
     dll_shared_lib_dirs()
     kind "SharedLib"
     language "C++"
@@ -1258,6 +1348,7 @@ workspace "SumatraPDF"
 
   -- a single static executable
   project "SumatraPDF-static"
+    build_defines()
     static_app_objdir()
     static_linker_intermediates()
     kind "WindowedApp"
@@ -1294,7 +1385,7 @@ workspace "SumatraPDF"
     gui_files()
     uia_files()
     engines_files()
-    favor_speed_files { "src/TextSearch.cpp", "src/EngineMupdf.cpp" }
+    favor_speed_files { "src/shared/TextSearch.cpp", "src/shared/EngineMupdf.cpp" }
     sumatrapdf_files()
 
     setup_base_pch()
@@ -1330,7 +1421,7 @@ workspace "SumatraPDF"
     -- Static libraries do not propagate dependencies through Ninja.
     links {
       "djvudec", "a-libwebp", "dav1d", "heicdec", "jxldec", "a-brotli",
-      "mupdf", "cmark-gfm", "a-mujs", "a-extract", "a-harfbuzz", "a-freetype", "a-lcms2", "a-openjpeg",
+      "mupdf", "tesseract", "leptonica", "zxing", "cmark-gfm", "a-mujs", "a-extract", "a-harfbuzz", "a-freetype", "a-lcms2", "a-openjpeg",
       "a-jbig2dec", "libjpeg-turbo", "a-libarchive", "a-gumbo", "base", "a-unrar", "chmdec", "a-zopfli", "msdes"
     }
     links {
@@ -1362,6 +1453,7 @@ workspace "SumatraPDF"
 
   -- a dll version where most functionality is in libsumatrapdf.dll
   project "SumatraPDF"
+    build_defines()
     dll_app_objdir()
     dll_linker_intermediates()
     kind "WindowedApp"
@@ -1397,7 +1489,7 @@ workspace "SumatraPDF"
     gui_files()
     uia_files()
     engines_files()
-    favor_speed_files { "src/TextSearch.cpp", "src/EngineMupdf.cpp" }
+    favor_speed_files { "src/shared/TextSearch.cpp", "src/shared/EngineMupdf.cpp" }
     sumatrapdf_files()
 
     setup_base_pch()
@@ -1490,7 +1582,7 @@ workspace "SumatraPDF"
     end
     -- mupdf static lib + the libraries it links / depends on
     set_group("mupdf", {
-      "mupdf", "cmark-gfm", "a-libarchive", "a-zlib", "a-brotli", "libjpeg-turbo",
+      "mupdf", "tesseract", "leptonica", "zxing", "cmark-gfm", "a-libarchive", "a-zlib", "a-brotli", "libjpeg-turbo",
       "a-extract", "a-gumbo", "a-jbig2dec", "a-mujs", "a-openjpeg",
       "a-freetype", "a-harfbuzz", "a-lcms2",
     })

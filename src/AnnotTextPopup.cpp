@@ -17,6 +17,7 @@
 
 #include "Settings.h"
 #include "Annotation.h"
+#include "PdfDate.h"
 #include "DocController.h"
 #include "EngineBase.h"
 #include "DisplayModel.h"
@@ -28,6 +29,8 @@
 #include "WindowTab.h"
 
 #include "AnnotTextPopup.h"
+#include "AppHelpersCommon.h"
+#include "AnnotTextPopupCommon.h"
 
 // A floating card with the annotation's whole text, opened by clicking the
 // annotation. The text sits in a read-only multi-line edit, which wraps,
@@ -36,19 +39,9 @@
 
 constexpr const WCHAR* kAnnotTextPopupClassName = L"SumatraAnnotTextPopup";
 
-constexpr int kMargin = 8;
 constexpr int kGap = 5;
 // between the author and the date on the header line
 constexpr int kHeaderGap = 12;
-// between the header line and the rule under it
-constexpr int kRuleGap = 4;
-constexpr int kCornerRadius = 6;
-// the card is as wide as the comment's longest line; lines longer than this
-// wrap, so a comment with no line breaks doesn't span the canvas
-constexpr int kMaxLineChars = 80;
-constexpr int kMinWidth = 120;
-// how much of the canvas the card may cover before the text starts scrolling
-constexpr int kMaxHeightPercent = 60;
 // a card shorter than this looks like a glitch, however short the comment
 constexpr int kMinLines = 3;
 
@@ -82,34 +75,6 @@ struct AnnotTextPopup {
     bool closing = false;
     Func1List<MainWindow*> onWindowMoved;
 };
-
-bool AnnotationHasText(Annotation* annot) {
-    if (!AnnotationIsLive(annot)) {
-        return false;
-    }
-    return len(Contents(annot)) > 0;
-}
-
-static Color PopupBg() {
-    return ThemeNotificationsBackgroundColor();
-}
-
-static Color PopupText() {
-    return ThemeNotificationsTextColor();
-}
-
-// the date is secondary information: same hue, less contrast
-static Color PopupMutedText() {
-    float units = IsLightColor(PopupBg()) ? 55.0f : -55.0f;
-    return AdjustLightness2(PopupText(), units);
-}
-
-// the rule under the header: a mid-tone that reads on both a light and a dark
-// card (the window edge color is nearly invisible on white)
-static Color PopupRuleColor() {
-    float units = IsLightColor(PopupBg()) ? 190.0f : -190.0f;
-    return AdjustLightness2(PopupText(), units);
-}
 
 // author on the left, date on the right, with a rule underneath. It's a single
 // control rather than an HBox of two labels so that a long author name
@@ -277,26 +242,11 @@ static TempStr PopupAuthorTemp(Annotation* annot) {
     return str::DupTemp(author);
 }
 
-// local time, like other apps show comment timestamps
-static TempStr PopupDateTemp(Annotation* annot) {
-    time_t secs = ModificationDate(annot);
-    if (secs == 0) {
-        return {};
-    }
-    struct tm tm;
-    if (localtime_s(&tm, &secs) != 0) {
-        return {};
-    }
-    char buf[64];
-    size_t n = strftime(buf, sizeof buf, "%Y-%m-%d %H:%M", &tm);
-    return str::DupTemp(Str(buf, (int)n));
-}
-
 // the header's ideal width fits author and date without eliding
 static AnnotPopupHeader* MakePopupHeader(AnnotTextPopup* popup, Annotation* annot) {
     auto* h = new AnnotPopupHeader();
     h->author = str::Dup(PopupAuthorTemp(annot));
-    h->date = str::Dup(PopupDateTemp(annot));
+    h->date = str::Dup(FormatPdfDateLocalTimeTemp(ModificationDate(annot)));
     h->authorFont = GetBoldPlatformFont(popup->font);
     h->dateFont = popup->font;
     int dx = PlatformFontMeasureText(h->authorFont, h->author).dx;
@@ -494,7 +444,7 @@ void RepositionAnnotationTextPopup(MainWindow* win) {
     if (!popup || !popup->host->IsVisible()) {
         return;
     }
-    bool sameTab = popup->tab == win->CurrentTab();
+    bool sameTab = IsCurrentTab(win, popup->tab);
     if (!sameTab || !PositionPopup(popup)) {
         HideAnnotationTextPopup(win);
     }

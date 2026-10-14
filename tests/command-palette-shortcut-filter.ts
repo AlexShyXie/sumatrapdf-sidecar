@@ -3,17 +3,10 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ControlClient, ControlCommand } from "./control.ts";
+import { IS_MAC } from "./host.ts";
 import { ROOT, cmdId, runStandalone, tmpPath } from "./util.ts";
-import {
-  captureWindowPixels,
-  captureWindowToPng,
-  getClassName,
-  getFocusedHwnd,
-  getRootWindow,
-  sendText,
-  sleep,
-} from "./winapi.ts";
-import { killAndWait, launchControlled, sendCommand } from "./win-automation.ts";
+import { captureWindowPixels, captureWindowToPng, sendText, sleep } from "./winapi.ts";
+import { killAndWait, launchControlled, sendCommand, findPalette, isFilterMatchTint } from "./win-automation.ts";
 
 const SETTINGS = `UiLanguage = en
 Theme = Light
@@ -41,15 +34,6 @@ async function paletteState(client: ControlClient): Promise<PaletteState | null>
   return { items: +m[1]!, queryLen: +m[2]!, selectedCmdId: +m[3]! };
 }
 
-function findPalette(frame: number): { palette: number; edit: number } {
-  const edit = getFocusedHwnd(frame);
-  if (!edit || getClassName(edit) !== "Edit") {
-    return { palette: 0, edit: 0 };
-  }
-  const palette = getRootWindow(edit);
-  return { palette: palette === frame ? 0 : palette, edit };
-}
-
 function countYellowInRightHalf(palette: number): number {
   const shot = captureWindowPixels(palette);
   if (!shot) {
@@ -62,7 +46,7 @@ function countYellowInRightHalf(palette: number): number {
       const b = shot.data[off]!;
       const g = shot.data[off + 1]!;
       const r = shot.data[off + 2]!;
-      if (r > 240 && g > 240 && b < 30) {
+      if (isFilterMatchTint(r, g, b)) {
         count++;
       }
     }
@@ -85,9 +69,16 @@ export async function testit(): Promise<void> {
     const openDeadline = Date.now() + 8_000;
     let handles = { palette: 0, edit: 0 };
     while (Date.now() < openDeadline) {
-      handles = findPalette(frame);
-      if (handles.palette && handles.edit) {
-        break;
+      if (IS_MAC) {
+        if (await paletteState(client)) {
+          handles = { palette: 1, edit: 1 };
+          break;
+        }
+      } else {
+        handles = findPalette(frame);
+        if (handles.palette && handles.edit) {
+          break;
+        }
       }
       await sleep(50);
     }
@@ -111,18 +102,22 @@ export async function testit(): Promise<void> {
       throw new Error(`command-palette-shortcut-filter: shortcut query failed: ${JSON.stringify(state)}`);
     }
 
-    const paintDeadline = Date.now() + 3_000;
-    let yellow = 0;
-    while (Date.now() < paintDeadline) {
-      yellow = countYellowInRightHalf(handles.palette);
-      if (yellow > 20) {
-        break;
+    if (IS_MAC) {
+      console.log("SKIP command-palette-shortcut-filter highlight: macOS has no palette window to sample");
+    } else {
+      const paintDeadline = Date.now() + 3_000;
+      let yellow = 0;
+      while (Date.now() < paintDeadline) {
+        yellow = countYellowInRightHalf(handles.palette);
+        if (yellow > 20) {
+          break;
+        }
+        await sleep(40);
       }
-      await sleep(40);
-    }
-    if (yellow <= 20) {
-      captureWindowToPng(handles.palette, tmpPath("command-palette-shortcut-filter.png"));
-      throw new Error(`command-palette-shortcut-filter: shortcut highlight not painted; yellow=${yellow}`);
+      if (yellow <= 20) {
+        captureWindowToPng(handles.palette, tmpPath("command-palette-shortcut-filter.png"));
+        throw new Error(`command-palette-shortcut-filter: shortcut highlight not painted; yellow=${yellow}`);
+      }
     }
 
     console.log("command-palette-shortcut-filter: OK");

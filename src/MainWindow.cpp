@@ -22,6 +22,7 @@
 #include "gui/win/FrameRateWnd.h"
 
 #include "Settings.h"
+#include "DisplayMode.h"
 #include "DocController.h"
 #include "EngineBase.h"
 #include "EngineAll.h"
@@ -33,6 +34,7 @@
 #include "ReadAloud.h"
 #include "ReadingAutoScroll.h"
 #include "TextSelection.h"
+#include "Annotation.h"
 #include "TextSearch.h"
 #include "SumatraPDF.h"
 #include "AIChatCommon.h"
@@ -50,43 +52,20 @@
 #include "SidebarPanel.h"
 #include "TableOfContents.h"
 #include "StressTesting.h"
+#include "ExternalViewers.h"
+#include "Installer.h"
+#include "CommandAvailability.h"
 #include "uia/Provider.h"
 #include "Theme.h"
 #include "Canvas.h"
 #include "HomePage.h"
 #include "MainWindow.h"
+#include "MainWindowCommon.h"
 
 static void SafeDeleteTabsCtrl(TabsCtrl* tabsCtrl) {
     logf("SafeDeleteTabsCtrl: 0x%p\n", tabsCtrl);
     delete tabsCtrl;
 }
-
-struct LinkHandler : ILinkHandler {
-    MainWindow* win = nullptr;
-
-    explicit LinkHandler(MainWindow* w) {
-        ReportIf(!w);
-        win = w;
-    }
-    ~LinkHandler() override;
-
-    void GotoLink(IPageDestination* dest) override;
-    void GotoNamedDest(Str name) override;
-    void GoToPage(int pageNo, bool addNavPoint) override;
-    bool GoToNextPage() override;
-    bool GoToPrevPage(bool toBottom = false) override;
-    void ScrollTo(IPageDestination* dest) override;
-    void ScrollTo(int pageNo, RectF rect, float zoom) override;
-    void LaunchURL(Str uri) override;
-    void LaunchFile(Str path, IPageDestination* remoteLink) override;
-    TocItem* FindTocItem(TocItem* item, Str name, bool partially) override;
-};
-
-LinkHandler::~LinkHandler() {
-    // do nothing
-}
-
-Vec<MainWindow*> gWindows;
 
 static void OverlayScrollbarsOnWindowMoved(MainWindow* win) {
     OverlayScrollbarUpdatePos(win->overlayScrollV);
@@ -258,6 +237,8 @@ MainWindow::~MainWindow() {
 void ClearMouseState(MainWindow* win) {
     CancelAnnotationResizeRerender(win);
     HideAnnotationHoverOverlay(win);
+    // the comment card holds an Annotation* of the engine about to go
+    HideAnnotationTextPopup(win);
     win->dragStartPending = false;
     win->textDragPending = false;
     win->imageDragPending = false;
@@ -265,27 +246,6 @@ void ClearMouseState(MainWindow* win) {
     win->imageDragPageNo = -1;
     win->linkOnLastButtonDown = nullptr;
     win->annotationUnderCursor = nullptr;
-}
-
-bool MainWindow::HasDocsLoaded() const {
-    int nTabs = TabCount();
-    if (nTabs == 0) {
-        // logf("HasDocsLoaded: false because nTabs == 0\n");
-        return true;
-    }
-    for (int i = 0; i < nTabs; i++) {
-        auto* tab = GetTab(i);
-        if (!tab->IsAboutTab()) {
-            // logf("HasDocsLoaded: true because GetTab(i) !IsAboutTab()\n");
-            return true;
-        }
-    }
-    // logf("HasDocsLoaded: false because all %d tabs are IsAboutTab()\n", nTabs);
-    return false;
-}
-
-bool MainWindow::IsCurrentTabAbout() const {
-    return nullptr == CurrentTab() || CurrentTab()->IsAboutTab();
 }
 
 bool MainWindow::IsDocLoaded() const {
@@ -355,18 +315,6 @@ Vec<WindowTab*> MainWindow::Tabs() const {
     return res;
 }
 
-DisplayModel* MainWindow::AsFixed() const {
-    return ctrl ? ctrl->AsFixed() : nullptr;
-}
-
-ChmModel* MainWindow::AsChm() const {
-    return ctrl ? ctrl->AsChm() : nullptr;
-}
-
-MarkdownModel* MainWindow::AsMarkdown() const {
-    return ctrl ? ctrl->AsMarkdown() : nullptr;
-}
-
 // Notify both display model and double-buffer (if they exist)
 // about a potential change of available canvas size
 void MainWindow::UpdateCanvasSize() {
@@ -412,6 +360,10 @@ Size MainWindow::GetViewPortSize() const {
     return size;
 }
 
+void MainWindow::RedrawCanvas() const {
+    HwndInvalidate(hwndCanvas);
+}
+
 static BOOL CALLBACK RedrawHwndCallback(HWND hwnd, LPARAM lp) {
     bool update = (bool)lp;
     HwndInvalidate(hwnd, true);
@@ -448,10 +400,6 @@ void MainWindow::ChangePresentationMode(PresentationMode mode) {
     RedrawAll();
 }
 
-bool MainWindow::InPresentation() const {
-    return presentation != PM_DISABLED;
-}
-
 static HWND FindModalOwnedBy(HWND hwndParent) {
     HWND hwnd = nullptr;
     while (true) {
@@ -480,12 +428,6 @@ void MainWindow::Focus() const {
         return;
     }
     HwndSetFocus(hwndFrame);
-}
-
-void MainWindow::ToggleZoom() const {
-    if (CurrentTab()) {
-        CurrentTab()->ToggleZoom();
-    }
 }
 
 void MainWindow::MoveDocBy(int dx, int dy) const {
@@ -541,7 +483,7 @@ static void LaunchEmbeddedDestination(MainWindow* win, PageDestination* pd) {
     if (len(data) == 0) {
         return;
     }
-    Str fileName = pd->GetValue2();
+    Str fileName = pd->GetValue();
     logf("GotoLink: opening file attachment annotation '%s', objNum: %d, size: %d\n", fileName, pd->embedObjNum,
          data.len);
     // PDF (and other types we can open): load from memory into a tab
@@ -650,156 +592,6 @@ void LinkHandler::GotoLink(IPageDestination* dest) {
     ReportIf(true);
 }
 
-void LinkHandler::ScrollTo(IPageDestination* dest) {
-    ReportIf(!win || !win->ctrl || win->linkHandler != this);
-    if (!dest || !win || !win->ctrl || !win->IsDocLoaded()) {
-        return;
-    }
-    // TODO: this seems like a hack, there should be a better way
-    // https://github.com/sumatrapdfreader/sumatrapdf/issues/3499
-    ChmModel* chm = win->ctrl->AsChm();
-    if (chm) {
-        chm->HandleLink(dest, nullptr);
-        return;
-    }
-    MarkdownModel* md = win->ctrl->AsMarkdown();
-    if (md) {
-        md->HandleLink(dest, nullptr);
-        return;
-    }
-    Location loc = win->ctrl->ResolveDest(dest);
-    if (!loc.IsValid()) {
-        return;
-    }
-    int pageNo = win->ctrl->PageNoFromLocation(loc);
-    if (!win->ctrl->ValidPageNo(pageNo)) {
-        return;
-    }
-    RectF rect = PageDestGetRect(dest);
-    float zoom = PageDestGetZoom(dest);
-    ScrollTo(pageNo, rect, zoom);
-}
-
-void LinkHandler::GoToPage(int pageNo, bool addNavPoint) {
-    ReportIf(!win || !win->ctrl || win->linkHandler != this);
-    if (!win || !win->ctrl || !win->IsDocLoaded()) {
-        return;
-    }
-    win->ctrl->GoToPage(pageNo, addNavPoint);
-}
-
-bool LinkHandler::GoToNextPage() {
-    ReportIf(!win || !win->ctrl || win->linkHandler != this);
-    if (!win || !win->ctrl || !win->IsDocLoaded()) {
-        return false;
-    }
-    return win->ctrl->GoToNextPage();
-}
-
-bool LinkHandler::GoToPrevPage(bool toBottom) {
-    ReportIf(!win || !win->ctrl || win->linkHandler != this);
-    if (!win || !win->ctrl || !win->IsDocLoaded()) {
-        return false;
-    }
-    return win->ctrl->GoToPrevPage(toBottom);
-}
-
-void LinkHandler::ScrollTo(int pageNo, RectF rect, float zoom) {
-    ReportIf(!win || !win->ctrl || win->linkHandler != this);
-    if (!win || !win->ctrl || !win->IsDocLoaded()) {
-        return;
-    }
-    win->ctrl->ScrollTo(pageNo, rect, zoom);
-    ShowLinkDestHighlight(win, pageNo, rect);
-}
-
-// Convert file:// / file:/// / file: URIs to a local path (+ optional #fragment).
-// Returns false if uri is not a file: scheme.
-static bool PathFromFileUriTemp(Str uri, TempStr* pathOut, Str* fragmentOut) {
-    Str rest = uri;
-    if (!str::TrimPrefixI(rest, StrL("file:"))) {
-        return false;
-    }
-    // file://host/path or file:///path → drop authority (// or ///)
-    if (str::TrimPrefix(rest, StrL("//"))) {
-        // empty host: next char is / of absolute path
-        if (rest && rest.s[0] == '/') {
-            // Windows drive path: /C:/foo → C:/foo
-            if (rest.len >= 3 && rest.s[1] && rest.s[2] == ':') {
-                rest = Str(rest.s + 1, rest.len - 1);
-            }
-        }
-    }
-    TempStr path = str::DupTemp(rest);
-    Str pathStr = path;
-    Str frag = str::SliceFromChar(pathStr, '#');
-    if (frag) {
-        pathStr = Str(pathStr.s, (int)(frag.s - pathStr.s));
-        frag = Str(frag.s + 1, frag.len - 1);
-    }
-    path = url::DecodeTemp(pathStr);
-    str::TransCharsInPlace(path, StrL("/"), StrL("\\"));
-    *pathOut = path;
-    if (fragmentOut) {
-        *fragmentOut = frag ? str::DupTemp(frag) : Str{};
-    }
-    return true;
-}
-
-void LinkHandler::LaunchURL(Str uri) {
-    if (len(uri) == 0) {
-        /* ignore missing URLs */;
-        return;
-    }
-
-    TempStr path = str::DupTemp(uri);
-    int colon = str::IndexOfChar(path, ':');
-    int hash = str::IndexOfChar(path, '#');
-    if (colon < 0 || (hash >= 0 && colon > hash)) {
-        // treat relative URIs as file paths (without fragment identifier)
-        if (hash >= 0) {
-            path.len = hash;
-        }
-        str::TransCharsInPlace(path, StrL("/"), StrL("\\"));
-        path = url::DecodeTemp(path);
-        // LaunchFile will reject unsupported file types
-        this->LaunchFile(path, nullptr);
-        return;
-    }
-
-    // file://... → open as a local document (or explorer if unsupported)
-    TempStr filePath;
-    Str fragment;
-    if (PathFromFileUriTemp(uri, &filePath, &fragment)) {
-        if (len(fragment) > 0) {
-            // Carry destination name for LaunchFile scroll-to (named dest / page)
-            PageDestinationFile dest(filePath, fragment);
-            this->LaunchFile(filePath, &dest);
-        } else {
-            this->LaunchFile(filePath, nullptr);
-        }
-        return;
-    }
-
-    // LaunchBrowser will reject unsupported URI schemes
-    SumatraLaunchBrowser(path);
-}
-
-// return true if we can load the file based on sniffing file type from content
-static bool IsFileSupportedByContent(Str filePath) {
-    FileType kindSniffed = GuessFileType(filePath, true);
-    return IsSupportedFileType(kindSniffed, true);
-}
-
-// MuPDF encodes GoToR named destinations as "nameddest=<name>" in the link URI
-// fragment, but EngineBase::GetNamedDest prepends "#nameddest=" itself -- so the
-// prefix must be stripped or the lookup becomes "#nameddest=nameddest=<name>"
-// and fails, leaving the remote PDF on page 1 (issue #5642).
-// Strips mupdf's "nameddest=" prefix so the name can be passed to GetNamedDest.
-void CleanRemoteDestNameInPlace(Str& destName) {
-    str::TrimPrefixI(destName, StrL("nameddest="));
-}
-
 // for safety, only handle relative paths and only open them in SumatraPDF
 // (unless they're of an allowed perceived type) and never launch any external
 // file in plugin mode (where documents are supposed to be self-contained)
@@ -867,8 +659,7 @@ void LinkHandler::LaunchFile(Str pathOrig, IPageDestination* remoteLink) {
     } else {
         targetWin = FindMainWindowByFile(fullPath, true);
         if (!targetWin) {
-            LoadArgs args(fullPath, win);
-            targetWin = LoadDocument(&args);
+            targetWin = LoadDocument(win, fullPath);
         }
     }
     if (!targetWin) {
@@ -893,70 +684,21 @@ void LinkHandler::LaunchFile(Str pathOrig, IPageDestination* remoteLink) {
         return;
     }
 
-    Str destName = PageDestGetName(remoteLink);
-    if (destName) {
-        CleanRemoteDestNameInPlace(destName);
-        IPageDestination* dest = targetWin->ctrl->GetNamedDest(destName);
-        if (dest) {
-            targetWin->linkHandler->ScrollTo(dest);
-        }
-    } else {
-        targetWin->linkHandler->ScrollTo(remoteLink);
+    // remoteLink's page and rect are in the source document: only its name means
+    // something in the target
+    Str destName = remoteLink->GetName();
+    if (len(destName) == 0) {
+        return;
     }
-}
-
-// normalizes case and whitespace in the string
-static TempStr NormalizeFuzzyTemp(Str str) {
-    TempStr dup = str::DupTemp(str);
-    str::ToLowerInPlace(dup);
-    str::NormalizeWSInPlace(dup);
-    // cf. AddTocItemToView
-    return dup;
-}
-
-static bool MatchFuzzy(Str s1, Str s2, bool partially) {
-    if (!partially) {
-        return str::Eq(s1, s2);
+    CleanRemoteDestNameInPlace(destName);
+    IPageDestination* dest = targetWin->ctrl->GetNamedDest(destName);
+    if (dest) {
+        targetWin->linkHandler->ScrollTo(dest);
     }
-
-    // only match at the start of a word (at the beginning and after a space)
-    Str rest = s1;
-    while (len(rest) > 0) {
-        int idx = str::IndexOf(rest, s2);
-        if (idx < 0) {
-            break;
-        }
-        const char* found = rest.s + idx;
-        if (found == s1.s || *(found - 1) == ' ') {
-            return true;
-        }
-        int off = idx + 1;
-        rest.s += off;
-        rest.len -= off;
-    }
-    return false;
-}
-
-// finds the first ToC entry that (partially) matches a given normalized name
-// (ignoring case and whitespace differences)
-TocItem* LinkHandler::FindTocItem(TocItem* item, Str name, bool partially) {
-    for (; item; item = item->next) {
-        if (item->title) {
-            TempStr fuzTitle = NormalizeFuzzyTemp(item->title);
-            if (MatchFuzzy(fuzTitle, name, partially)) {
-                return item;
-            }
-        }
-        TocItem* found = FindTocItem(item->child, name, partially);
-        if (found) {
-            return found;
-        }
-    }
-    return nullptr;
 }
 
 // Select and scroll the ToC tree to tocItem (same idea as GoToTocItem from the palette).
-static void SelectTocItemInTree(MainWindow* win, TocItem* tocItem) {
+void SelectTocItemInTree(MainWindow* win, TocItem* tocItem) {
     if (!win || !tocItem || !win->tocLoaded || !win->tocTreeView) {
         return;
     }
@@ -971,59 +713,121 @@ static void SelectTocItemInTree(MainWindow* win, TocItem* tocItem) {
     win->tocKeepSelection = false;
 }
 
-void LinkHandler::GotoNamedDest(Str name) {
-    ReportIf(!win || win->linkHandler != this);
-    DocController* ctrl = win->ctrl;
-    if (!ctrl) {
+static void PopulateTabCloseFlags(AppCommandCtx& ctx) {
+    if (!ctx.win) {
         return;
     }
 
-    // Match order:
-    // 1. Exact match on internal destination name
-    // 2. Fuzzy match on full ToC item title
-    // 3. Fuzzy match on a part of a ToC item title
-    // 4. Exact match on page label
-    IPageDestination* dest = ctrl->GetNamedDest(name);
-    bool hasDest = dest != nullptr;
-    if (dest) {
-        ScrollTo(dest);
-    } else if (ctrl->HasToc()) {
-        auto* docTree = ctrl->GetToc();
-        TocItem* root = docTree->root;
-        TempStr fuzName = NormalizeFuzzyTemp(name);
-        TocItem* tocItem = FindTocItem(root, fuzName, false);
-        if (!tocItem) {
-            tocItem = FindTocItem(root, fuzName, true);
+    int nTabs = ctx.win->TabCount();
+    ctx.nTabs = nTabs;
+    WindowTab* currTab = ctx.tab;
+    int tabIdx = ctx.win->GetTabIdx(currTab);
+    ctx.canCloseTabsToRight = tabIdx < (nTabs - 1);
+    int nFirstDocTab = 0;
+    for (int i = 0; i < nTabs; i++) {
+        WindowTab* tab = ctx.win->GetTab(i);
+        if (tab->IsAboutTab()) {
+            nFirstDocTab = 1;
+            continue;
         }
-        if (tocItem) {
-            dest = tocItem->GetPageDestination();
-            if (dest) {
-                ScrollTo(dest);
-                hasDest = true;
-            } else if (tocItem->pageNo > 0) {
-                ctrl->GoToPage(tocItem->pageNo, true);
-                hasDest = true;
-            }
-            if (hasDest) {
-                SelectTocItemInTree(win, tocItem);
-            }
+        ctx.hasDocTabs = true;
+        if (tab == currTab) {
+            ctx.canCloseTabsToLeft = i > nFirstDocTab;
+            continue;
         }
-    }
-    if (!hasDest && ctrl->HasPageLabels()) {
-        int pageNo = ctrl->GetPageByLabel(name);
-        if (ctrl->ValidPageNo(pageNo)) {
-            ctrl->GoToPage(pageNo, true);
-        }
+        ctx.canCloseOtherTabs = true;
     }
 }
 
-bool HasOpenedDocuments(MainWindow* win) {
-    for (WindowTab* t : win->Tabs()) {
-        if (!t->IsAboutTab()) {
-            return true;
+AppCommandCtx NewAppCommandCtx(MainWindow* win, Point cursorPos) {
+    AppCommandCtx ctx;
+    ctx.win = win;
+    ctx.cursorPos = cursorPos;
+    if (!win) {
+        return ctx;
+    }
+
+    ctx.tab = win->CurrentTab();
+    ctx.isDocLoaded = win->IsDocLoaded();
+    ctx.filePath = ctx.tab ? ctx.tab->filePath : Str();
+    ctx.hasOpenDocuments = HasOpenedDocuments(win);
+    ctx.ttsAvailable = true;
+    ctx.shellIntegrationInstalled = IsOurExeInstalled();
+    ctx.debugDpiOverrideAvailable = true;
+
+    if (ctx.tab) {
+        ctx.autoScrollOn = ctx.tab->autoScroll.on;
+        ctx.readingBarOn = ctx.tab->readingBar.on;
+        ctx.isChm = ctx.tab->AsChm() || ctx.tab->AsMarkdown();
+        Str currentPath = win->ctrl ? win->ctrl->GetFilePath() : ctx.filePath;
+        ctx.isMarkdown = str::EndsWithI(currentPath, StrL(".md")) || str::EndsWithI(currentPath, StrL(".markdown"));
+        EngineBase* engine = ctx.tab->GetEngine();
+        ctx.isCbx = engine && engine->kind == kindEngineComicBooks;
+        ctx.isImageCollection = engine && engine->isImageCollection;
+        ctx.isReflowable = engine && engine->isReflowable;
+        ctx.engineKind = ctx.tab->GetEngineType();
+        ctx.engineHasErrors = engine && engine->HasErrors();
+        ctx.canSendEmail = CanSendAsEmailAttachment(ctx.tab);
+#ifndef DISABLE_DOCUMENT_RESTRICTIONS
+        ctx.allowsPrinting = !win->AsFixed() || (engine && engine->AllowsPrinting());
+#endif
+        ctx.isPdf = IsPdfDoc(ctx.tab);
+        if (ctx.isPdf && engine) {
+            ctx.isPdfEncrypted = EngineMupdfIsEncrypted(engine);
+        }
+        ctx.canContinueReadAloud = CanContinueReadAloud(ctx.tab);
+        ctx.hideAnnotations = ctx.tab->hideAnnotations;
+        ctx.selectedAnnotation = ctx.tab->selectedAnnotation;
+    }
+
+    ctx.isSpeaking = TtsIsSpeaking();
+    ctx.clipboardHasImage = IsClipboardFormatAvailable(CF_BITMAP);
+    ctx.aiChatAvailable = IsAIChatAvailable();
+    ctx.aiChatSupported = IsAIChatSupportedForTab(ctx.tab);
+    ctx.grokInstalled = IsBackendInstalled(AIChatBackend::Grok);
+    ctx.claudeInstalled = IsBackendInstalled(AIChatBackend::Claude);
+    ctx.codexInstalled = IsBackendInstalled(AIChatBackend::Codex);
+    ctx.antiGravityInstalled = IsBackendInstalled(AIChatBackend::AntiGravity);
+    ctx.hasSelection = ctx.isDocLoaded && ctx.tab && win->showSelection && ctx.tab->selectionOnPage;
+
+    if (ctx.isDocLoaded && win->ctrl) {
+        ctx.isSinglePage = IsSingle(win->ctrl->GetDisplayMode());
+        ctx.pageCount = win->ctrl->PageCount();
+        ctx.hasToc = win->ctrl->HasToc();
+    }
+
+    DisplayModel* dm = win->AsFixed();
+    if (dm) {
+        ctx.isFixedPage = true;
+        EngineBase* engine = dm->GetEngine();
+        ctx.hasTextSelection = ctx.hasSelection && len(dm->textSelection->result) > 0;
+        ctx.supportsAnnots = EngineSupportsAnnotations(engine);
+        ctx.hasUnsavedAnnotations = EngineHasUnsavedAnnotations(engine);
+        ctx.hasRedactMarks = EngineHasRedactMarks(engine);
+        ctx.hasUserRedactMarks = EngineHasUserRedactMarks(engine);
+        ctx.canUndo = EngineMupdfCanUndo(engine);
+        ctx.canRedo = EngineMupdfCanRedo(engine);
+        ctx.isCursorOnPage = dm->GetPageNoByPoint(cursorPos) > 0;
+        ctx.annotationUnderCursor = dm->GetAnnotationAtPos(cursorPos, nullptr);
+        IPageElement* pageEl = dm->GetElementAtPos(cursorPos, nullptr);
+        if (pageEl) {
+            Str value = pageEl->GetValue();
+            ctx.cursorOnLinkTarget = pageEl->Is(kindPageElementDest) && PageDestHasAddress(pageEl->AsLink());
+            ctx.cursorOnComment = value && pageEl->Is(kindPageElementComment);
+            ctx.cursorOnImage = pageEl->Is(kindPageElementImage);
+        }
+        if (ctx.annotationUnderCursor) {
+            ctx.cursorOnComment = !str::IsEmptyOrWhiteSpace(Contents(ctx.annotationUnderCursor));
         }
     }
-    return false;
+
+    if (!CanAccessDisk()) {
+        ctx.supportsAnnots = false;
+        ctx.hasUnsavedAnnotations = false;
+    }
+
+    PopulateTabCloseFlags(ctx);
+    return ctx;
 }
 
 // a debugging aid: flip it (in the source or the debugger) to get a small
@@ -1069,27 +873,8 @@ void UpdateControlsColors(MainWindow* win) {
     }
 }
 
-bool IsRightDragging(MainWindow* win) {
-    if (win->mouseAction != MouseAction::Dragging) {
-        return false;
-    }
-    return win->dragRightClick;
-}
-
-// True if `win` is still in gWindows (the object has not been deleted).
-// Does not look at isBeingClosed: CloseWindow sets that flag first and then
-// pumps messages (save-annotations dialog, ShowWindow), using this to detect
-// whether the window was destroyed during that pumping. Folding isBeingClosed
-// in here would make CloseWindow abort immediately after setting the flag.
-bool IsMainWindowValid(MainWindow* win) {
-    return win && VecContains(gWindows, win);
-}
-
-// True if `win` still exists and CloseWindow has not started. Use this for
-// deferred work (load finish, timers, find/print threads, UI updates) that
-// must not touch a window that is tearing down.
-bool IsMainWindowValidAndNotClosing(MainWindow* win) {
-    return IsMainWindowValid(win) && !win->isBeingClosed;
+HWND MainWindowHwnd(MainWindow* win) {
+    return win ? win->hwndFrame : nullptr;
 }
 
 MainWindow* FindMainWindowByHwnd(HWND hwnd) {
@@ -1120,24 +905,6 @@ MainWindow* FindMainWindowByHwnd(HWND hwnd) {
         cur = next;
     }
     return nullptr;
-}
-
-// Find MainWindow using WindowTab. Diffrent than WindowTab->win in that
-// it validates that WindowTab is still valid
-MainWindow* FindMainWindowByTab(WindowTab* tabToFind) {
-    if (!tabToFind) return nullptr;
-    for (MainWindow* win : gWindows) {
-        for (WindowTab* tab : win->Tabs()) {
-            if (tab == tabToFind) {
-                return win;
-            }
-        }
-    }
-    return nullptr;
-}
-
-bool IsWindowTabValid(WindowTab* tab) {
-    return FindMainWindowByTab(tab) != nullptr;
 }
 
 // temporarily highlight this tab

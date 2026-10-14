@@ -16,24 +16,22 @@
 
 #include "Settings.h"
 #include "AppSettings.h"
+#include "DocController.h"
+#include "EngineBase.h"
+#include "DisplayModel.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
 #include "WindowTab.h"
 
 #include "Theme.h"
 #include "Notifications.h"
+#include "NotificationsCommon.h"
 
 static StrNode* gDelayedNotifications = nullptr;
 
-Kind kNotifCursorPos = "cursorPosHelper";
-Kind kNotifActionResponse = "responseToAction";
-Kind kNotifPageInfo = "pageInfoHelper";
-// can have multiple of those
-Kind kNotifAdHoc = "notifAdHoc";
-// debug-only: continuous layout re-done because newly visible pages got measured
-Kind kNotifLazyLayout = "notifLazyLayout";
-// debug-only: background chapter layout of an ebook
-Kind kNotifChapterLayout = "chapterLayout";
+void SetNotifWindow(NotificationCreateArgs& args, MainWindow* win) {
+    args.hwndParent = win ? win->hwndCanvas : nullptr;
+}
 
 static Kind kindNotifText = "notifText";
 static Kind kindNotifProgress = "notifProgress";
@@ -149,11 +147,6 @@ struct NotificationWnd : WindowBase {
 constexpr int kMaxNotifs = 128;
 static NotificationWnd* gNotifs[kMaxNotifs];
 static int gNotifsCount = 0;
-
-// Notifications are drawn over the document and stay for a couple of seconds.
-// A test that reads pixels has to wait them out (which is most of the runtime
-// of e.g. tests/issue-1195.ts), so -dbg-control can switch them off.
-static bool gNotificationsEnabled = true;
 
 static int GetForHwnd(HWND hwnd, NotificationWnd* wnds[kMaxNotifs]) {
     int n = 0;
@@ -463,17 +456,6 @@ HWND NotificationWnd::Create(const NotificationCreateArgs& args) {
         }
     }
     return hwnd;
-}
-
-// returns 0% - 100%
-int CalcPerc(int current, int total) {
-    ReportIf(total <= 0 || current < 0);
-    ReportIf(total < current);
-    if (total <= 0) {
-        total = 1;
-    }
-    int perc = limitValue(100 * current / total, 0, 100);
-    return perc;
 }
 
 void NotificationWnd::Layout(Str message) {
@@ -787,7 +769,11 @@ static NotificationWnd* NotifsGetForGroup(NotificationWnd** wnds, int nWnds, Kin
     return nullptr;
 }
 
-NotificationWnd* ShowNotification(const NotificationCreateArgs& args) {
+NotificationWnd* ShowNotification(const NotificationCreateArgs& argsIn) {
+    NotificationCreateArgs args = argsIn;
+    if (!args.hwndParent && args.win) {
+        args.hwndParent = args.win->hwndCanvas;
+    }
     ReportIf(!args.hwndParent);
     if (!gNotificationsEnabled) {
         // callers already handle a null (Create() / NotifsAdd() can fail)
@@ -805,7 +791,7 @@ NotificationWnd* ShowNotification(const NotificationCreateArgs& args) {
     // already selected another tab). Hide if this tab is not current.
     if (args.tab && wnd->delayTimerId == 0) {
         MainWindow* win = FindMainWindowByHwnd(args.hwndParent);
-        if (win && win->CurrentTab() != args.tab) {
+        if (win && !IsCurrentTab(win, args.tab)) {
             ShowWindow(wnd->hwnd, SW_HIDE);
         } else {
             BringWindowToTop(wnd->hwnd);
@@ -912,10 +898,6 @@ void CloseNotification(NotificationWnd* wnd) {
     wnd->ScheduleRemove(NotifCloseReason::Program);
 }
 
-bool AreNotificationsEnabled() {
-    return gNotificationsEnabled;
-}
-
 // Turning them off also takes down the ones already on screen, so a test can
 // disable them after the app has shown one (the zoom notification from -zoom
 // is up before a test can say anything).
@@ -948,6 +930,34 @@ NotificationWnd* GetNotificationForGroup(HWND hwnd, Kind kind) {
     NotificationWnd* wnds[kMaxNotifs];
     int nWnds = GetForHwnd(hwnd, wnds);
     return NotifsGetForGroup(wnds, nWnds, kind);
+}
+
+static HWND CanvasOf(MainWindow* win) {
+    return win ? win->hwndCanvas : nullptr;
+}
+
+bool RemoveNotificationsForGroup(MainWindow* win, Kind kind) {
+    return RemoveNotificationsForGroup(CanvasOf(win), kind);
+}
+
+NotificationWnd* GetNotificationForGroup(MainWindow* win, Kind kind) {
+    return GetNotificationForGroup(CanvasOf(win), kind);
+}
+
+NotificationWnd* ShowTemporaryNotification(MainWindow* win, Str msg, int timeoutMs) {
+    return ShowTemporaryNotification(CanvasOf(win), msg, timeoutMs);
+}
+
+NotificationWnd* ShowWarningNotification(MainWindow* win, Str msg, int timeoutMs) {
+    return ShowWarningNotification(CanvasOf(win), msg, timeoutMs);
+}
+
+NotificationWnd* ShowPlainNotification(MainWindow* win, Str msg, int timeoutMs) {
+    return ShowPlainNotification(CanvasOf(win), msg, timeoutMs);
+}
+
+NotificationWnd* ShowPlainWarningNotification(MainWindow* win, Str msg, int timeoutMs) {
+    return ShowPlainWarningNotification(CanvasOf(win), msg, timeoutMs);
 }
 
 void MaybeDelayedWarningNotification(Str msg) {

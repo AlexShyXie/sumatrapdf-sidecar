@@ -4,10 +4,6 @@
 #include "base/Base.h"
 #include "base/Win.h"
 #include <uiautomationcore.h>
-#ifdef __GNUC__
-// mingw needs explicit UUID declaration for IAccIdentity
-__CRT_UUID_DECL(IAccIdentity, 0x7852B78D, 0x1CFD, 0x41C1, 0xA6, 0x15, 0x9C, 0x0C, 0x85, 0x96, 0x0B, 0x5F)
-#endif
 
 #include "gui/UIModels.h"
 
@@ -371,10 +367,16 @@ HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::RangeFromChild(IR
         return E_FAIL;
     }
 
-    // get page range
-    // TODO: is childElement guaranteed to be a SumatraUIAutomationPageProvider?
-    *pRetVal = new SumatraUIAutomationTextRange(this, ((SumatraUIAutomationPageProvider*)childElement)->pageNum);
-    return S_OK;
+    // a client can pass any element (e.g. the Document itself), so only
+    // accept one of our live pages
+    for (SumatraUIAutomationPageProvider* it = child_first; it; it = it->sibling_next) {
+        if (static_cast<IRawElementProviderSimple*>(it) != childElement) {
+            continue;
+        }
+        *pRetVal = new SumatraUIAutomationTextRange(this, it->pageNum);
+        return S_OK;
+    }
+    return E_INVALIDARG;
 }
 
 // The empty range at the character nearest to a point on the screen. Screen

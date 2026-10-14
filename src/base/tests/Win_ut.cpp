@@ -2,9 +2,11 @@
    License: Simplified BSD (see COPYING.BSD) */
 
 #include "base/Base.h"
+
+#if OS_WIN
 #include "base/CmdLineArgs.h"
 #include "base/Pixmap.h"
-#include "base/AutoWin.h"
+#include "base/ScopedWin.h"
 #include "base/Win.h"
 
 // must be last due to assert() over-write
@@ -115,6 +117,32 @@ static void RecolorLinkAaTest() {
     RecolorPixmap(dib, text, bg, link);
     CheckLinkAaPixels(dib->data, 4);
     FreePixmap(dib);
+}
+
+// a pale blue fill in a JPEG straddles the link threshold pixel by pixel,
+// so neighbors one unit apart must recolor nearly alike (issue #6313)
+static void RecolorLinkNoiseTest() {
+    Color text = MkRgb(0xff, 0xff, 0xff);
+    Color bg = MkRgb(0, 0, 0);
+    Color link = MkRgb(0x50, 0xa0, 0xff);
+
+    Pixmap* px = AllocPixmap(2, 1, PixmapFormat::BGR8);
+    utassert(px && px->data);
+    u8* p = px->data;
+    // (173, 225, 249) and (173, 224, 250): B,G,R
+    p[0] = 249;
+    p[1] = 225;
+    p[2] = 173;
+    p[3] = 250;
+    p[4] = 224;
+    p[5] = 173;
+    RecolorPixmap(px, text, bg, link);
+    const int maxDiff = 8;
+    for (int i = 0; i < 3; i++) {
+        int diff = std::abs((int)p[i] - (int)p[i + 3]);
+        utassert(diff <= maxDiff);
+    }
+    FreePixmap(px);
 }
 
 // 16x16 red square in the middle, transparent corners (AND mask).
@@ -429,10 +457,11 @@ static void PixmapToBgrTest() {
 }
 
 void WinUtilTest() {
-    AutoCoUninitialize comScope;
+    ScopedCom comScope;
 
     QuoteCmdLineArgTest();
     RecolorLinkAaTest();
+    RecolorLinkNoiseTest();
     PixmapFromHICONAlphaTest();
     BlitPixmapExactTest();
     BlitPaletteDibTest();
@@ -442,7 +471,7 @@ void WinUtilTest() {
     {
         Str string = StrL("abcde");
         auto strm = CreateStreamFromData(string);
-        AutoReleaseComPtr<IStream> stream(strm);
+        ScopedComPtr<IStream> stream(strm);
         utassert(stream);
         Str data = ReadIStream(stream);
         utassert((u8*)data.s);
@@ -458,7 +487,7 @@ void WinUtilTest() {
         WStr string = L"abcde";
         size_t stringSize = string.len * sizeof(WCHAR);
         auto strm = CreateStreamFromData(Str((char*)string.s, (int)stringSize));
-        AutoReleaseComPtr<IStream> stream(strm);
+        ScopedComPtr<IStream> stream(strm);
         utassert(stream);
         Str dataTmp = ReadIStream(stream);
         WStr data = WStr((WCHAR*)(u8*)dataTmp.s, (int)((size_t)dataTmp.len / sizeof(WCHAR)));
@@ -474,3 +503,5 @@ void WinUtilTest() {
         utassert(allScreens.Intersect(oneScreen) == oneScreen);
     }
 }
+
+#endif // OS_WIN

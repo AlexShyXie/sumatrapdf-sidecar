@@ -14,19 +14,7 @@
 #include "AppSettings.h"
 
 #include "GlobalHotkeys.h"
-
-struct GlobalHotkeyInfo {
-    int hotkeyId = 0;
-    int cmdId = 0;
-    Str key;
-    Str cmd;
-};
-
-static Vec<GlobalHotkeyInfo> gGlobalHotkeys;
-static HWND gGlobalHotkeysHwnd = nullptr;
-static Vec<HWND> gActiveFrameHwndMRU;
-
-constexpr int kGlobalHotkeyBaseId = 0x6000;
+#include "GlobalHotkeysCommon.h"
 
 static bool IsOtherSumatraProcessRunning() {
     DWORD myPid = GetCurrentProcessId();
@@ -55,14 +43,6 @@ static UINT AccelFVirtToHotkeyMod(BYTE fVirt) {
     return mod;
 }
 
-void GlobalHotkeysOnActivate(HWND hwnd) {
-    if (!hwnd) {
-        return;
-    }
-    VecRemove(gActiveFrameHwndMRU, hwnd);
-    VecInsertAt(gActiveFrameHwndMRU, 0, hwnd);
-}
-
 static MainWindow* GetTargetWindowForGlobalHotkey() {
     for (HWND hwnd : gActiveFrameHwndMRU) {
         MainWindow* win = FindMainWindowByHwnd(hwnd);
@@ -76,10 +56,6 @@ static MainWindow* GetTargetWindowForGlobalHotkey() {
         }
     }
     return nullptr;
-}
-
-HWND GetGlobalHotkeysHwnd() {
-    return gGlobalHotkeysHwnd;
 }
 
 void RegisterGlobalHotkeys(HWND hwnd) {
@@ -131,19 +107,6 @@ void RegisterGlobalHotkeys(HWND hwnd) {
         }
         GlobalHotkeyInfo info{hotkeyId, cmdId, sc->key, sc->cmd};
         VecAppend(gGlobalHotkeys, info);
-    }
-}
-
-void UnregisterGlobalHotkeys(HWND hwnd) {
-    if (!hwnd) {
-        return;
-    }
-    for (const auto& hk : gGlobalHotkeys) {
-        UnregisterHotKey(hwnd, hk.hotkeyId);
-    }
-    VecReset(gGlobalHotkeys);
-    if (hwnd == gGlobalHotkeysHwnd) {
-        gGlobalHotkeysHwnd = nullptr;
     }
 }
 

@@ -6,6 +6,7 @@ struct WindowTab;
 
 void ShowAddFavoriteDialog(MainWindow* win, Str filePath, int pageNo, Str pageLabel, Str name);
 void ShowAdvancedSettingsDialog(MainWindow* win);
+void ShowConfigureRestrictedUseDialog(MainWindow* win);
 void OpenSettingsFileInEditor();
 TempStr AdvSettingsRowsResultTemp(Str action, int arg, int* exitCodeOut);
 void ShowChangeBackgroundColorDialog(MainWindow* win);
@@ -39,7 +40,7 @@ void ShowCustomZoomDialog(MainWindow* win);
 void ShowPageGridDialog(MainWindow* win);
 void ResetPageGridToDefaults();
 TempStr PageGridStateTemp();
-void ShowSignDocumentDialog(MainWindow* win, Str fieldName = {}, bool hasField = false);
+void ShowSignDocumentDialog(MainWindow* win, Str fieldName = {}, bool hasField = false, int certifyLevel = 0);
 bool IsPlacingSignature(MainWindow* win);
 bool CancelPlacingSignature(MainWindow* win);
 void CloseSignDocumentDialog(MainWindow* win);
@@ -104,3 +105,4 @@ struct Print_Advanced_Data {
 };
 
 HPROPSHEETPAGE CreatePrintAdvancedPropSheet(Print_Advanced_Data* data);
+void ShowPDFScriptDialog(MainWindow* win);

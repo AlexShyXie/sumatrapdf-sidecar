@@ -42,6 +42,7 @@ struct Archive {
         // internal use
         i64 filePos = 0;
         char* data = nullptr;
+        FILETIME GetWinFileTime() const;
     };
 
     Archive();

@@ -74,7 +74,7 @@ static void TrimHtmlTextToken(Str& tokText) {
 static WStr ExtractHtmlText(EpubDoc* doc) {
     log(StrL("ExtractHtmlText()\n"));
 
-    Str d = doc->GetHtmlData();
+    Str d = ToStr(doc->htmlData);
     int dataLen = d.len;
 
     str::Builder text;
@@ -82,7 +82,7 @@ static WStr ExtractHtmlText(EpubDoc* doc) {
     GumboHtmlParser p(d);
     HtmlToken* t;
     Vec<HtmlTag> tagNesting;
-    while ((t = p.Next()) != nullptr && !t->IsError()) {
+    while ((t = p.Next()) != nullptr) {
         if (t->IsText() && !VecContains(tagNesting, Tag_Head) && !VecContains(tagNesting, Tag_Script) &&
             !VecContains(tagNesting, Tag_Style)) {
             // trim whitespace (TODO: also normalize within text?)
@@ -134,7 +134,7 @@ HRESULT EpubFilter::GetNextChunkValue(ChunkValue& chunkValue) {
 
         case STATE_EPUB_AUTHOR:
             m_state = STATE_EPUB_TITLE;
-            str = m_epubDoc->GetPropertyTemp(DocProp::Author);
+            str = GetPropValueTemp(m_epubDoc->props, DocProp::Author);
             if (len(str) > 0) {
                 ws = ToWStrTemp(str);
                 chunkValue.SetTextValue(PKEY_Author, ws.s);
@@ -144,9 +144,9 @@ HRESULT EpubFilter::GetNextChunkValue(ChunkValue& chunkValue) {
 
         case STATE_EPUB_TITLE:
             m_state = STATE_EPUB_DATE;
-            str = m_epubDoc->GetPropertyTemp(DocProp::Title);
+            str = GetPropValueTemp(m_epubDoc->props, DocProp::Title);
             if (len(str) == 0) {
-                str = m_epubDoc->GetPropertyTemp(DocProp::Subject);
+                str = GetPropValueTemp(m_epubDoc->props, DocProp::Subject);
             }
             if (len(str) > 0) {
                 ws = ToWStrTemp(str);
@@ -157,9 +157,9 @@ HRESULT EpubFilter::GetNextChunkValue(ChunkValue& chunkValue) {
 
         case STATE_EPUB_DATE:
             m_state = STATE_EPUB_CONTENT;
-            str = m_epubDoc->GetPropertyTemp(DocProp::ModificationDate);
+            str = GetPropValueTemp(m_epubDoc->props, DocProp::ModificationDate);
             if (len(str) == 0) {
-                str = m_epubDoc->GetPropertyTemp(DocProp::CreationDate);
+                str = GetPropValueTemp(m_epubDoc->props, DocProp::CreationDate);
             }
             if (len(str) > 0) {
                 SYSTEMTIME systime;

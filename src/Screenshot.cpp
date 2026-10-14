@@ -34,6 +34,8 @@
 #include "Translations.h"
 #include "GlobalHotkeys.h"
 #include "Screenshot.h"
+#include "AppHelpersCommon.h"
+#include "ScreenshotCommon.h"
 
 static bool IsAppFrame(HWND hwnd) {
     for (MainWindow* win : gWindows) {
@@ -42,11 +44,6 @@ static bool IsAppFrame(HWND hwnd) {
         }
     }
     return false;
-}
-
-static TempStr GetScreenshotSaveDirTemp() {
-    TempStr dataDir = GetAppDataDirTemp();
-    return path::JoinTemp(dataDir, StrL("Screenshots"));
 }
 
 static HWND GetScreenshotOwnerHwnd() {
@@ -61,96 +58,7 @@ void InitScreenshotHost() {
     gScreenshotHost.GetOwnerHwnd = GetScreenshotOwnerHwnd;
 }
 
-// find custom shortcut key string for CmdScreenshot, or empty if none
-static Str FindScreenshotShortcut() {
-    // check gSettings->shortcuts first (may have been updated at runtime)
-    for (Shortcut* sc : *gSettings->shortcuts) {
-        if (str::EqI(sc->cmd, StrL("CmdScreenshot")) && sc->key) {
-            return sc->key;
-        }
-    }
-    // fall back to custom commands (built at startup)
-    auto* curr = gFirstCustomCommand;
-    while (curr) {
-        if (curr->origId == CmdScreenshot && curr->key) {
-            return curr->key;
-        }
-        curr = curr->next;
-    }
-    return {};
-}
-
 // --- Set Screenshot Hotkey dialog ---
-
-// serialize VK code + modifiers to a shortcut string like "Ctrl+Shift+F5"
-static TempStr SerializeHotkeyTemp(UINT vk, bool ctrl, bool shift, bool alt, bool altGr) {
-    str::Builder s;
-    if (altGr) {
-        s.Append(StrL("AltGr+"));
-    } else {
-        if (ctrl) {
-            s.Append(StrL("Ctrl+"));
-        }
-        if (alt) {
-            s.Append(StrL("Alt+"));
-        }
-    }
-    if (shift) {
-        s.Append(StrL("Shift+"));
-    }
-    bool isAlphaNumKey = (vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9');
-    if (vk >= VK_F1 && vk <= VK_F24) {
-        s.Append(fmt("F%d", (int)(vk - VK_F1 + 1)));
-    } else if (isAlphaNumKey) {
-        s.AppendChar((char)vk);
-    } else if (vk == VK_SNAPSHOT) {
-        s.Append(StrL("PrtSc"));
-    } else if (vk == VK_RETURN) {
-        s.Append(StrL("Return"));
-    } else if (vk == VK_LEFT) {
-        s.Append(StrL("Left"));
-    } else if (vk == VK_RIGHT) {
-        s.Append(StrL("Right"));
-    } else if (vk == VK_UP) {
-        s.Append(StrL("Up"));
-    } else if (vk == VK_DOWN) {
-        s.Append(StrL("Down"));
-    } else if (vk == VK_DELETE) {
-        s.Append(StrL("Delete"));
-    } else if (vk == VK_INSERT) {
-        s.Append(StrL("Insert"));
-    } else if (vk == VK_HOME) {
-        s.Append(StrL("Home"));
-    } else if (vk == VK_END) {
-        s.Append(StrL("End"));
-    } else if (vk == VK_PRIOR) {
-        s.Append(StrL("PageUp"));
-    } else if (vk == VK_NEXT) {
-        s.Append(StrL("PageDown"));
-    } else if (vk == VK_SPACE) {
-        s.Append(StrL("Space"));
-    } else if (vk == VK_PAUSE) {
-        s.Append(StrL("Pause"));
-    } else if (vk == VK_SCROLL) {
-        s.Append(StrL("ScrollLock"));
-    } else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) {
-        s.Append(fmt("Numpad%d", (int)(vk - VK_NUMPAD0)));
-    } else {
-        // unknown key
-        return {};
-    }
-    return ToStrTemp(s);
-}
-
-// find existing Shortcut entry for CmdScreenshot, or nullptr
-static Shortcut* FindScreenshotShortcutEntry() {
-    for (Shortcut* sc : *gSettings->shortcuts) {
-        if (str::EqI(sc->cmd, StrL("CmdScreenshot"))) {
-            return sc;
-        }
-    }
-    return nullptr;
-}
 
 // WM_KEYDOWN doesn't fire for VK_SNAPSHOT (PrtSc) because Windows intercepts it.
 // Use a low-level keyboard hook to capture it and post a custom message.

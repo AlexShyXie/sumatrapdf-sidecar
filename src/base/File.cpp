@@ -3,6 +3,10 @@
 
 #include "base/Base.h"
 #include "base/AutoWin.h"
+#if !OS_WIN
+#include <limits.h>
+#include <unistd.h>
+#endif
 
 #include "base/File.h"
 
@@ -10,6 +14,27 @@
 // data is a valid null-terminated string or WCHAR*.
 // 3 is for absolute worst case of WCHAR* where last char was partially written
 constexpr int kZeroPaddingCount = 3;
+
+// GUI-subsystem exes can lack CRT stdout even when launched with a pipe.
+void WriteStdout(Str data) {
+    if (len(data) == 0) {
+        return;
+    }
+#if OS_WIN
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h && h != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(h, data.s, (DWORD)len(data), &written, nullptr);
+        return;
+    }
+#endif
+    fwrite(data.s, 1, (size_t)len(data), stdout);
+}
+
+void WriteStdoutLn(Str data) {
+    WriteStdout(data);
+    WriteStdout(StrL("\n"));
+}
 
 TempStr MakeUniqueFilePathTemp(Str path) {
     if (!file::Exists(path)) {
@@ -29,6 +54,8 @@ TempStr MakeUniqueFilePathTemp(Str path) {
 bool FileTimeEq(const FILETIME& a, const FILETIME& b) {
     return a.dwLowDateTime == b.dwLowDateTime && a.dwHighDateTime == b.dwHighDateTime;
 }
+
+#if OS_WIN
 
 // Defined in Win.cpp; avoid pulling all of Win.h into this file.
 void LogLastError(DWORD err = 0);
@@ -96,17 +123,6 @@ TempStr GetSelfExePathTemp() {
 }
 
 // Directory containing GetSelfExePathTemp().
-TempStr GetSelfExeDirTemp() {
-    TempStr path = GetSelfExePathTemp();
-    return path::GetDirTemp(path);
-}
-
-TempStr GetPathInExeDirTemp(Str fileName) {
-    TempStr dir = GetSelfExeDirTemp();
-    TempStr path = path::JoinTemp(dir, fileName);
-    path = path::NormalizeTemp(path);
-    return path;
-}
 
 static ULARGE_INTEGER FileTimeToLargeInteger(const FILETIME& ft) {
     ULARGE_INTEGER res;
@@ -123,14 +139,42 @@ int FileTimeDiffInSecs(const FILETIME& ft1, const FILETIME& ft2) {
     return (int)diff;
 }
 
+#endif
+
+TempStr GetSelfExeDirTemp() {
+    TempStr path = GetSelfExePathTemp();
+#if !OS_WIN
+    if (len(path) == 0) {
+        return {};
+    }
+#endif
+    return path::GetDirTemp(path);
+}
+
+TempStr GetPathInExeDirTemp(Str fileName) {
+    TempStr dir = GetSelfExeDirTemp();
+#if !OS_WIN
+    if (len(dir) == 0) {
+        char cwd[PATH_MAX];
+        if (!getcwd(cwd, sizeof(cwd))) {
+            return fileName;
+        }
+        dir = str::DupTemp(Str(cwd));
+    }
+#endif
+    TempStr path = path::JoinTemp(dir, fileName);
+    path = path::NormalizeTemp(path);
+    return path;
+}
+
 namespace path {
 
 bool IsSep(char c) {
-    return c == kPathSepChar || c == '/';
+    return c == kPathSepChar || (OS_WIN && c == '/');
 }
 
 static bool IsSep(WCHAR c) {
-    return c == kPathSepWChar || c == L'/';
+    return c == kPathSepWChar || (OS_WIN && c == L'/');
 }
 
 bool IsDriveRoot(Str path) {
@@ -196,7 +240,7 @@ TempStr JoinTemp(Str dir, Str name, Str name2) {
 }
 
 TempWStr JoinTemp(WStr dir, WStr name, WStr name2) {
-    return JoinTempT(dir, name, name2, WStrL(L"\\"));
+    return JoinTempT(dir, name, name2, WStr(kPathSepWStr, 1));
 }
 
 Str Join(Arena* a, Str dir, Str name) {
@@ -354,6 +398,27 @@ TempStr WindowsToWslMountTemp(Str path) {
     str::TransCharsInPlace(rest, StrL("\\"), StrL("/"));
     return fmt("/mnt/%c/%s", drive, rest);
 }
+
+// path is dir, or something inside it. Only at a separator, so "C:\foo"
+// does not contain "C:\foobar".
+bool IsInDir(Str path, Str dir) {
+    int n = len(dir);
+    if (n == 0 || len(path) < n) {
+        return false;
+    }
+    if (!str::StartsWithI(path, dir)) {
+        return false;
+    }
+    if (len(path) == n) {
+        return true;
+    }
+    if (IsSep(dir.s[n - 1])) {
+        return true;
+    }
+    return IsSep(path.s[n]);
+}
+
+#if OS_WIN
 
 Type GetType(Str path) {
     DWORD attrs = GetCachedAttributes(path);
@@ -1132,6 +1197,8 @@ TempStr GetNonVirtualTemp(Str virtualPath) {
     return res;
 }
 
+#endif
+
 } // namespace path
 
 namespace file {
@@ -1152,6 +1219,72 @@ bool StartsWith(Str path, Str s) {
     }
     return MemEq(buf, s.s, s.len);
 }
+
+bool StartsWithN(Str path, Str s) {
+    return StartsWith(path, s);
+}
+
+#if !OS_WIN
+int ReadN(Str path, u8* buf, size_t toRead) {
+    FILE* fp = OpenFILE(path);
+    if (!fp) {
+        return -1;
+    }
+    AutoCall closeFile(fclose, fp);
+    ZeroMemory(buf, toRead);
+    size_t nRead = fread((void*)buf, 1, toRead, fp);
+    if (nRead == 0 && ferror(fp)) {
+        return -1;
+    }
+    return (int)nRead;
+}
+
+Str ReadFileWithArena(Str filePath, Arena* a) {
+    char* d = nullptr;
+    int res;
+    int size = 0;
+    FILE* fp = OpenFILE(filePath);
+    if (!fp) {
+        return {};
+    }
+    AutoCall closeFile(fclose, fp);
+    res = fseek(fp, 0, SEEK_END);
+    if (res != 0) {
+        return {};
+    }
+    long fileSize = ftell(fp);
+    size_t nRead = 0;
+    if (fileSize < 0 || fileSize > INT_MAX - kZeroPaddingCount) {
+        goto Error;
+    }
+    size = (int)fileSize;
+    d = AllocArray<char>(a, size + kZeroPaddingCount);
+    if (!d) {
+        goto Error;
+    }
+    res = fseek(fp, 0, SEEK_SET);
+    if (res != 0) {
+        goto Error;
+    }
+
+    nRead = fread((void*)d, 1, size, fp);
+    if (nRead != (size_t)size) {
+        int err = ferror(fp);
+        int isEof = feof(fp);
+        logf("ReadFileWithArena: fread() failed, path: '%s', size: %d, nRead: %d, err: %d, isEof: %d\n", filePath,
+             (int)size, (int)nRead, err, isEof);
+        ReportIf(!(isEof || (err != 0)));
+        goto Error;
+    }
+
+    return Str(d, size);
+Error:
+    Free(a, (void*)d);
+    return {};
+}
+#endif
+
+#if OS_WIN
 
 FILE* OpenFILE(Str path) {
     ReportIf(len(path) == 0);
@@ -1403,14 +1536,23 @@ bool Delete(Str filePath) {
 }
 
 bool DeleteFileToTrash(Str path) {
-    TempWStr pathW = ToWStrTemp(path);
+    // SHFileOperation pumps messages. A temp-arena path is wiped when that
+    // pumps a frame, and the shell then reports the file as missing.
+    WStr pathW = ToWStr(path);
     int n = len(pathW) + 2;
-    TempWStr pathDoubleTerminated = WStr(AllocArrayTemp<WCHAR>(n), n);
-    wstr::BufSet(pathDoubleTerminated, pathW);
+    WCHAR* buf = AllocArray<WCHAR>(nullptr, n);
+    if (buf && pathW.s && len(pathW) > 0) {
+        memcpy(buf, pathW.s, (size_t)len(pathW) * sizeof(WCHAR));
+    }
+    wstr::Free(pathW);
+    if (!buf) {
+        return false;
+    }
     FILEOP_FLAGS flags = FOF_NO_UI | FOF_ALLOWUNDO;
     uint op = FO_DELETE;
-    SHFILEOPSTRUCTW shfo = {nullptr, op, pathDoubleTerminated.s, nullptr, flags, FALSE, nullptr, nullptr};
+    SHFILEOPSTRUCTW shfo = {nullptr, op, buf, nullptr, flags, FALSE, nullptr, nullptr};
     int res = SHFileOperationW(&shfo);
+    Free(nullptr, buf);
     return res == 0;
 }
 
@@ -1571,6 +1713,66 @@ bool OverwriteAtomicRetry(Str dst, Str src, int retryCount, int retrySleepMs) {
     return false;
 }
 
+FileHandle OpenReadWrite(Str path, bool createIfMissing) {
+    DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    DWORD disposition = createIfMissing ? OPEN_ALWAYS : OPEN_EXISTING;
+    return CreateFileW(CWStrTemp(path), GENERIC_READ | GENERIC_WRITE, share, nullptr, disposition,
+                       FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+i64 SeekEnd(FileHandle h) {
+    LARGE_INTEGER zero = {};
+    LARGE_INTEGER pos = {};
+    if (!SetFilePointerEx(h, zero, &pos, FILE_END)) {
+        return -1;
+    }
+    return pos.QuadPart;
+}
+
+bool WriteAll(FileHandle h, Str data) {
+    int written = 0;
+    while (written < data.len) {
+        DWORD n = 0;
+        if (!::WriteFile(h, data.s + written, (DWORD)(data.len - written), &n, nullptr) || n == 0) {
+            return false;
+        }
+        written += (int)n;
+    }
+    return true;
+}
+
+bool ReadAt(FileHandle h, i64 offset, void* buf, int size) {
+    LARGE_INTEGER pos;
+    pos.QuadPart = offset;
+    if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) {
+        return false;
+    }
+    int total = 0;
+    while (total < size) {
+        DWORD n = 0;
+        if (!::ReadFile(h, (char*)buf + total, (DWORD)(size - total), &n, nullptr) || n == 0) {
+            return false;
+        }
+        total += (int)n;
+    }
+    return true;
+}
+
+TempStr LastErrorTemp() {
+    return GetLastErrorAsStr(GetTempArena());
+}
+
+FILETIME GetAccessTime(Str path) {
+    FILETIME t{};
+    WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+    if (GetInfo(path, fileInfo)) {
+        t = fileInfo.ftLastAccessTime;
+    }
+    return t;
+}
+
+#endif
+
 } // namespace file
 
 namespace dir {
@@ -1582,6 +1784,8 @@ bool CreateForFile(Str path, int* errOut) {
     TempStr dir = path::GetDirTemp(path);
     return CreateAll(dir, errOut);
 }
+
+#if OS_WIN
 
 bool Exists(WStr dir) {
     return Exists(ToUtf8Temp(dir));
@@ -1691,4 +1895,217 @@ bool HasWriteAccess(Str dir) {
     return true;
 }
 
+#endif
+
 } // namespace dir
+
+TempStr GetHomeDirTemp();
+TempStr ExpandEnvVarTemp(Str varName);
+TempStr ToAbsolutePathTemp(Str path);
+
+bool FileSystemEntryExists(Str s) {
+    return path::GetType(s) != path::Type::None;
+}
+
+Str FindFirstValidParentDir(Str path) {
+    Str current = path;
+    while (len(current) > 0) {
+        if (dir::Exists(current)) {
+            return current;
+        }
+        Str parent = PathGetDirTemp(current);
+        if (parent.len >= current.len) {
+            break;
+        }
+        current = parent;
+    }
+    return current;
+}
+
+Str PathGetDirTemp(Str path) {
+    if (len(path) == 0) {
+        return {};
+    }
+    while (path.len > 1 && path::IsSep(path.s[path.len - 1])) {
+        path.len--;
+    }
+    int idx = -1;
+    for (int i = 0; i < path.len; i++) {
+        if (path::IsSep(path.s[i])) {
+            idx = i;
+        }
+    }
+    if (idx < 0) {
+        return {};
+    }
+    int n = idx;
+    if (idx == 0) {
+        n = 1;
+    } else if (idx == 2 && path.s[1] == ':') {
+        n = 3;
+    }
+    return str::DupTemp(Str(path.s, n));
+}
+
+Str PathGetNameTemp(Str path) {
+    if (len(path) == 0) {
+        return {};
+    }
+    while (path.len > 1 && path::IsSep(path.s[path.len - 1])) {
+        path.len--;
+    }
+    int idx = -1;
+    for (int i = 0; i < path.len; i++) {
+        if (path::IsSep(path.s[i])) {
+            idx = i;
+        }
+    }
+    if (idx < 0) {
+        return str::DupTemp(path);
+    }
+    return str::DupTemp(Str(path.s + idx + 1, path.len - idx - 1));
+}
+
+Str SmartResolveDirectory(Str dir) {
+    if (len(dir) == 0) {
+        return dir;
+    }
+
+    auto* ta = GetTempArena();
+    char* normalized = (char*)Alloc(ta, dir.len + 1);
+    for (int i = 0; i < dir.len; i++) {
+        normalized[i] = path::IsSep(dir.s[i]) ? kPathSepChar : dir.s[i];
+    }
+    normalized[dir.len] = 0;
+    Str result = Str(normalized, dir.len);
+
+    if (dir::Exists(result)) {
+        return ToAbsolutePathTemp(result);
+    }
+
+    if (len(result) > 0 && result.s[0] == '~') {
+        Str home = GetHomeDirTemp();
+        if (len(home) > 0) {
+            int newLen = home.len + result.len - 1;
+            char* expanded = (char*)Alloc(ta, newLen + 1);
+            int pos = 0;
+            for (int i = 0; i < home.len; i++) {
+                expanded[pos++] = home.s[i];
+            }
+            for (int i = 1; i < result.len; i++) {
+                expanded[pos++] = result.s[i];
+            }
+            expanded[pos] = 0;
+            result = Str(expanded, pos);
+            if (dir::Exists(result)) {
+                return ToAbsolutePathTemp(result);
+            }
+        }
+    }
+
+    char* expanded = (char*)Alloc(ta, MAX_PATH);
+    int outPos = 0;
+    int i = 0;
+    while (i < result.len && outPos < MAX_PATH - 1) {
+        if (result.s[i] == '$' && i + 1 < result.len) {
+            int varStart = i + 1;
+            int varEnd = varStart;
+            while (varEnd < result.len) {
+                char c = result.s[varEnd];
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+                    varEnd++;
+                } else {
+                    break;
+                }
+            }
+            if (varEnd > varStart) {
+                Str varName = Str(result.s + varStart, varEnd - varStart);
+                Str value = ExpandEnvVarTemp(varName);
+                if (len(value) > 0) {
+                    for (int j = 0; j < value.len && outPos < MAX_PATH - 1; j++) {
+                        expanded[outPos++] = value.s[j];
+                    }
+                    i = varEnd;
+                    continue;
+                }
+            }
+            expanded[outPos++] = result.s[i++];
+        } else if (result.s[i] == '%') {
+            int varStart = i + 1;
+            int varEnd = varStart;
+            while (varEnd < result.len && result.s[varEnd] != '%') {
+                varEnd++;
+            }
+            if (varEnd < result.len && varEnd > varStart) {
+                Str varName = Str(result.s + varStart, varEnd - varStart);
+                Str value = ExpandEnvVarTemp(varName);
+                if (len(value) > 0) {
+                    for (int j = 0; j < value.len && outPos < MAX_PATH - 1; j++) {
+                        expanded[outPos++] = value.s[j];
+                    }
+                    i = varEnd + 1;
+                    continue;
+                }
+            }
+            expanded[outPos++] = result.s[i++];
+        } else {
+            expanded[outPos++] = result.s[i++];
+        }
+    }
+    expanded[outPos] = 0;
+    result = Str(expanded, outPos);
+
+    return ToAbsolutePathTemp(result);
+}
+
+#if OS_WIN
+
+TempWStr GetSelfExePathW() {
+    return GetModulePathTemp((HMODULE)&__ImageBase, MAX_PATH + 1);
+}
+
+TempStr GetHomeDirTemp() {
+    WCHAR buf[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        return ToUtf8Temp(WStr(buf, (int)n));
+    }
+
+    WCHAR drive[MAX_PATH];
+    WCHAR path[MAX_PATH];
+    DWORD driveLen = GetEnvironmentVariableW(L"HOMEDRIVE", drive, MAX_PATH);
+    DWORD pathLen = GetEnvironmentVariableW(L"HOMEPATH", path, MAX_PATH);
+    if (driveLen > 0 && pathLen > 0) {
+        WCHAR combined[MAX_PATH * 2];
+        int pos = 0;
+        for (DWORD i = 0; i < driveLen && pos < MAX_PATH * 2 - 1; i++) {
+            combined[pos++] = drive[i];
+        }
+        for (DWORD i = 0; i < pathLen && pos < MAX_PATH * 2 - 1; i++) {
+            combined[pos++] = path[i];
+        }
+        combined[pos] = 0;
+        return ToUtf8Temp(WStr(combined, pos));
+    }
+    return {};
+}
+
+TempStr ExpandEnvVarTemp(Str varName) {
+    WCHAR buf[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(CWStrTemp(varName), buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        return ToUtf8Temp(WStr(buf, (int)n));
+    }
+    return {};
+}
+
+TempStr ToAbsolutePathTemp(Str path) {
+    WCHAR buf[MAX_PATH];
+    DWORD n = GetFullPathNameW(CWStrTemp(path), MAX_PATH, buf, nullptr);
+    if (n > 0 && n < MAX_PATH) {
+        return ToUtf8Temp(WStr(buf, (int)n));
+    }
+    return path;
+}
+
+#endif

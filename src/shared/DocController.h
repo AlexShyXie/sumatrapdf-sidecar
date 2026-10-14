@@ -1,0 +1,283 @@
+/* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
+   License: GPLv3 */
+
+struct DocController;
+struct ChmModel;
+struct MarkdownModel;
+struct DisplayModel;
+struct IPageElement;
+struct IPageDestination;
+struct ILinkHandler;
+struct TocTree;
+struct TocItem;
+struct MainWindow;
+struct FileState;
+struct RenderedBitmap;
+struct BrowserView;
+struct BrowserViewCallback;
+// chapter-aware page location; full definition in ChapterTable.h
+struct Location;
+enum class DisplayMode;
+enum class DocProp : u8;
+
+enum class BrowserUrlType {
+    Internal,
+    External,
+};
+
+struct BrowserTocTraceItem {
+    Str title;
+    Str url;
+    int level = 0;
+    int pageNo = 0;
+    BrowserUrlType urlType = BrowserUrlType::Internal;
+};
+
+IPageDestination* NewBrowserDestination(Arena* arena, Str url, int pageNo, BrowserUrlType type);
+TocItem* NewBrowserTocItem(Arena* arena, Str title, int pageNo, Str url, BrowserUrlType type);
+TocTree* BuildBrowserTocTree(Arena* arena, Vec<BrowserTocTraceItem>& trace);
+
+using OnBitmapRendered = Func1<RenderedBitmap*>;
+
+struct DocControllerCallback {
+    virtual ~DocControllerCallback() = default;
+    // tell the UI to show the pageNo as current page (which also syncs
+    // the toc with the curent page). Needed for when a page change happens
+    // indirectly or is initiated from within the model
+    virtual void PageNoChanged(DocController* ctrl, int pageNo) = 0;
+    virtual void ZoomChanged(DocController* ctrl, float zoomVirtual) = 0;
+    // tell the UI to open the linked document or URL
+    virtual void GotoLink(IPageDestination*) = 0;
+    // DisplayModel //
+    virtual void Repaint() = 0;
+    virtual void UpdateScrollbars(DisplayModel* dm, Size canvas) = 0;
+    virtual void RequestRendering(DisplayModel* dm, int pageNo) = 0;
+    // start (or continue) chained predictive rendering anchored to originPageNo
+    virtual void RequestPredictiveRendering(DisplayModel* dm, int originPageNo, const int* pages, int nPages) = 0;
+    virtual void CleanUp(DisplayModel* dm) = 0;
+    virtual void RenderThumbnail(DisplayModel* dm, Size size, const OnBitmapRendered*) = 0;
+    // ChmModel //
+    // tell the UI to move focus back to the main window
+    // (if always == false, then focus is only moved if it's inside
+    // an HtmlWindow and thus outside the reach of the main UI)
+    virtual void FocusFrame(bool always) = 0;
+    // tell the UI to let the user save the provided data to a file
+    virtual void SaveDownload(Str url, Str) = 0;
+    // MarkdownModel //
+    // in-page find result from the webview: search generation, 1-based
+    // current match and total match count on the current page
+    virtual void FindResultReceived(int gen, int current, int total) = 0;
+    // all-pages find result from the webview (raw 'mdfindall' payload)
+    virtual void FindAllResultReceived(Str payload) = 0;
+    // the controller replaced its TocTree (built in the background): show the
+    // new one. Must not return while anything still points into the old tree.
+    virtual void TocChanged(DocController*) = 0;
+    // the DisplayModel's flat page numbering shifted because a chapter got
+    // (re)laid out; refresh anything keyed by pageNo (selection, find, toolbar,
+    // toc selection)
+    virtual void PagesRenumbered(DisplayModel* dm) = 0;
+};
+
+struct DocController {
+    DocControllerCallback* cb;
+
+    explicit DocController(DocControllerCallback* cb) : cb(cb) { ReportIf(!cb); }
+    virtual ~DocController() = default;
+
+    // meta data
+    virtual Str GetFilePath() const = 0;
+    virtual Str GetDefaultFileExt() const = 0;
+    virtual int PageCount() const = 0;
+    virtual TempStr GetPropertyTemp(DocProp prop) = 0;
+
+    // page navigation (stateful)
+    virtual int CurrentPageNo() const = 0;
+    virtual void GoToPage(int pageNo, bool addNavPoint) = 0;
+    virtual bool CanNavigate(int dir) const = 0;
+    virtual void Navigate(int dir) = 0;
+
+    // chapter-aware page addressing; single-chapter controllers (the
+    // default) behave exactly as the flat pageNo API always has
+    virtual int ChapterCount() { return 1; }
+    bool HasChapters() { return ChapterCount() > 1; }
+    virtual int ChapterPageCount(int) { return PageCount(); }
+    virtual Location CurrentLocation();
+    virtual void GoToLocation(Location loc, bool addNavPoint);
+    virtual Location LocationFromPageNo(int pageNo);
+    virtual int PageNoFromLocation(Location loc);
+    virtual Location ResolveDest(IPageDestination* dest);
+    virtual TempStr MakeBookmarkTemp(Location loc);
+    virtual Location LookupBookmark(Str s);
+    virtual Location ClampLocation(Location loc);
+
+    // view settings
+    virtual void SetDisplayMode(DisplayMode mode, bool keepContinuous = false) = 0;
+    virtual DisplayMode GetDisplayMode() const = 0;
+    virtual void SetInPresentation(bool enable) = 0;
+    virtual void SetZoomVirtual(float zoom, Point* fixPt) = 0;
+    virtual float GetZoomVirtual(bool absolute = false) const = 0;
+    virtual float GetNextZoomStep(float towards) const = 0;
+    virtual void SetViewPortSize(Size size) = 0;
+
+    // in-page find in an embedded browser view (ChmModel, MarkdownModel with
+    // a WebView2 backend); see SearchAndDDE.cpp BrowserFind* and BrowserDocView
+    virtual bool CanFindInPage() const { return false; }
+    virtual void FindStart(Str, bool, bool, int) {}
+    virtual void FindAllPages(Str, bool, bool, int) {}
+    virtual void FindGoto(int) {}
+    virtual void GoToPageWithFind(int, Str, bool, bool, int, int) {}
+    virtual void FindClear() {}
+
+    // table of contents
+    virtual bool HasToc() {
+        auto* tree = GetToc();
+        return tree != nullptr;
+    }
+    virtual TocTree* GetToc() = 0;
+    virtual void ScrollTo(int pageNo, RectF rect, float zoom) = 0;
+
+    // engine-owned; do not delete
+    virtual IPageDestination* GetNamedDest(Str name) = 0;
+
+    // get display state (pageNo, zoom, scroll etc. of the document)
+    virtual void GetDisplayState(FileState* fs) = 0;
+    // asynchronously calls saveThumbnail (fails silently)
+    virtual void CreateThumbnail(Size size, const OnBitmapRendered* saveThumbnail) = 0;
+
+    // page labels (optional)
+    virtual bool HasPageLabels() const { return false; }
+    virtual TempStr GetPageLabeTemp(int pageNo) const { return fmt("%d", pageNo); }
+    virtual int GetPageByLabel(Str label) const { return ParseInt(label); }
+
+    // common shortcuts
+    virtual bool ValidPageNo(int pageNo) const { return 1 <= pageNo && pageNo <= PageCount(); }
+    virtual bool GoToNextPage() {
+        if (CurrentPageNo() == PageCount()) {
+            return false;
+        }
+        GoToPage(CurrentPageNo() + 1, false);
+        return true;
+    }
+    virtual bool GoToPrevPage(__unused bool toBottom = false) {
+        if (CurrentPageNo() == 1) {
+            return false;
+        }
+        GoToPage(CurrentPageNo() - 1, false);
+        return true;
+    }
+    virtual bool GoToFirstPage() {
+        if (CurrentPageNo() == 1) {
+            return false;
+        }
+        GoToPage(1, true);
+        return true;
+    }
+    virtual bool GoToLastPage() {
+        if (CurrentPageNo() == PageCount()) {
+            return false;
+        }
+        GoToPage(PageCount(), true);
+        return true;
+    }
+
+    virtual bool HandleLink(IPageDestination*, ILinkHandler*) {
+        // TODO: over-ride in ChmModel
+        return false;
+    }
+
+    // for quick type determination and type-safe casting
+    virtual DisplayModel* AsFixed() { return nullptr; }
+    virtual ChmModel* AsChm() { return nullptr; }
+    virtual MarkdownModel* AsMarkdown() { return nullptr; }
+};
+
+struct BrowserDocController : DocController {
+    explicit BrowserDocController(DocControllerCallback* cb);
+    ~BrowserDocController() override;
+
+    int PageCount() const override;
+    int CurrentPageNo() const override;
+    bool CanNavigate(int dir) const override;
+    void Navigate(int dir) override;
+
+    void SetDisplayMode(DisplayMode mode, bool keepContinuous = false) override;
+    DisplayMode GetDisplayMode() const override;
+    void SetInPresentation(bool enable) override;
+    void SetZoomVirtual(float zoom, Point* fixPt) override;
+    float GetZoomVirtual(bool absolute = false) const override;
+    float GetNextZoomStep(float towards) const override;
+    void SetViewPortSize(Size size) override;
+    void ScrollTo(int pageNo, RectF rect, float zoom) override;
+    void GetDisplayState(FileState* fs) override;
+    bool HandleLink(IPageDestination* link, ILinkHandler* linkHandler) override;
+
+    bool CanFindInPage() const override;
+    void FindStart(Str term, bool matchCase, bool wholeWord, int gen) override;
+    void FindGoto(int idx) override;
+    void GoToPageWithFind(int pageNo, Str term, bool matchCase, bool wholeWord, int idx, int gen) override;
+    void FindClear() override;
+
+    void PrintCurrentPage(bool showUI) const;
+    void FindInCurrentPage() const;
+    void SelectAll() const;
+    void CopySelection() const;
+    LRESULT PassUIMsg(UINT msg, WPARAM wp, LPARAM lp) const;
+    void FinishDocumentLoad(int pageNo);
+    void FinishPendingFind();
+    void OnFindResult(int gen, int current, int total);
+    void OnFindAllResult(Str payload);
+    void DownloadData(Str url, Str data);
+    void OnLButtonDown();
+    bool SetParentWindow(MainWindow* win, HWND hwndParent);
+    void RemoveParentWindow();
+    void DestroyParentWindow();
+    void CloseBrowser();
+    void UpdateTheme();
+
+    void SaveHtmlScrollPos();
+    void SaveHtmlScrollPosForPage(int pageNo);
+    void SaveHtmlScrollPosForUrl(Str url, PointF pos);
+    bool GetSavedHtmlScrollPosForPage(int pageNo, PointF* pos) const;
+    bool GetSavedHtmlScrollPosForUrl(Str url, PointF* pos) const;
+    void RestoreHtmlScrollPos();
+    Str GetCachedData(Str url) const;
+    Str CacheData(Str url, Str data);
+
+    StrVec pages;
+    int currentPageNo = 1;
+    Str currentPageUrl;
+    BrowserView* docView = nullptr;
+    BrowserViewCallback* browserCb = nullptr;
+    float initZoom;
+    float zoomVirtual = 100.0f;
+    PointF htmlScrollPos = PointF(-1, -1);
+    bool restoreHtmlScrollPos = false;
+    bool skipNextBeforeNavigateScrollSave = false;
+    Str pendingFindTerm;
+    bool pendingFindMatchCase = false;
+    bool pendingFindWholeWord = false;
+    int pendingFindIdx = -1;
+    int pendingFindGen = 0;
+    bool hasPendingFind = false;
+    StrVec htmlScrollUrls;
+    Vec<PointF> htmlScrollPositions;
+    Mutex docAccess;
+
+  private:
+    struct CacheEntry;
+
+    void ClearDataCache();
+
+    virtual BrowserViewCallback* CreateBrowserCallback() = 0;
+    virtual Str BrowserVirtualHost() const { return {}; }
+    virtual bool OpenLinkedDocument(Str) { return false; }
+    virtual bool DisplayPage(Str pageUrl) = 0;
+    virtual TempStr NormalizeScrollUrlTemp(Str url) const = 0;
+    virtual TempStr ScrollUrlForPageTemp(int pageNo) const = 0;
+    Vec<CacheEntry*> dataCache;
+    mutable bool sendingBrowserMsg = false;
+};
+
+inline bool IsBrowserDocController(DocController* ctrl) {
+    return ctrl && (ctrl->AsChm() || ctrl->AsMarkdown());
+}

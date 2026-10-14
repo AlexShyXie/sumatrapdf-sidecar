@@ -4,24 +4,30 @@
 // Home/End/PageUp/PageDown never moved the list.
 import { join } from "node:path";
 import { ControlClient, ControlCommand } from "./control";
-import { ROOT, cmdId, runStandalone } from "./util";
+import { IS_MAC } from "./host";
+import { ROOT, cmdId, runStandalone, SLOW_BUILD_FACTOR } from "./util";
+import { postMessage, sendText, sleep, WM_CLOSE, WM_KEYDOWN } from "./winapi";
 import {
-  getClassName,
-  getFocusedHwnd,
-  getRootWindow,
-  postMessage,
-  sendText,
-  sleep,
-  WM_CLOSE,
-  WM_KEYDOWN,
-} from "./winapi";
-import { killAndWait, launchControlled, sendCommand, sendCommandSync, waitForExit } from "./win-automation";
+  killAndWait,
+  launchControlled,
+  sendCommand,
+  sendCommandSync,
+  waitForExit,
+  findPalette,
+} from "./win-automation";
 
 const VK_END = 0x23;
 const VK_HOME = 0x24;
 const VK_NEXT = 0x22; // Page Down
 
 function clipboardText(): string {
+  if (IS_MAC) {
+    const res = Bun.spawnSync(["pbpaste"], { stdout: "pipe", stderr: "pipe" });
+    if (res.exitCode !== 0) {
+      throw new Error(`issue-5972: pbpaste failed: ${res.stderr.toString()}`);
+    }
+    return res.stdout.toString().replace(/\r?\n$/, "");
+  }
   const res = Bun.spawnSync(["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard -Raw"], {
     stdout: "pipe",
     stderr: "pipe",
@@ -33,6 +39,13 @@ function clipboardText(): string {
 }
 
 function setClipboard(value: string): void {
+  if (IS_MAC) {
+    const res = Bun.spawnSync(["pbcopy"], { stdin: Buffer.from(value), stdout: "pipe", stderr: "pipe" });
+    if (res.exitCode !== 0) {
+      throw new Error(`issue-5972: pbcopy failed: ${res.stderr.toString()}`);
+    }
+    return;
+  }
   const res = Bun.spawnSync(["powershell.exe", "-NoProfile", "-Command", `Set-Clipboard -Value '${value}'`], {
     stdout: "pipe",
     stderr: "pipe",
@@ -61,8 +74,10 @@ async function paletteState(client: ControlClient): Promise<PaletteState | null>
   return { sel: +m[1]!, items: +m[2]!, querySel: [+m[3]!, +m[4]!], queryLen: +m[5]! };
 }
 
+const kWait = IS_MAC ? SLOW_BUILD_FACTOR : 1;
+
 async function waitPalette(client: ControlClient): Promise<PaletteState> {
-  const deadline = Date.now() + 8_000;
+  const deadline = Date.now() + 8_000 * kWait;
   for (;;) {
     const st = await paletteState(client);
     if (st && st.items > 1) {
@@ -75,15 +90,6 @@ async function waitPalette(client: ControlClient): Promise<PaletteState> {
   }
 }
 
-function findPalette(frame: number): { palette: number; edit: number } {
-  const edit = getFocusedHwnd(frame);
-  if (!edit || getClassName(edit) !== "Edit") {
-    return { palette: 0, edit: 0 };
-  }
-  const palette = getRootWindow(edit);
-  return { palette: palette === frame ? 0 : palette, edit };
-}
-
 export async function testit(): Promise<void> {
   const pdf = join(ROOT, "ext", "a-zlib", "zlib.3.pdf");
   const { proc, client, frame } = await launchControlled([pdf]);
@@ -91,9 +97,16 @@ export async function testit(): Promise<void> {
     await client.waitForRenderIdle();
     sendCommand(frame, cmdId("CmdCommandPalette"));
     let st = await waitPalette(client);
-    const { palette, edit } = findPalette(frame);
-    if (!palette || !edit) {
-      throw new Error("issue-5972: no command palette edit");
+    // The palette is a tool window. Keys and commands already go to it.
+    let palette = frame;
+    let edit = frame;
+    if (!IS_MAC) {
+      const found = findPalette(frame);
+      palette = found.palette;
+      edit = found.edit;
+      if (!palette || !edit) {
+        throw new Error("issue-5972: no command palette edit");
+      }
     }
 
     postMessage(edit, WM_KEYDOWN, VK_NEXT, 0);
@@ -111,7 +124,7 @@ export async function testit(): Promise<void> {
     const query = "palette-copy-5972";
     sendText(edit, query);
     sendCommandSync(palette, cmdId("CmdSelectAll"));
-    const deadline = Date.now() + 3_000;
+    const deadline = Date.now() + 3_000 * kWait;
     for (;;) {
       st = (await paletteState(client))!;
       if (st.queryLen === query.length && st.querySel[0] === 0 && st.querySel[1] === query.length) {
@@ -126,7 +139,7 @@ export async function testit(): Promise<void> {
     const sentinel = "issue-5972 clipboard sentinel";
     setClipboard(sentinel);
     sendCommandSync(palette, cmdId("CmdCopySelection"));
-    const copyDeadline = Date.now() + 3_000;
+    const copyDeadline = Date.now() + 3_000 * kWait;
     for (;;) {
       const copied = clipboardText();
       if (copied === query) {
@@ -151,7 +164,7 @@ export async function testit(): Promise<void> {
 }
 
 async function waitForSelChange(client: ControlClient, from: number, what: string): Promise<PaletteState> {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + 5_000 * kWait;
   for (;;) {
     const st = await paletteState(client);
     if (st && st.sel !== from) {
@@ -165,7 +178,7 @@ async function waitForSelChange(client: ControlClient, from: number, what: strin
 }
 
 async function waitForSel(client: ControlClient, want: number, what: string): Promise<PaletteState> {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + 5_000 * kWait;
   for (;;) {
     const st = await paletteState(client);
     if (st && st.sel === want) {

@@ -29,28 +29,7 @@
 #include "Translations.h"
 #include "DarkMode.h"
 #include "SumatraDialogs.h"
-
-static const int kMaxCustomColors = 13;
-static const int kNumPresets = 3;
-static const Color kBgPresetColors[] = {
-    kColorUnset,
-    kColBlack,
-    kColWhite,
-};
-
-// custom swatches are laid out in 2 rows
-static const int kCustomInRow1 = 5;
-
-static const Color kColCheckerDark = MkRgb(204, 204, 204);
-
-static const int kIdPreview = 1;
-static const int kIdPreset0 = 10;
-static const int kIdCustom0 = 20;
-
-enum class CloseAction {
-    Cancel,
-    Select
-};
+#include "ChangeColorDialogCommon.h"
 
 // HSV picker, hex edit, swatches and Cancel/OK. Same WindowBase layout as
 // Settings. Used for Change Background Color and, when colorsArgs is set, as
@@ -149,41 +128,6 @@ static void ClearChangeColorWnd() {
     gChangeColorWnd = nullptr;
 }
 
-static void HsvToRgb(float h, float s, float v, u8& r, u8& g, u8& b) {
-    float c = v * s;
-    float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
-    float m = v - c;
-    float rf, gf, bf;
-    if (h < 60) {
-        rf = c;
-        gf = x;
-        bf = 0;
-    } else if (h < 120) {
-        rf = x;
-        gf = c;
-        bf = 0;
-    } else if (h < 180) {
-        rf = 0;
-        gf = c;
-        bf = x;
-    } else if (h < 240) {
-        rf = 0;
-        gf = x;
-        bf = c;
-    } else if (h < 300) {
-        rf = x;
-        gf = 0;
-        bf = c;
-    } else {
-        rf = c;
-        gf = 0;
-        bf = x;
-    }
-    r = (u8)((rf + m) * 255.0f);
-    g = (u8)((gf + m) * 255.0f);
-    b = (u8)((bf + m) * 255.0f);
-}
-
 static Pixmap* MakeHsvPixmap(int w, int h) {
     Pixmap* px = AllocPixmap(w, h, PixmapFormat::BGRA8, false);
     if (!px) {
@@ -205,27 +149,6 @@ static Pixmap* MakeHsvPixmap(int w, int h) {
     return px;
 }
 
-static Color WithAlpha(Color c, u8 a) {
-    return (c & 0xffffff) | ((Color)a << 24);
-}
-
-// an alpha of 0 means "no alpha given" everywhere else, so it reads as opaque
-static u8 OpacityOf(Color c) {
-    u8 a = GetAlpha(c);
-    return a == 0 ? 0xff : a;
-}
-
-static u8 BlendChannel(u8 fg, u8 bg, u8 a) {
-    return (u8)((((int)fg * (int)a) + ((int)bg * (255 - (int)a))) / 255);
-}
-
-static Color BlendOver(Color col, Color bg, u8 a) {
-    u8 r, g, b, br, bg2, bb;
-    UnpackColor(col, r, g, b);
-    UnpackColor(bg, br, bg2, bb);
-    return MkRgb(BlendChannel(r, br, a), BlendChannel(g, bg2, a), BlendChannel(b, bb, a));
-}
-
 static void PaintCheckerboard(Gfx* gfx, Rect rc, Color light, Color dark) {
     constexpr int kCheckerSize = 8;
     for (int cy = 0; cy < rc.dy; cy += kCheckerSize) {
@@ -242,14 +165,6 @@ static void PaintCheckerboard(Gfx* gfx, Rect rc, Color light, Color dark) {
             gfx->FillRect({rc.x + cx, rc.y + cy, cellW, cellH}, isDark ? dark : light);
         }
     }
-}
-
-static void SaveCustomColors(const Vec<Color>& colors) {
-    if (!gSettings) {
-        return;
-    }
-    str::ReplaceWithCopy(&gSettings->customColors, SerializeColorList(colors));
-    ScheduleSaveSettings();
 }
 
 void ChangeColorWnd::LoadColors() {
@@ -756,7 +671,7 @@ void ChangeColorWnd::ClassifyTab(WindowTab* t) {
     if (!engine) {
         return;
     }
-    isImage = engine->IsImageCollection();
+    isImage = engine->isImageCollection;
     isCbx = engine->kind == kindEngineComicBooks;
     isEbook = engine->kind == kindEngineMupdf && !str::EqI(engine->defaultExt, StrL(".pdf"));
 }
@@ -1165,13 +1080,7 @@ void ShowChangeColorsDialog(ChangeColorsArgs* args) {
     gChangeColorWnd = wnd;
 }
 
-// which tab the color picked in the generic dialog applies to
-struct TabColorTarget {
-    MainWindow* win = nullptr;
-    Str filePath;
-};
-
-static void TabColorPicked(TabColorTarget* target, ChangeColorsArgs* args) {
+void TabColorPicked(TabColorTarget* target, ChangeColorsArgs* args) {
     if (args->colorsChanged) {
         SaveCustomColors(args->colors);
     }
@@ -1192,23 +1101,4 @@ static void TabColorPicked(TabColorTarget* target, ChangeColorsArgs* args) {
     }
     str::Free(target->filePath);
     delete target;
-}
-
-void ShowSetTabColorDialog(MainWindow* win, WindowTab* tab) {
-    if (!IsMainWindowValidAndNotClosing(win) || !tab || !tab->ctrl) {
-        return;
-    }
-    auto* target = new TabColorTarget();
-    target->win = win;
-    str::ReplaceWithCopy(&target->filePath, tab->filePath);
-
-    auto* args = new ChangeColorsArgs();
-    args->win = win;
-    args->title = Tr("Change Tab Color");
-    args->color = tab->tabColor;
-    if (gSettings) {
-        ParseColorList(gSettings->customColors, args->colors, kMaxCustomColors);
-    }
-    args->onClose = MkFunc1(TabColorPicked, target);
-    ShowChangeColorsDialog(args);
 }

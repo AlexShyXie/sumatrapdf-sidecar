@@ -6,18 +6,10 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ControlClient, ControlCommand } from "./control.ts";
+import { IS_MAC } from "./host.ts";
 import { assemblePdf, cmdId, runStandalone, tmpPath } from "./util.ts";
-import {
-  getClassName,
-  getFocusedHwnd,
-  getRootWindow,
-  postMessage,
-  sendText,
-  sleep,
-  VK_RETURN,
-  WM_KEYDOWN,
-} from "./winapi.ts";
-import { killAndWait, launchControlled, sendCommand } from "./win-automation.ts";
+import { postMessage, sendText, sleep, VK_RETURN, WM_KEYDOWN } from "./winapi.ts";
+import { killAndWait, launchControlled, sendCommand, findPalette } from "./win-automation.ts";
 
 const SETTINGS = `UiLanguage = en
 Theme = Light
@@ -44,15 +36,6 @@ function makePdf(): string {
       "/QuadPoints [72 530 220 530 72 500 220 500] /C [1 1 0] /Contents (palette-annot-beta) >>",
   ];
   return assemblePdf(objs);
-}
-
-function findPalette(frame: number): { palette: number; edit: number } {
-  const edit = getFocusedHwnd(frame);
-  if (!edit || getClassName(edit) !== "Edit") {
-    return { palette: 0, edit: 0 };
-  }
-  const palette = getRootWindow(edit);
-  return { palette: palette === frame ? 0 : palette, edit };
 }
 
 async function paletteState(client: ControlClient): Promise<PaletteState | null> {
@@ -96,9 +79,16 @@ export async function testit(): Promise<void> {
     const openDeadline = Date.now() + 8_000;
     let handles = { palette: 0, edit: 0 };
     while (Date.now() < openDeadline) {
-      handles = findPalette(frame);
-      if (handles.palette && handles.edit) {
-        break;
+      if (IS_MAC) {
+        if (await paletteState(client)) {
+          handles = { palette: frame, edit: frame };
+          break;
+        }
+      } else {
+        handles = findPalette(frame);
+        if (handles.palette && handles.edit) {
+          break;
+        }
       }
       await sleep(50);
     }

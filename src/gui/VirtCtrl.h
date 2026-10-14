@@ -66,6 +66,7 @@ struct VirtMouseEvent {
     bool isCtrl = false;
     bool isShift = false;
     bool isAlt = false;
+    bool isLeftDown = false;
     // true = consume (stop bubbling)
     bool didHandle = false;
 };
@@ -626,6 +627,8 @@ struct VirtText : VirtCtrl {
     bool prefix = false;
     // nudges the underline off the text baseline box
     int underlineOffsetY = 0;
+    // kColorUnset: the text color
+    Color underlineColor = kColorUnset;
     VirtTextAlign align = VirtTextAlign::Left;
 
     Size sz = {0, 0};
@@ -674,6 +677,7 @@ struct VirtLink : VirtText {
 struct VirtButton : VirtText {
     // colors: kColBtn*, defaulting to gColsBtnDefault when isDefault
     Insets textPadding{.top = 4, .right = 8, .bottom = 4, .left = 8};
+    int cornerRadius = 0;
 
     VirtButton(Str s, PlatformFont* font = nullptr);
     ~VirtButton() override;
@@ -696,6 +700,19 @@ struct VirtButton : VirtText {
 };
 
 VirtButton* AsVirtButton(ILayout*);
+
+// the buttons of the redrawn dialogs: the one action filled with the text
+// color, Cancel outlined, the quiet ones plain words that fill on hover
+enum class DlgButtonStyle {
+    Filled,
+    Outline,
+    Ghost
+};
+VirtButton* NewDlgButton(HWND hwndForDpi, Str text, PlatformFont* font, DlgButtonStyle style, bool isDefault);
+// a filled button goes pale while disabled
+void SetDlgButtonEnabled(VirtButton* b, DlgButtonStyle style, bool enabled);
+// the dialogs' UI font at `px`
+PlatformFont* DlgUiFont(int px);
 
 struct VirtIconButton : VirtCtrl {
     // not owned; in SumatraPDF it comes from GetCachedPixmapForSvg()
@@ -960,6 +977,9 @@ struct VirtFixedLinesText : VirtRichText {
 };
 
 VirtRichText* ParseTip(Str s);
+// "Enter run": the key as a key cap before the words, padded 8 on each side
+void InitKeyHint(VirtRichText* t, PlatformFont* font, Str key, Str desc, Color colTxt, Color colBg);
+VirtRichText* NewKeyHint(PlatformFont* font, Str key, Str desc, Color colTxt, Color colBg);
 // same, but into a VirtRichText the caller made (e.g. a subclass of it)
 void ParseTipInto(VirtRichText*, Str s);
 int TipWordCount(VirtRichText*);

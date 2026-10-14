@@ -14,6 +14,7 @@
 #include "gui/GuiColors.h"
 #include "gui/VirtCtrl.h"
 #include "gui/win/TabsCtrl.h"
+#include "AppHelpersCommon.h"
 
 // Forward declaration - defined in MainWindow.cpp
 struct MainWindow;
@@ -54,14 +55,6 @@ TabInfo::~TabInfo() {
 
 static Gdiplus::Color GdipCol(Color c) {
     return GdiRgbFromColor(c);
-}
-
-// the text stays readable on a tab that carries a color of its own
-static Color TabTextColorForBackground(Color text, Color tabBg) {
-    if (abs((int)GetLightness(text) - (int)GetLightness(tabBg)) >= 80) {
-        return text;
-    }
-    return IsLightColor(tabBg) ? kColBlack : kColWhite;
 }
 
 //--- TabCtrl: one tab
@@ -460,10 +453,6 @@ void TabsCtrl::LayoutTabs() {
         dx = std::min(tabDefaultDx, maxDx);
     }
     tabSize = {dx, dy};
-    if (IsRunningOnWine()) {
-        logf("TabsCtrl::LayoutTabs: hwnd=%p client=(%d,%d) tabSize=(%d,%d) nTabs=%d\n", hwnd, rect.dx, rect.dy,
-             tabSize.dx, tabSize.dy, nTabs);
-    }
 
     for (int i = 0; i < nTabs; i++) {
         tabCtrls[i]->idealSize = tabSize;

@@ -1,6 +1,6 @@
 // Full regular suite: run-almost-all (fast) then the tests whose time is the test.
 //
-// Run:  bun tests/run-all.ts [--no-build] [-silent] [-exe <SumatraPDF.exe>]
+// Run:  bun tests/run-all.ts [--no-build] [-silent] [-ng] [-exe <SumatraPDF.exe>]
 //
 // Register a new test in run-almost-all.ts unless it cannot be made faster
 // (print-to-PDF, LaTeX, a measured wait, high-zoom tile settle, a huge
@@ -23,9 +23,11 @@ import { testit as issue5353 } from "./issue-5353.ts";
 import { testit as issue6150 } from "./issue-6150.ts";
 import { testit as issue5040 } from "./issue-5040.ts";
 import { testit as reloadDebounce } from "./reload-debounce.ts";
+import { testit as issue6316 } from "./issue-6316.ts";
 import { testit as issue2693 } from "./issue-2693.ts";
 import { testit as issue5865 } from "./issue-5865.ts";
 import { testit as ghsaCrhmW5qrWjj4 } from "./security-ghsa-crhm-w5qr-wjj4.ts";
+import { testit as issue6314 } from "./issue-6314.ts";
 import { testit as issue1195 } from "./issue-1195.ts";
 import { testit as issue5870ListDirs } from "./issue-5870-list-dirs.ts";
 import { testit as issue1324 } from "./issue-1324.ts";
@@ -69,9 +71,12 @@ export const slowTests: NamedTest[] = [
   ["issue-6150", issue6150],
   ["issue-5040", issue5040],
   ["reload-debounce", reloadDebounce],
+  ["issue-6316", issue6316],
   ["issue-2693", issue2693],
   ["issue-5865", issue5865],
   ["security-ghsa-crhm-w5qr-wjj4", ghsaCrhmW5qrWjj4],
+  // copies the exe next to a restrict ini, like the ghsa test above
+  ["issue-6314", issue6314],
   ["issue-1195", issue1195],
   ["dvi-open", dviOpen],
   // quits during background EPUB layout; ASan catches the font-cache use-after-free

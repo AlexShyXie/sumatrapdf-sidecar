@@ -4,9 +4,11 @@
 // renderer (docs/gen_docs.render.js) needs. The build's prebuild packs that dir into IDR_EMBEDDED_PAK.
 import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 import { commands as commandsDef } from "./gen-commands";
 import { checkCdnImages } from "./r2";
 import { copyFileNormalized, websiteDocsDir } from "./util.js";
+import { genPDFScripts } from "./gen-pdf-scripts";
 
 const docsDir = "docs";
 const manualOutDir = join(".work", "docs");
@@ -14,6 +16,7 @@ const mdDir = websiteDocsDir;
 
 const kMainPage = "SumatraPDF-documentation.md";
 const kAllDocsFile = "all-docs.md";
+const kScriptExamplesPage = "Tool-run-javascript-examples.md";
 // hosted on the website, not in this repo
 const kExcludeFromAllDocs = new Set(["SumatraPDF-all-docs-for-llm-ai.md"]);
 
@@ -122,16 +125,60 @@ function writeBundledRenderJs(outDir: string): void {
   const searchHtml = readFileSync(join(docsDir, "gen_docs.search.html"), "utf-8");
   const searchJs = readFileSync(join(docsDir, "gen_docs.search.js"), "utf-8");
   const marker = "/*COMMANDS_SEARCH_BUNDLE*/";
+  const scriptsMarker = '/*PDF_SCRIPTS_URL*/ ""';
   if (!template.includes(marker)) {
     throw new Error(`${join(docsDir, "gen_docs.render.js")} missing ${marker}`);
   }
+  if (!template.includes(scriptsMarker)) {
+    throw new Error(`${join(docsDir, "gen_docs.render.js")} missing ${scriptsMarker}`);
+  }
+  const scriptsHash = createHash("sha1")
+    .update(readFileSync(join(".work", "scripts.js")))
+    .digest("hex")
+    .slice(0, 4);
+  const scriptsURL = `https://www.sumatrapdfreader.org/docs/all-scripts-${scriptsHash}.js`;
   const bundle =
     "const kCommandsSearchHtml = " +
     JSON.stringify(searchHtml) +
     ";\nconst kCommandsSearchJs = " +
     JSON.stringify(searchJs) +
     ";\n";
-  writeFileSync(join(outDir, "gen_docs.render.js"), template.replace(marker, bundle));
+  writeFileSync(
+    join(outDir, "gen_docs.render.js"),
+    template.replace(marker, bundle).replace(scriptsMarker, JSON.stringify(scriptsURL)),
+  );
+}
+
+function copyScriptExamples(outDir: string, pages: string[]): void {
+  if (!pages.includes(kScriptExamplesPage)) {
+    return;
+  }
+  const text = readFileSync(join(mdDir, kScriptExamplesPage), "utf-8");
+  const examples = /^## Examples\r?\n([\s\S]*?)(?=^## |$(?![\s\S]))/m.exec(text);
+  if (!examples) {
+    throw new Error(`${kScriptExamplesPage}: missing Examples section`);
+  }
+  const links = [...examples[1].matchAll(/^- \[[^\]]+\]\(scripts\/([a-zA-Z0-9_-]+\.js)\)\s*$/gm)];
+  if (!links.length) {
+    throw new Error(`${kScriptExamplesPage}: no script examples`);
+  }
+  const names = new Set<string>();
+  const scriptsDir = join(mdDir, "scripts");
+  mkdirSync(join(outDir, "scripts"), { recursive: true });
+  for (const link of links) {
+    const name = link[1];
+    if (names.has(name)) {
+      throw new Error(`${kScriptExamplesPage}: duplicate script ${name}`);
+    }
+    names.add(name);
+    copyFileNormalized(join(outDir, "scripts", name), join(scriptsDir, name));
+  }
+  for (const file of readdirSync(scriptsDir, { withFileTypes: true })) {
+    if (file.isFile() && file.name.endsWith(".js") && !names.has(file.name)) {
+      throw new Error(`${kScriptExamplesPage}: script ${file.name} is not listed`);
+    }
+  }
+  console.log(`staged ${names.size} PDF script examples`);
 }
 
 // Build the manual in a scratch dir and swap it in at the end: a build's
@@ -150,6 +197,8 @@ function writeManualPakFiles(pages: string[]): void {
   }
   writeFileSync(join(outDir, "manifest.json"), JSON.stringify(manifest, null, 2));
   console.log(`wrote manifest.json (${Object.keys(manifest).length} pages)`);
+
+  copyScriptExamples(outDir, pages);
 
   genAllDocsMd(outDir);
 
@@ -257,6 +306,7 @@ export type GenDocsOptions = {
 export async function main(opts: GenDocsOptions = {}) {
   const timeStart = performance.now();
   console.log("gen-docs starting");
+  genPDFScripts();
 
   // CI has no (private) sumatra-website checkout; the exe ships without the manual
   if (!existsSync(mdDir)) {

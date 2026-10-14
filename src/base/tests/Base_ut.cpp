@@ -386,7 +386,67 @@ static void ArenaPtrCompressTest() {
     }
 }
 
+#if OS_POSIX && !OS_WASM
+static AtomicBool gTimedJoinFinished;
+
+static void TimedJoinWorker() {
+    SleepInMs(50);
+    AtomicBoolSet(&gTimedJoinFinished, true);
+}
+
+static void TimedJoinTest() {
+    AtomicBoolSet(&gTimedJoinFinished, false);
+    ThreadHandle thread = StartThread(MkFunc0Void(TimedJoinWorker), StrL("timed-join-test"));
+    utassert(thread != nullptr);
+    utassert(!JoinThread(&thread, 1));
+    utassert(thread == nullptr);
+    SleepInMs(100);
+    utassert(AtomicBoolGet(&gTimedJoinFinished));
+
+    AtomicBoolSet(&gTimedJoinFinished, false);
+    thread = StartThread(MkFunc0Void(TimedJoinWorker), StrL("timed-join-test"));
+    utassert(JoinThread(&thread, 500));
+    utassert(thread == nullptr);
+    utassert(AtomicBoolGet(&gTimedJoinFinished));
+}
+#endif
+
+#if !OS_WASM
+static AtomicBool gWaitThreadFinished;
+
+static void WaitThreadWorker() {
+    SleepInMs(50);
+    AtomicBoolSet(&gWaitThreadFinished, true);
+}
+
+// WaitThread() leaves the handle open: it can be waited on again and is closed
+// by its owner, before or after the thread ends.
+static void WaitThreadTest() {
+    AtomicBoolSet(&gWaitThreadFinished, false);
+    ThreadHandle thread = StartThread(MkFunc0Void(WaitThreadWorker), StrL("wait-thread-test"));
+    utassert(thread != nullptr);
+    utassert(!WaitThread(thread, 1));
+    utassert(thread != nullptr);
+    utassert(WaitThread(thread, -1));
+    utassert(AtomicBoolGet(&gWaitThreadFinished));
+    utassert(WaitThread(thread, 0));
+    utassert(SafeCloseThreadHandle(&thread));
+    utassert(thread == nullptr);
+    utassert(!WaitThread(nullptr, 0));
+
+    // closed while still running
+    AtomicBoolSet(&gWaitThreadFinished, false);
+    thread = StartThread(MkFunc0Void(WaitThreadWorker), StrL("wait-thread-test"));
+    utassert(SafeCloseThreadHandle(&thread));
+    SleepInMs(150);
+    utassert(AtomicBoolGet(&gWaitThreadFinished));
+}
+#endif
+
 void BaseUtilTest() {
+#if !OS_WASM
+    WaitThreadTest();
+#endif
     ListTest();
     Func0Test();
     Func1Test();
@@ -395,6 +455,9 @@ void BaseUtilTest() {
     ColorTest();
     ArenaChainedBlockSizeTest();
     ArenaPtrCompressTest();
+#if OS_POSIX && !OS_WASM
+    TimedJoinTest();
+#endif
 
     size_t n = dimof(roundUpTestCases) / 2;
     for (size_t i = 0; i < n; i++) {
@@ -425,6 +488,11 @@ void BaseUtilTest() {
     utassert(FoldDiacriticsRune(0x00E9) == 'e'); // é -> e
     utassert(FoldDiacriticsRune(0x0141) == 'L'); // Ł -> L
     utassert(FoldDiacriticsRune(0x0105) == 'a'); // ą -> a
+    utassert(FoldDiacriticsRune(0x0386) == 0x0391);
+    utassert(FoldDiacriticsRune(0x0401) == 0x0415);
+    utassert(FoldDiacriticsRune(0x1ea1) == 'a');
+    utassert(FoldDiacriticsRune(0x1f82) == 0x03b1);
+    utassert(FoldDiacriticsRune(0x212b) == 'A');
     utassert(FoldDiacriticsRune(0x0430) == 0x0430);
     utassert(IsCombiningMark(0x0301));
 

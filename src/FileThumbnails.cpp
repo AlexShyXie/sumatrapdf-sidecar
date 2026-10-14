@@ -6,131 +6,20 @@
 #include "base/File.h"
 #include "base/GdiPlusUtil.h"
 #include "base/Pixmap.h"
+#include "base/UITask.h"
+#include "base/Win.h"
+
+#include "gui/UIModels.h"
+#include "gui/win/HtmlWindow.h"
 
 #include "Settings.h"
+#include "EbookBase.h"
+#include "ChmFile.h"
 #include "ImageReader.h"
 
 #include "AppTools.h"
 #include "FileThumbnails.h"
-
-TempStr GetThumbnailPathTemp(Str filePath) {
-    // create a fingerprint of a (normalized) path for the file name
-    // I'd have liked to also include the file's last modification time
-    // in the fingerprint (much quicker than hashing the entire file's
-    // content), but that's too expensive for files on slow drives
-    u8 digest[16]{};
-    // Null/empty paths show up when a FileState has no path (corrupt settings
-    // or a race while closing); never hash an empty path (crash e.g. 35043).
-    if (len(filePath) == 0) {
-        return {};
-    }
-    TempStr path = str::DupTemp(filePath);
-    if (path::HasVariableDriveLetter(path)) {
-        // ignore the drive letter, if it might change
-        path.s[0] = '?';
-    }
-    CalcMD5Digest(path, digest);
-    TempStr fingerPrint = str::MemToHexTemp(Str((const char*)digest, dimofi(digest)));
-
-    TempStr thumbsDir = GetThumbnailCacheDirTemp();
-    if (len(thumbsDir) == 0) {
-        return {};
-    }
-
-    TempStr res = path::JoinTemp(thumbsDir, str::JoinTemp(fingerPrint, StrL(".png")));
-    return res;
-}
-
-TempStr GetThumbnailCacheDirTemp() {
-    TempStr thumbsDir = GetPathInAppDataDirTemp(StrL("sumatrapdfcache"));
-    return thumbsDir;
-}
-
-// Empty rather than remove: SaveThumbnail runs on the UI thread and re-creates
-// this directory, so deleting it out from under a save in flight made
-// dir::CreateAll fail (crash 2026-08-05/8c3bf9e1f000001).
-void EmptyThumbnailCacheDirectory() {
-    TempStr thumbsDir = GetThumbnailCacheDirTemp();
-    dir::Empty(thumbsDir);
-}
-
-void DeleteThumbnailForFile(Str filePath) {
-    TempStr thumbPath = GetThumbnailPathTemp(filePath);
-    if (len(thumbPath) == 0) {
-        return;
-    }
-    bool ok = file::Delete(thumbPath);
-    const auto* status = ok ? "ok" : "failed";
-    logf("DeleteThumbnailForFile: file::Remove('%s') %s\n", thumbPath, Str(status));
-}
-
-static bool PixmapIsEmpty(const Pixmap* px) {
-    return !px || px->width <= 0 || px->height <= 0 || !px->data;
-}
-
-Pixmap* LoadThumbnail(FileState* fs) {
-    if (!fs || len(fs->filePath) == 0) {
-        return nullptr;
-    }
-    if (fs->thumbnail) {
-        return fs->thumbnail;
-    }
-    TempStr bmpPath = GetThumbnailPathTemp(fs->filePath);
-    if (len(bmpPath) == 0) {
-        return nullptr;
-    }
-
-    Str data = file::ReadFile(bmpPath);
-    if (len(data) == 0) {
-        return nullptr;
-    }
-    // 24bpp: thumbnails stay in memory for every Home entry shown
-    Pixmap* px = PixmapToBgr(PixmapFromData(data));
-    str::Free(data);
-    if (PixmapIsEmpty(px)) {
-        FreePixmap(px);
-        return nullptr;
-    }
-
-    fs->thumbnail = px;
-    return fs->thumbnail;
-}
-
-bool HasThumbnail(FileState* fs) {
-    if (!fs || len(fs->filePath) == 0) {
-        return false;
-    }
-    // Prefer the in-memory thumbnail; only hit disk when missing.
-    if (!fs->thumbnail && !LoadThumbnail(fs)) {
-        return false;
-    }
-
-    TempStr bmpPath = GetThumbnailPathTemp(fs->filePath);
-    if (len(bmpPath) == 0) {
-        return fs->thumbnail != nullptr;
-    }
-    FILETIME bmpTime = file::GetModificationTime(bmpPath);
-    FILETIME fileTime = file::GetModificationTime(fs->filePath);
-    // delete the thumbnail if the file is newer than the thumbnail
-    if (FileTimeDiffInSecs(fileTime, bmpTime) > 0) {
-        FreePixmap(fs->thumbnail);
-        fs->thumbnail = nullptr;
-    }
-
-    return fs->thumbnail != nullptr;
-}
-
-// takes ownership of bmp
-void SetThumbnail(FileState* fs, Pixmap* bmp) {
-    ReportIf(bmp && PixmapIsEmpty(bmp));
-    if (!fs || len(fs->filePath) == 0 || PixmapIsEmpty(bmp)) {
-        FreePixmap(bmp);
-        return;
-    }
-    FreePixmap(fs->thumbnail);
-    fs->thumbnail = PixmapToBgr(bmp);
-    SaveThumbnail(fs);
-}
+#include "FileThumbnailsCommon.h"
 
 void SaveThumbnail(FileState* fs) {
     if (!fs || !fs->thumbnail || len(fs->filePath) == 0) {
@@ -177,29 +66,148 @@ void SaveThumbnail(FileState* fs) {
         return;
     }
     CLSID tmpClsid = GetGdiPlusEncoderClsid(L"image/png");
-    WCHAR* pathW = CWStrTemp(thumbnailPath);
+    // encode next to the final name and rename: a reader never sees a partial
+    // png, and a failed encode leaves no 0-byte png that reads back blank
+    // (issue #5932)
+    TempStr tmpPath = str::JoinTemp(thumbnailPath, StrL(".tmp"));
+    WCHAR* pathW = CWStrTemp(tmpPath);
     Gdiplus::Status st = bmp->Save(pathW, &tmpClsid, nullptr);
     delete bmp;
-    if (st != Gdiplus::Ok) {
-        // gdi+ creates the file before it encodes, so a failure leaves a 0-byte
-        // png behind, which reads back as a blank thumbnail (issue #5932)
+    if (st != Gdiplus::Ok || !file::RenameReplace(thumbnailPath, tmpPath)) {
         logf("SaveThumbnail: Save('%s') failed with %d\n", thumbnailPath, (int)st);
-        file::Delete(thumbnailPath);
+        file::Delete(tmpPath);
     }
 }
 
-void RemoveThumbnail(FileState* fs) {
-    if (!fs || len(fs->filePath) == 0) {
+struct ChmThumbnailTask : HtmlWindowCallback {
+    ChmFile* doc = nullptr;
+    HWND hwnd = nullptr;
+    HtmlWindow* hw = nullptr;
+    bool didSave = false;
+    Size size;
+    const OnBitmapRendered* saveThumbnail = nullptr;
+    Str homeUrl;
+    Vec<Str> data;
+    Mutex docAccess;
+
+    ChmThumbnailTask(ChmFile* doc, HWND hwnd, Size size, const OnBitmapRendered* saveThumbnail);
+    ~ChmThumbnailTask() override;
+    void StartCreateThumbnail(HtmlWindow* hw);
+    bool OnBeforeNavigate(Str url, bool newWindow) override;
+    void OnDocumentComplete(Str url) override;
+    Str GetDataForUrl(Str url) override;
+    void OnLButtonDown() override;
+    void DownloadData(Str url, Str data) override;
+};
+
+static void SafeDeleteChmThumbnailTask(ChmThumbnailTask* d) {
+    logf("SafeDeleteChmThumbnailTask: about to delete ChmThumbnailTask: 0x%p\n", (void*)d);
+    delete d;
+}
+
+ChmThumbnailTask::ChmThumbnailTask(ChmFile* doc, HWND hwnd, Size size, const OnBitmapRendered* saveThumbnail) {
+    this->doc = doc;
+    this->hwnd = hwnd;
+    this->size = size;
+    this->saveThumbnail = saveThumbnail;
+    this->didSave = false;
+}
+
+ChmThumbnailTask::~ChmThumbnailTask() {
+    docAccess.Lock();
+    delete hw;
+    DestroyWindow(hwnd);
+    delete doc;
+    for (auto&& d : data) {
+        str::Free(d);
+    }
+    docAccess.Unlock();
+    delete saveThumbnail;
+    str::Free(homeUrl);
+}
+
+bool ChmThumbnailTask::OnBeforeNavigate(Str /*url*/, bool newWindow) {
+    return !newWindow;
+}
+
+void ChmThumbnailTask::StartCreateThumbnail(HtmlWindow* hw) {
+    this->hw = hw;
+    homeUrl = strconv::AnsiToUtf8(doc->homePath);
+    Str trimmedHomeUrl = homeUrl;
+    if (str::TrimPrefix(trimmedHomeUrl, StrL("/"))) {
+        str::ReplaceWithCopy(&homeUrl, trimmedHomeUrl);
+    }
+    hw->NavigateToDataUrl(homeUrl);
+}
+
+Str ChmThumbnailTask::GetDataForUrl(Str url) {
+    AutoUnlockMutex scope(&docAccess);
+    TempStr plainUrl = url::GetFullPathTemp(url);
+    Str d = str::Dup(doc->GetDataTemp(plainUrl));
+    VecAppend(data, d);
+    return d;
+}
+
+void ChmThumbnailTask::OnDocumentComplete(Str url) {
+    if (url && url.s[0] == '/') {
+        url = Str(url.s + 1, url.len - 1);
+    }
+    if (!str::Eq(url, homeUrl)) {
         return;
     }
-    if (!HasThumbnail(fs)) {
+    logf("ChmThumbnailTask::OnDocumentComplete: '%s'\n", url);
+    if (didSave) {
+        // don't crash creating .chm thumbnail
+        // https://github.com/sumatrapdfreader/sumatrapdf/issues/4519
+        // https://github.com/sumatrapdfreader/sumatrapdf/issues/4833
+        return;
+    }
+    didSave = true;
+    Rect area(0, 0, size.dx * 2, size.dy * 2);
+    HBITMAP hbmp = hw->TakeScreenshot(area, size);
+    if (hbmp) {
+        RenderedBitmap* bmp = new RenderedBitmap(hbmp, size);
+        saveThumbnail->Call(bmp);
+    }
+    // delay deleting because ~ChmThumbnailTask() deletes HtmlWindow
+    // and we're currently processing HtmlWindow messages
+    auto fn = MkFunc0<ChmThumbnailTask>(SafeDeleteChmThumbnailTask, this);
+    uitask::Post(fn, "SafeDeleteChmThumbnailTask");
+}
+
+void ChmThumbnailTask::OnLButtonDown() {}
+
+void ChmThumbnailTask::DownloadData(Str /*url*/, Str /*data*/) {}
+
+void CreateChmThumbnail(Str path, const Size& size, const OnBitmapRendered* saveThumbnail) {
+    // doc and window will be destroyed by the callback once it's invoked
+    ChmFile* doc = ChmFile::CreateFromFile(path);
+    if (!doc) {
+        delete saveThumbnail;
         return;
     }
 
-    TempStr bmpPath = GetThumbnailPathTemp(fs->filePath);
-    if (bmpPath) {
-        file::Delete(bmpPath);
+    // We render twice the size of thumbnail and scale it down
+    int dx = (size.dx * 2) + GetSystemMetrics(SM_CXVSCROLL);
+    int dy = (size.dy * 2) + GetSystemMetrics(SM_CYHSCROLL);
+    // reusing WC_STATICW. I don't think exact class matters (WndProc
+    // will be taken over by HtmlWindow anyway) but it can't be nullptr.
+    HWND hwnd =
+        CreateWindowExW(0, WC_STATICW, L"BrowserCapture", WS_POPUP, 0, 0, dx, dy, nullptr, nullptr, nullptr, nullptr);
+    if (!hwnd) {
+        delete doc;
+        return;
     }
-    FreePixmap(fs->thumbnail);
-    fs->thumbnail = nullptr;
+#if 0 // when debugging set to 1 to see the window
+    ShowWindow(hwnd, SW_SHOW);
+#endif
+
+    ChmThumbnailTask* thumbnailTask = new ChmThumbnailTask(doc, hwnd, size, saveThumbnail);
+    HtmlWindow* hw = HtmlWindow::Create(hwnd, thumbnailTask);
+    if (!hw) {
+        delete thumbnailTask;
+        return;
+    }
+    // is deleted in ChmThumbnailTask::OnDocumentComplete
+    thumbnailTask->StartCreateThumbnail(hw);
 }

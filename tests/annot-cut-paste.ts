@@ -7,7 +7,7 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ControlClient, ControlCommand } from "./control.ts";
-import { assemblePdf, cmdId, runStandalone, tmpPath } from "./util.ts";
+import { assemblePdf, cmdId, runStandalone, shortcutLabel, tmpPath, USE_NG } from "./util.ts";
 import {
   clientToScreen,
   getClientRect,
@@ -36,6 +36,7 @@ import {
 } from "./win-automation.ts";
 
 type Square = { x: number; y: number; dx: number; dy: number };
+type MarkupState = { raw: string; selected: boolean; annotations: number; squares: Square[] };
 
 function makePdf(): string {
   const objs = [
@@ -57,9 +58,7 @@ function parseSquares(raw: string): Square[] {
   return out;
 }
 
-async function markupState(
-  client: ControlClient,
-): Promise<{ raw: string; selected: boolean; annotations: number; squares: Square[] }> {
+async function markupState(client: ControlClient): Promise<MarkupState> {
   const deadline = Date.now() + 5_000;
   let raw = "";
   for (;;) {
@@ -82,6 +81,26 @@ async function markupState(
   }
 }
 
+// Selecting shows editing UI and can refit the page. Retry at the new center.
+async function selectSquare(client: ControlClient, canvas: number): Promise<{ state: MarkupState; square: Square }> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    let state = await markupState(client);
+    const square = state.squares[0];
+    if (state.squares.length === 1 && square && square.dx > 0 && square.dy > 0) {
+      await clickAt(canvas, square.x + Math.floor(square.dx / 2), square.y + Math.floor(square.dy / 2), 0);
+      state = await markupState(client);
+      if (state.selected && state.squares.length === 1) {
+        return { state, square: state.squares[0]! };
+      }
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`annot-cut-paste: could not select the square\n${state.raw}`);
+    }
+    await sleep(50);
+  }
+}
+
 // poll until the page holds `want` annotations, else report what it holds
 async function waitForAnnotCount(client: ControlClient, want: number, what: string) {
   const deadline = Date.now() + 5_000;
@@ -99,8 +118,66 @@ async function waitForAnnotCount(client: ControlClient, want: number, what: stri
   }
 }
 
+async function waitForDeselection(client: ControlClient): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    const state = await markupState(client);
+    if (!state.selected) {
+      return;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`annot-cut-paste: Escape did not deselect the annotation\n${state.raw}`);
+    }
+    await sleep(50);
+  }
+}
+
+// ng's menu is a gpui popup, not an HMENU. Same rows as the menu bar dump:
+// path, kind, command, disabled, checked, title, accelerator.
+function menuFromDump(raw: string): MenuItem[] {
+  const root: MenuItem[] = [];
+  const byPath = new Map<string, MenuItem>();
+  for (const line of raw.split("\n")) {
+    if (!line) {
+      continue;
+    }
+    const p = line.split("\t");
+    if (p.length < 6 || p[1] === "-") {
+      continue;
+    }
+    const path = p[0]!;
+    const item: MenuItem = { text: p[5] ?? "" };
+    if (p[1] === "S") {
+      item.items = [];
+    }
+    if (p[3] === "1") {
+      item.disabled = true;
+    }
+    if (p[6]) {
+      item.accel = p[6];
+    }
+    byPath.set(path, item);
+    const dot = path.lastIndexOf(".");
+    const parent = dot < 0 ? undefined : byPath.get(path.slice(0, dot));
+    if (parent?.items) {
+      parent.items.push(item);
+    } else {
+      root.push(item);
+    }
+  }
+  return root;
+}
+
 // the page context menu at a client point of the canvas, then dismiss it
-async function contextMenuAt(canvas: number, x: number, y: number): Promise<MenuItem[]> {
+async function contextMenuAt(client: ControlClient, canvas: number, x: number, y: number): Promise<MenuItem[]> {
+  if (USE_NG) {
+    const res = await client.request(ControlCommand.TestContextMenuAt, [x, y]);
+    const raw = String(res[1] ?? "");
+    if (res[0] !== 0) {
+      throw new Error(`annot-cut-paste: could not read the context menu\n${raw}`);
+    }
+    return menuFromDump(raw);
+  }
   const s = clientToScreen(canvas, x, y);
   openContextMenu(canvas, s.x, s.y);
   const popup = await waitForContextMenu(3000);
@@ -131,6 +208,7 @@ function findMenuItem(items: MenuItem[], text: string): MenuItem | null {
 // annotation, so deselect first.
 async function hoverDate(client: ControlClient, frame: number, canvas: number, x: number, y: number): Promise<string> {
   await pressKey(frame, VK_ESCAPE, 0);
+  await waitForDeselection(client);
   const s = clientToScreen(canvas, x, y);
   setCursorPos(s.x, s.y);
   sendMessage(canvas, WM_MOUSEMOVE, 0, packCoords(x, y));
@@ -201,25 +279,18 @@ export async function testit(): Promise<void> {
 
     sendCommandSync(frame, cmdId("CmdToggleEditPDF"));
 
-    let state = await markupState(client);
-    if (state.squares.length !== 1) {
-      throw new Error(`annot-cut-paste: expected one square on the page\n${state.raw}`);
-    }
-    const original = state.squares[0]!;
+    const selected = await selectSquare(client, canvas);
+    let state = selected.state;
+    const original = selected.square;
     const mid = { x: original.x + Math.floor(original.dx / 2), y: original.y + Math.floor(original.dy / 2) };
-    await clickAt(canvas, mid.x, mid.y, 0);
-    state = await markupState(client);
-    if (!state.selected) {
-      throw new Error(`annot-cut-paste: click did not select the square\n${state.raw}`);
-    }
 
     // the context menu offers Cut for the annotation under the cursor, with
     // the shortcuts that reach these commands
-    const menu = await contextMenuAt(canvas, mid.x, mid.y);
+    const menu = await contextMenuAt(client, canvas, mid.x, mid.y);
     requireEnabled(menu, "Cut Annotation");
-    requireAccel(menu, "Cut Annotation", "Ctrl + X");
-    requireAccel(menu, "Copy Annotation", "Ctrl + C");
-    requireAccel(menu, "Paste Annotation", "Ctrl + V");
+    requireAccel(menu, "Cut Annotation", shortcutLabel("Ctrl + X"));
+    requireAccel(menu, "Copy Annotation", shortcutLabel("Ctrl + C"));
+    requireAccel(menu, "Paste Annotation", shortcutLabel("Ctrl + V"));
     for (const name of ["Apply Redactions", "Save changes", "Save to new file", "Discard changes"]) {
       if (!findMenuItem(menu, name)) {
         throw new Error(`annot-cut-paste: "${name}" is not in the Annotations submenu`);
@@ -240,7 +311,7 @@ export async function testit(): Promise<void> {
     }
 
     // ... and Paste once something has been cut
-    requireEnabled(await contextMenuAt(canvas, mid.x, mid.y), "Paste Annotation");
+    requireEnabled(await contextMenuAt(client, canvas, mid.x, mid.y), "Paste Annotation");
 
     const cr = getClientRect(canvas);
     const paste = {

@@ -2,6 +2,8 @@
    License: Simplified BSD (see COPYING.BSD) */
 
 #include "base/Base.h"
+
+#if OS_WIN
 #include "base/Win.h"
 #include "base/Pixmap.h"
 
@@ -65,63 +67,6 @@ RectF MeasureTextStandard(Graphics* g, Font* f, WStr s) {
     Gdiplus::PointF pz(0, 0);
     g->MeasureString(s.s, s.len, f, pz, &bbox);
     return RectF{bbox};
-}
-
-RectF MeasureTextQuick(Graphics* g, Font* f, WStr s) {
-    int n = s.len;
-    ReportIf(0 >= n);
-
-    static Vec<Font*> fontCache;
-    static Vec<bool> fixCache;
-
-    Gdiplus::RectF bbox;
-    g->MeasureString(s.s, n, f, Gdiplus::PointF(0, 0), &bbox);
-    int idx = VecFind(fontCache, f);
-    if (-1 == idx) {
-        LOGFONTW lfw;
-        Status ok = f->GetLogFontW(g, &lfw);
-        bool isItalicOrMonospace = Ok != ok || lfw.lfItalic || wstr::Eq(lfw.lfFaceName, WStrL(L"Courier New")) ||
-                                   wstr::FindFrom(lfw.lfFaceName, L"Consol") ||
-                                   wstr::EndsWith(lfw.lfFaceName, WStrL(L"Mono")) ||
-                                   wstr::EndsWith(lfw.lfFaceName, WStrL(L"Typewriter"));
-        VecAppend(fontCache, f);
-        VecAppend(fixCache, isItalicOrMonospace);
-        idx = fontCache.len - 1;
-    }
-    // most documents look good enough with these adjustments
-    if (!fixCache[idx]) {
-        float correct = 0;
-        for (int i = 0; i < n; i++) {
-            switch (s.s[i]) {
-                case 'i':
-                case 'l':
-                    correct += 0.2f;
-                    break;
-                case 't':
-                case 'f':
-                case 'I':
-                case '.':
-                case ',':
-                case '!':
-                    correct += 0.1f;
-                    break;
-            }
-        }
-        bbox.Width *= (1.0f - (correct / (float)n)) * 0.99f;
-    }
-    bbox.Height *= 0.95f;
-    return RectF{bbox};
-}
-
-RectF MeasureText(Graphics* g, Font* f, WStr s, TextMeasureAlgorithm algo) {
-    // TODO: ideally we should not be here with len == 0. This
-    // might indicate a problem with fromatter code. See internals-en.epub
-    // for a repro
-    ReportIf((len(s) == 0) || (s.len > INT_MAX));
-    if (algo) {
-        return algo(g, f, s);
-    }
-    return MeasureTextAccurate(g, f, s);
 }
 
 void GetBaseTransform(Matrix& m, Gdiplus::RectF pageRect, float zoom, int rotation) {
@@ -266,6 +211,9 @@ Gdiplus::Bitmap* WrapPixmapGdiplus(const Pixmap* px) {
         return nullptr;
     }
     auto* bmp = new Gdiplus::Bitmap(px->width, px->height, px->stride, fmt, px->data);
+    if (!bmp) {
+        return nullptr;
+    }
     if (bmp->GetLastStatus() != Gdiplus::Ok) {
         delete bmp;
         return nullptr;
@@ -467,3 +415,5 @@ bool CopyPixmapToClipboard(Pixmap* p, bool appendOnly) {
     }
     return ok;
 }
+
+#endif // OS_WIN

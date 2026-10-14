@@ -12,9 +12,40 @@
 // Handles (HWND) are represented as JS `number`s here. That's fine for window
 // handles in practice; do not use these helpers for arbitrary 64-bit pointers.
 
-import { dlopen, FFIType, JSCallback, ptr, toArrayBuffer } from "bun:ffi";
+import { unlinkSync } from "node:fs";
+import { CFunction, dlopen, FFIType, JSCallback, ptr, read, toArrayBuffer } from "bun:ffi";
+import { IS_MAC, IS_WIN } from "./host.ts";
+import {
+  macClientToScreen,
+  macControlRequest,
+  macDdeExecute,
+  macFrameClientRect,
+  macFrameVisible,
+  macSendMessage,
+  macSendText,
+  TestLayout,
+} from "./mac-control.ts";
 
-const user32 = dlopen("user32.dll", {
+// Windows tests talk to user32. On macOS the same helpers either use
+// CoreGraphics or throw, so importing this file does not require the DLLs.
+function loadDll(file: string, symbols: Parameters<typeof dlopen>[1]): ReturnType<typeof dlopen> {
+  if (!IS_WIN) {
+    const stub = new Proxy(
+      {},
+      {
+        get(_target, prop) {
+          return () => {
+            throw new Error(`${String(prop)} (${file}) is Windows-only`);
+          };
+        },
+      },
+    );
+    return { symbols: stub, close() {} } as unknown as ReturnType<typeof dlopen>;
+  }
+  return dlopen(file, symbols);
+}
+
+const user32 = loadDll("user32.dll", {
   EnumWindows: { args: [FFIType.function, FFIType.i64], returns: FFIType.bool },
   EnumChildWindows: { args: [FFIType.ptr, FFIType.function, FFIType.i64], returns: FFIType.bool },
   GetClassNameW: { args: [FFIType.ptr, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
@@ -93,7 +124,7 @@ const user32 = dlopen("user32.dll", {
 // HDC/HBITMAP/HGDIOBJ handles are u64 (bigint) here, NOT ptr: Bun's ptr return
 // type sign-extends a 32-bit GDI handle whose high bit is set into a bogus
 // 64-bit value, so the handle round-trips wrong and the calls fail intermittently.
-const gdi32 = dlopen("gdi32.dll", {
+const gdi32 = loadDll("gdi32.dll", {
   CreateCompatibleDC: { args: [FFIType.u64], returns: FFIType.u64 },
   CreateCompatibleBitmap: { args: [FFIType.u64, FFIType.i32, FFIType.i32], returns: FFIType.u64 },
   SelectObject: { args: [FFIType.u64, FFIType.u64], returns: FFIType.u64 },
@@ -139,22 +170,27 @@ const gdi32 = dlopen("gdi32.dll", {
   },
 });
 
-const shell32 = dlopen("shell32.dll", {
+const shell32 = loadDll("shell32.dll", {
   SHAppBarMessage: { args: [FFIType.u32, FFIType.ptr], returns: FFIType.u64 },
 });
 
-const dwmapi = dlopen("dwmapi.dll", {
+const dwmapi = loadDll("dwmapi.dll", {
   DwmGetWindowAttribute: { args: [FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
 });
 
-const gdiplus = dlopen("gdiplus.dll", {
+const ole32 = loadDll("ole32.dll", {
+  CoInitializeEx: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+  CoCreateInstance: { args: [FFIType.ptr, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+});
+
+const gdiplus = loadDll("gdiplus.dll", {
   GdiplusStartup: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.u32 },
   GdipCreateBitmapFromHBITMAP: { args: [FFIType.u64, FFIType.u64, FFIType.ptr], returns: FFIType.u32 },
   GdipSaveImageToFile: { args: [FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.u32 },
   GdipDisposeImage: { args: [FFIType.u64], returns: FFIType.u32 },
 });
 
-const kernel32 = dlopen("kernel32.dll", {
+const kernel32 = loadDll("kernel32.dll", {
   CreateProcessW: {
     args: [
       FFIType.ptr,
@@ -190,7 +226,7 @@ const kernel32 = dlopen("kernel32.dll", {
 
 // Authenticode helpers (mirror src/base/Crypto.cpp GetExecutableSignerTemp / IsPEFileSigned).
 // crypt32 for embedded PKCS#7 signer name; wintrust for signature validity.
-const crypt32 = dlopen("crypt32.dll", {
+const crypt32 = loadDll("crypt32.dll", {
   CryptQueryObject: {
     args: [
       FFIType.u32,
@@ -224,7 +260,7 @@ const crypt32 = dlopen("crypt32.dll", {
   CertFreeCertificateContext: { args: [FFIType.ptr], returns: FFIType.bool },
 });
 
-const wintrust = dlopen("wintrust.dll", {
+const wintrust = loadDll("wintrust.dll", {
   WinVerifyTrust: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 });
 
@@ -331,6 +367,8 @@ export const TVGN_NEXT = 0x1;
 export const TVGN_CHILD = 0x4;
 export const TVGN_CARET = 0x9;
 export const TVGN_NEXTVISIBLE = 0x6;
+export const TVGN_FIRSTVISIBLE = 0x5;
+export const TVM_GETVISIBLECOUNT = 0x1110;
 export const TVE_COLLAPSE = 0x1;
 export const TVE_EXPAND = 0x2;
 
@@ -353,8 +391,32 @@ const SPI_GETWORKAREA = 0x0030;
 const SM_CXSCREEN = 0;
 const SM_CYSCREEN = 1;
 
+function macDisplaySize(): { w: number; h: number } {
+  try {
+    const cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", {
+      CGMainDisplayID: { args: [], returns: FFIType.u32 },
+      CGDisplayPixelsWide: { args: [FFIType.u32], returns: FFIType.u64 },
+      CGDisplayPixelsHigh: { args: [FFIType.u32], returns: FFIType.u64 },
+    });
+    const id = cg.symbols.CGMainDisplayID();
+    const w = Number(cg.symbols.CGDisplayPixelsWide(id));
+    const h = Number(cg.symbols.CGDisplayPixelsHigh(id));
+    if (w > 0 && h > 0) {
+      return { w, h };
+    }
+  } catch {
+    // headless, or the framework would not open
+  }
+  return { w: 1440, h: 900 };
+}
+
 // the desktop minus the taskbar (and any other appbar)
 export function getWorkArea(): Rect {
+  if (IS_MAC) {
+    const s = macDisplaySize();
+    // menu bar on top, dock along the bottom
+    return { left: 0, top: 25, right: s.w, bottom: Math.max(s.h - 70, 25) };
+  }
   const buf = new Int32Array(4);
   if (!user32.symbols.SystemParametersInfoW(SPI_GETWORKAREA, 0, ptr(buf), 0)) {
     // no work area to be had: fall back to the whole primary screen
@@ -457,6 +519,9 @@ export function packCoords(x: number, y: number): number {
 }
 
 export function getClassName(hwnd: number): string {
+  if (!IS_WIN) {
+    return "";
+  }
   const buf = new Uint16Array(256);
   const n = user32.symbols.GetClassNameW(hwnd, ptr(buf), 256);
   let s = "";
@@ -477,6 +542,9 @@ export function getWindowPid(hwnd: number): number {
 // GUITHREADINFO { DWORD cbSize, flags; HWND active, focus, capture, menuOwner,
 // moveSize, caret; RECT rcCaret; } = 72 bytes on x64, focus at offset 16.
 export function getFocusedHwnd(hwndInSameThread: number): number {
+  if (IS_MAC) {
+    return hwndInSameThread;
+  }
   const tid = user32.symbols.GetWindowThreadProcessId(hwndInSameThread, null);
   const buf = new ArrayBuffer(72);
   const dv = new DataView(buf);
@@ -489,6 +557,9 @@ export function getFocusedHwnd(hwndInSameThread: number): number {
 
 // visit returns false to stop enumeration early
 export function enumWindows(visit: (hwnd: number) => boolean): void {
+  if (!IS_WIN) {
+    return;
+  }
   const cb = new JSCallback((hwnd: number) => visit(hwnd), {
     args: [FFIType.ptr, FFIType.i64],
     returns: FFIType.bool,
@@ -501,6 +572,9 @@ export function enumWindows(visit: (hwnd: number) => boolean): void {
 }
 
 export function enumChildWindows(parent: number, visit: (hwnd: number) => boolean): void {
+  if (!IS_WIN) {
+    return;
+  }
   const cb = new JSCallback((hwnd: number) => visit(hwnd), {
     args: [FFIType.ptr, FFIType.i64],
     returns: FFIType.bool,
@@ -510,6 +584,22 @@ export function enumChildWindows(parent: number, visit: (hwnd: number) => boolea
   } finally {
     cb.close();
   }
+}
+
+// an owned top-level window (not a child) of a given class. 0 if none.
+export function findOwnedWindow(owner: number, className: string): number {
+  if (!owner) {
+    return 0;
+  }
+  let found = 0;
+  enumWindows((hwnd) => {
+    if (getWindowOwner(hwnd) === owner && getClassName(hwnd) === className) {
+      found = hwnd;
+      return false;
+    }
+    return true;
+  });
+  return found;
 }
 
 // find a top-level window of a given process and window class (0 if none)
@@ -552,6 +642,10 @@ export function findVisibleChildWindow(parent: number, className: string): numbe
 
 // poll for findTopWindow until it appears or timeout (returns 0 on timeout)
 export async function waitForTopWindow(pid: number, className: string, timeoutMs = 12000): Promise<number> {
+  // macOS has no HWND. 1 is the frame sentinel. Any other class still times out.
+  if (IS_MAC && className === "GpuiSystemMonitor") {
+    return 1;
+  }
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const h = findTopWindow(pid, className);
@@ -576,12 +670,18 @@ export async function waitForChildWindow(parent: number, className: string, time
 }
 
 export function getClientRect(hwnd: number): Rect {
+  if (IS_MAC) {
+    return macFrameClientRect();
+  }
   const buf = new Int32Array(4);
   user32.symbols.GetClientRect(hwnd, ptr(buf));
   return { left: buf[0], top: buf[1], right: buf[2], bottom: buf[3] };
 }
 
 export function clientToScreen(hwnd: number, x: number, y: number): { x: number; y: number } {
+  if (IS_MAC) {
+    return macClientToScreen(x, y);
+  }
   const buf = new Int32Array([x, y]);
   user32.symbols.ClientToScreen(hwnd, ptr(buf));
   return { x: buf[0], y: buf[1] };
@@ -592,6 +692,16 @@ export function getScrollInfo(
   hwnd: number,
   bar: number = SB_VERT,
 ): { min: number; max: number; page: number; pos: number; trackPos: number } {
+  if (IS_MAC) {
+    const text = String(macControlRequest(TestLayout, [])[1] ?? "");
+    const key = bar === SB_HORZ ? "scrollH" : "scrollV";
+    const m = new RegExp(`${key} pos=(-?\\d+) min=(-?\\d+) max=(-?\\d+) page=(-?\\d+)`).exec(text);
+    if (!m) {
+      throw new Error(`GetScrollInfo: no ${key} in layout`);
+    }
+    const pos = Number(m[1]);
+    return { pos, min: Number(m[2]), max: Number(m[3]), page: Number(m[4]), trackPos: pos };
+  }
   const buf = new Uint8Array(28);
   const dv = new DataView(buf.buffer);
   dv.setUint32(0, 28, true); // cbSize
@@ -612,6 +722,10 @@ export function getScrollPos(hwnd: number, bar: number = SB_VERT): number {
 }
 
 export function postMessage(hwnd: number, msg: number, wParam: number, lParam: number): boolean {
+  if (IS_MAC) {
+    macSendMessage(msg, wParam, lParam);
+    return true;
+  }
   return user32.symbols.PostMessageW(hwnd, msg, BigInt(wParam), BigInt(lParam));
 }
 
@@ -630,12 +744,18 @@ export async function postChar(hwnd: number, ch: string): Promise<boolean> {
 // LRESULT as a bigint -- TreeView messages return HTREEITEM pointers that can
 // exceed 2^53, so they must not be coerced to a JS number.
 export function sendMessage(hwnd: number, msg: number, wParam: number | bigint, lParam: number | bigint): bigint {
+  if (IS_MAC) {
+    return macSendMessage(msg, wParam, lParam);
+  }
   return user32.symbols.SendMessageW(hwnd, msg, BigInt(wParam), BigInt(lParam)) as bigint;
 }
 
 // Send a null-terminated UTF-16 WM_COPYDATA payload. COPYDATASTRUCT is 24
 // bytes on x64: ULONG_PTR dwData, DWORD cbData + padding, PVOID lpData.
 export function sendCopyDataW(hwnd: number, dataId: number, text: string): bigint {
+  if (IS_MAC) {
+    return macDdeExecute(dataId, text);
+  }
   const payload = wideZ(text);
   const cds = new Uint8Array(24);
   const view = new DataView(cds.buffer);
@@ -692,6 +812,19 @@ export function countVisibleTreeRows(tree: number): number {
   return n;
 }
 
+// is the item one of the rows that fit entirely in the tree's client area
+export function treeIsItemInView(tree: number, item: bigint): boolean {
+  const nFit = Number(sendMessage(tree, TVM_GETVISIBLECOUNT, 0, 0));
+  let it = treeGetNextItem(tree, TVGN_FIRSTVISIBLE);
+  for (let i = 0; i < nFit && it !== 0n; i++) {
+    if (it === item) {
+      return true;
+    }
+    it = treeGetNextItem(tree, TVGN_NEXTVISIBLE, it);
+  }
+  return false;
+}
+
 // collapse every top-level node
 export function collapseTreeRoots(tree: number): void {
   let it = treeGetRoot(tree);
@@ -709,6 +842,10 @@ export function repaintWindow(hwnd: number): void {
 }
 
 export function moveWindow(hwnd: number, x: number, y: number, w: number, h: number, repaint = true): boolean {
+  if (IS_MAC) {
+    const res = macControlRequest(122, ["place", x, y, w, h, 0]);
+    return res[0] === 0;
+  }
   return user32.symbols.MoveWindow(hwnd, x, y, w, h, repaint);
 }
 
@@ -754,14 +891,47 @@ export function setWindowPos(
 }
 
 export function showWindow(hwnd: number, cmd: number): boolean {
+  if (IS_MAC) {
+    if (cmd === SW_RESTORE && isZoomed(hwnd)) {
+      return moveWindow(hwnd, 80, 80, 1200, 900);
+    }
+    return true;
+  }
   return user32.symbols.ShowWindow(hwnd, cmd);
 }
 
 export function isZoomed(hwnd: number): boolean {
+  if (IS_MAC) {
+    const text = String(macControlRequest(TestLayout, [])[1] ?? "");
+    return /maximized=1/.test(text);
+  }
   return user32.symbols.IsZoomed(hwnd);
 }
 
+function macWarpCursor(x: number, y: number): boolean {
+  try {
+    const cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", {
+      CGWarpMouseCursorPosition: {
+        args: [{ x: FFIType.f64, y: FFIType.f64 }],
+        returns: FFIType.i32,
+      },
+    });
+    return cg.symbols.CGWarpMouseCursorPosition({ x, y }) === 0;
+  } catch {
+    return false;
+  }
+}
+
+let macCursor = { x: 0, y: 0 };
+
 export function setCursorPos(x: number, y: number): boolean {
+  if (IS_MAC) {
+    const ok = macWarpCursor(x, y);
+    if (ok) {
+      macCursor = { x, y };
+    }
+    return ok;
+  }
   return user32.symbols.SetCursorPos(x, y);
 }
 
@@ -819,6 +989,9 @@ function modifierNames(keys: [string, number][]): string {
 }
 
 export async function ensureModifierKeysUp(): Promise<void> {
+  if (!IS_WIN) {
+    return;
+  }
   let held = heldModifierKeys();
   if (held.length === 0) {
     unreleasedWarned = "";
@@ -871,7 +1044,13 @@ const FILE_ATTRIBUTE_NORMAL = 0x80;
 
 // CreateFileW with dwShareMode=0: what OneNote does when it tries to rewrite
 // an extracted attachment. ok=false means another process is still holding it.
+// Unix open() has no share mode, so a held fd is reported by lsof instead.
 export function tryOpenExclusive(path: string): { ok: boolean; error: number } {
+  if (!IS_WIN) {
+    const listed = Bun.spawnSync(["lsof", "-t", path], { stdout: "pipe", stderr: "ignore" });
+    const held = listed.stdout.toString().trim().length > 0;
+    return held ? { ok: false, error: 32 } : { ok: true, error: 0 };
+  }
   const w = wideZ(path);
   const h = kernel32.symbols.CreateFileW(ptr(w), GENERIC_WRITE, 0, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0n);
   if (h === 0xffffffffffffffffn || h === -1n) {
@@ -882,6 +1061,15 @@ export function tryOpenExclusive(path: string): { ok: boolean; error: number } {
 }
 
 export function tryDeleteFile(path: string): { ok: boolean; error: number } {
+  if (!IS_WIN) {
+    try {
+      unlinkSync(path);
+      return { ok: true, error: 0 };
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      return { ok: false, error: err.errno ?? 1 };
+    }
+  }
   const w = wideZ(path);
   const ok = kernel32.symbols.DeleteFileW(ptr(w));
   if (ok) {
@@ -891,6 +1079,10 @@ export function tryDeleteFile(path: string): { ok: boolean; error: number } {
 }
 
 export function getWindowText(hwnd: number): string {
+  if (IS_MAC) {
+    const text = String(macControlRequest(TestLayout, [])[1] ?? "");
+    return /^windowTitle=(.*)$/m.exec(text)?.[1] ?? "";
+  }
   const buf = new Uint16Array(512);
   const n = user32.symbols.GetWindowTextW(hwnd, ptr(buf), 512);
   let s = "";
@@ -928,6 +1120,21 @@ function readClipboardText(): string | null {
 }
 
 export async function getClipboardText(timeoutMs = 1000): Promise<string> {
+  if (IS_MAC) {
+    const deadline = Date.now() + timeoutMs;
+    let last = "";
+    for (;;) {
+      const r = Bun.spawnSync(["pbpaste"], { stdout: "pipe", stderr: "ignore" });
+      last = r.stdout.toString();
+      if (r.exitCode === 0 && last.length > 0) {
+        return last;
+      }
+      if (Date.now() >= deadline) {
+        return last;
+      }
+      await sleep(20);
+    }
+  }
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const text = readClipboardText();
@@ -973,6 +1180,16 @@ export function getWindowTextFull(hwnd: number, maxChars = 16384): string {
 
 // window rectangle in screen coordinates (vs getClientRect's client-relative one)
 export function getWindowRect(hwnd: number): Rect {
+  if (IS_MAC) {
+    const text = String(macControlRequest(TestLayout, [])[1] ?? "");
+    const m = /window rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)/.exec(text);
+    if (!m) {
+      return { left: 0, top: 0, right: 0, bottom: 0 };
+    }
+    const x = Number(m[1]);
+    const y = Number(m[2]);
+    return { left: x, top: y, right: x + Number(m[3]), bottom: y + Number(m[4]) };
+  }
   const buf = new Int32Array(4);
   user32.symbols.GetWindowRect(hwnd, ptr(buf));
   return { left: buf[0], top: buf[1], right: buf[2], bottom: buf[3] };
@@ -991,6 +1208,9 @@ export function getExtendedFrameBounds(hwnd: number): Rect {
 // control is actually on screen (e.g. layout code that collapses a control hides
 // it rather than resizing it to nothing). Ask the OS instead.
 export function isWindowVisible(hwnd: number): boolean {
+  if (IS_MAC) {
+    return macFrameVisible();
+  }
   return user32.symbols.IsWindowVisible(hwnd);
 }
 
@@ -1075,6 +1295,9 @@ export function getSystemMetrics(index: number): number {
 // This is process-wide and cannot be undone, so only call it from tests that
 // read pixels or physical geometry, not from every test.
 export function setProcessDpiAware(): boolean {
+  if (!IS_WIN) {
+    return false;
+  }
   // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4
   return user32.symbols.SetProcessDpiAwarenessContext(-4n as unknown as number);
 }
@@ -1082,6 +1305,9 @@ export function setProcessDpiAware(): boolean {
 // The real cursor position, in screen (physical, when this process is DPI
 // aware) coordinates.
 export function getCursorPos(): { x: number; y: number } {
+  if (IS_MAC) {
+    return macCursor;
+  }
   const buf = new Int32Array(2);
   if (!user32.symbols.GetCursorPos(ptr(buf))) {
     return { x: 0, y: 0 };
@@ -1101,6 +1327,9 @@ export function getCursorPos(): { x: number; y: number } {
 // desktop happily, and a disconnected session still names "Default" as the
 // input desktop while refusing to move the pointer.
 export function hasInteractiveDesktop(): boolean {
+  if (!IS_WIN) {
+    return true;
+  }
   const at = getCursorPos();
   return user32.symbols.SetCursorPos(at.x, at.y);
 }
@@ -1297,6 +1526,10 @@ export function tbGetButtonIndex(toolbar: number, cmdId: number): number {
 // set a window's text via WM_SETTEXT (works on edit controls cross-process,
 // unlike SendInput typing). Synchronous, so the wide buffer stays alive.
 export function sendText(hwnd: number, text: string): void {
+  if (IS_MAC) {
+    macSendText(text);
+    return;
+  }
   const buf = wideZ(text);
   sendMessage(hwnd, WM_SETTEXT, 0, ptr(buf));
 }
@@ -1728,6 +1961,18 @@ export async function killAndWait(proc: KillableProc | undefined | null, timeout
   if (proc.exitCode !== null && proc.exitCode !== undefined) {
     return true;
   }
+  if (!IS_WIN) {
+    try {
+      proc.kill?.("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    const deadline = Date.now() + timeoutMs;
+    while ((proc.exitCode === null || proc.exitCode === undefined) && Date.now() < deadline) {
+      await sleep(20);
+    }
+    return proc.exitCode !== null && proc.exitCode !== undefined;
+  }
   const pid = proc.pid ?? 0;
   try {
     proc.kill?.();
@@ -1739,6 +1984,29 @@ export async function killAndWait(proc: KillableProc | undefined | null, timeout
 
 // taskkill /F /IM <exe> replacement: terminate every matching process and wait
 export async function killProcessesNamed(exeName: string, timeoutMs = 5000): Promise<number> {
+  if (!IS_WIN) {
+    const name = exeName.replace(/\.exe$/i, "");
+    const listed = Bun.spawnSync(["pgrep", "-x", name]);
+    const pids = listed.stdout
+      .toString()
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((s) => parseInt(s, 10));
+    let n = 0;
+    for (const pid of pids) {
+      if (!pid || pid === process.pid) {
+        continue;
+      }
+      try {
+        process.kill(pid, "SIGKILL");
+        n++;
+      } catch {
+        /* already gone */
+      }
+    }
+    return n;
+  }
   let n = 0;
   for (const pid of listPidsByExeName(exeName)) {
     if (pid === process.pid) {
@@ -1832,4 +2100,64 @@ export function readMenuTree(hmenu: bigint): MenuItem[] {
     }
   }
   return out;
+}
+
+// --- virtual desktops: the shell's IVirtualDesktopManager over raw COM ---
+
+const COINIT_APARTMENTTHREADED = 2;
+const CLSCTX_ALL = 23;
+const CLSID_VIRTUAL_DESKTOP_MANAGER = "AA509086-5CA9-4C25-8F95-589D3C07B48A";
+const IID_VIRTUAL_DESKTOP_MANAGER = "A5CD92FF-29BE-454C-8D04-D82879FB3F1B";
+// vtable slots after IUnknown's QueryInterface / AddRef / Release
+const VTBL_RELEASE = 2;
+const VTBL_GET_WINDOW_DESKTOP_ID = 4;
+
+// "AA509086-5CA9-4C25-..." -> the 16 bytes of a GUID struct (Data1..3 little-endian)
+function guidBytes(s: string): Uint8Array {
+  const hex = s.replace(/[{}-]/g, "");
+  const b = new Uint8Array(16);
+  const dv = new DataView(b.buffer);
+  dv.setUint32(0, parseInt(hex.slice(0, 8), 16), true);
+  dv.setUint16(4, parseInt(hex.slice(8, 12), 16), true);
+  dv.setUint16(6, parseInt(hex.slice(12, 16), 16), true);
+  for (let i = 0; i < 8; i++) {
+    b[8 + i] = parseInt(hex.slice(16 + i * 2, 18 + i * 2), 16);
+  }
+  return b;
+}
+
+// GUID struct bytes -> "{AA509086-5CA9-4C25-8F95-589D3C07B48A}", as StringFromGUID2 prints it
+function guidString(b: Uint8Array): string {
+  const dv = new DataView(b.buffer, b.byteOffset);
+  const hex = (v: number, digits: number) => v.toString(16).toUpperCase().padStart(digits, "0");
+  const tail = Array.from(b.subarray(8), (x) => hex(x, 2));
+  return `{${hex(dv.getUint32(0, true), 8)}-${hex(dv.getUint16(4, true), 4)}-${hex(dv.getUint16(6, true), 4)}-${tail.slice(0, 2).join("")}-${tail.slice(2).join("")}}`;
+}
+
+// the virtual desktop a top-level window is on, as "{GUID}"; "" when the shell
+// can't tell (no virtual desktop support in this session, hidden window)
+export function getWindowVirtualDesktopId(hwnd: number): string {
+  ole32.symbols.CoInitializeEx(null, COINIT_APARTMENTTHREADED);
+  const clsid = guidBytes(CLSID_VIRTUAL_DESKTOP_MANAGER);
+  const iid = guidBytes(IID_VIRTUAL_DESKTOP_MANAGER);
+  const out = new BigUint64Array(1);
+  const hr = ole32.symbols.CoCreateInstance(ptr(clsid), null, CLSCTX_ALL, ptr(iid), ptr(out));
+  const obj = Number(out[0]);
+  if (hr < 0 || !obj) {
+    return "";
+  }
+  const vtbl = read.ptr(obj, 0);
+  const getDesktopId = new CFunction({
+    ptr: read.ptr(vtbl, VTBL_GET_WINDOW_DESKTOP_ID * 8),
+    args: [FFIType.ptr, FFIType.ptr, FFIType.ptr],
+    returns: FFIType.i32,
+  });
+  const release = new CFunction({ ptr: read.ptr(vtbl, VTBL_RELEASE * 8), args: [FFIType.ptr], returns: FFIType.u32 });
+  const guid = new Uint8Array(16);
+  const hr2 = getDesktopId(obj, hwnd, ptr(guid));
+  release(obj);
+  if (hr2 < 0 || guid.every((x) => x === 0)) {
+    return "";
+  }
+  return guidString(guid);
 }

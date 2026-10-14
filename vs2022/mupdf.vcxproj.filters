@@ -58,8 +58,11 @@
     <Filter Include="src">
       <UniqueIdentifier>{2DAB880B-99B4-887C-2230-9F7C8E38947C}</UniqueIdentifier>
     </Filter>
-    <Filter Include="src\mupdf">
-      <UniqueIdentifier>{788FB2B5-E4F9-662C-2D38-18D299E14481}</UniqueIdentifier>
+    <Filter Include="src\shared">
+      <UniqueIdentifier>{D3351079-BFED-51C6-28F5-2A2214CCECB6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\shared\mupdf">
+      <UniqueIdentifier>{9EFE7CBB-8AF7-9B0D-B329-81929F817B19}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -411,11 +414,14 @@
     <ClInclude Include="..\ext\mupdf\source\pdf\pdf-imp.h">
       <Filter>ext\mupdf\source\pdf</Filter>
     </ClInclude>
-    <ClInclude Include="..\src\mupdf\noto_sumatra.h">
-      <Filter>src\mupdf</Filter>
+    <ClInclude Include="..\src\shared\mupdf\load-jxl.h">
+      <Filter>src\shared\mupdf</Filter>
     </ClInclude>
-    <ClInclude Include="..\src\mupdf\pkcs7-windows.h">
-      <Filter>src\mupdf</Filter>
+    <ClInclude Include="..\src\shared\mupdf\noto_sumatra.h">
+      <Filter>src\shared\mupdf</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\shared\mupdf\pkcs7-windows.h">
+      <Filter>src\shared\mupdf</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -1097,6 +1103,9 @@
     <ClCompile Include="..\ext\mupdf\source\svg\svg-run.c">
       <Filter>ext\mupdf\source\svg</Filter>
     </ClCompile>
+    <ClCompile Include="..\ext\mupdf\source\tools\mubar.c">
+      <Filter>ext\mupdf\source\tools</Filter>
+    </ClCompile>
     <ClCompile Include="..\ext\mupdf\source\tools\muconvert.c">
       <Filter>ext\mupdf\source\tools</Filter>
     </ClCompile>
@@ -1190,14 +1199,20 @@
     <ClCompile Include="..\ext\mupdf\source\xps\xps-zip.c">
       <Filter>ext\mupdf\source\xps</Filter>
     </ClCompile>
-    <ClCompile Include="..\src\mupdf\mupdf_load_system_font.c">
-      <Filter>src\mupdf</Filter>
+    <ClCompile Include="..\src\shared\mupdf\fonts_map.c">
+      <Filter>src\shared\mupdf</Filter>
     </ClCompile>
-    <ClCompile Include="..\src\mupdf\noto_sumatra.c">
-      <Filter>src\mupdf</Filter>
+    <ClCompile Include="..\src\shared\mupdf\load-jxl.cpp">
+      <Filter>src\shared\mupdf</Filter>
     </ClCompile>
-    <ClCompile Include="..\src\mupdf\pkcs7-windows.c">
-      <Filter>src\mupdf</Filter>
+    <ClCompile Include="..\src\shared\mupdf\mupdf_load_system_font.c">
+      <Filter>src\shared\mupdf</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\shared\mupdf\noto_sumatra.c">
+      <Filter>src\shared\mupdf</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\shared\mupdf\pkcs7-windows.c">
+      <Filter>src\shared\mupdf</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

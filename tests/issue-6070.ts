@@ -11,7 +11,8 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ControlClient, ControlCommand } from "./control.ts";
-import { cmdId, makePdf, runStandalone, tmpPath } from "./util.ts";
+import { IS_MAC } from "./host.ts";
+import { cmdId, makePdf, runStandalone, tmpPath, USE_NG } from "./util.ts";
 import {
   clientToScreen,
   enumWindows,
@@ -36,7 +37,7 @@ import {
   WM_LBUTTONUP,
   WM_MOUSEMOVE,
 } from "./winapi.ts";
-import { killAndWait, launchControlled, sendCommand } from "./win-automation.ts";
+import { ensureModifierKeysUp, killAndWait, launchControlled, sendCommand } from "./win-automation.ts";
 
 type Rect = { x: number; y: number; dx: number; dy: number };
 type Merge = {
@@ -104,11 +105,51 @@ async function pageState(client: ControlClient): Promise<string> {
   return m ? `${m[1]} ${m[2]}` : "";
 }
 
-function mouse(hwnd: number, msg: number, mk: number, pt: { x: number; y: number }) {
+function macMods(mk: number): number {
+  // Command is the control modifier the merge grid reads.
+  return mk & MK_CONTROL ? 8 : 0;
+}
+
+async function mouse(client: ControlClient, hwnd: number, msg: number, mk: number, pt: { x: number; y: number }) {
+  if (IS_MAC) {
+    const kind = msg === WM_MOUSEMOVE ? "move" : msg === WM_LBUTTONDOWN ? "down" : "up";
+    const button = msg === WM_MOUSEMOVE && mk & MK_LBUTTON ? 1 : 0;
+    const res = await client.request(ControlCommand.TestToolWindow, [
+      "input",
+      "mergepdf",
+      kind,
+      pt.x,
+      pt.y,
+      button,
+      macMods(mk),
+    ]);
+    const raw = String(res[1] ?? "");
+    if ((res[0] as number) !== 0 || raw.startsWith("ERR")) {
+      throw new Error(`issue-6070: merge input ${kind}: ${raw}`);
+    }
+    return;
+  }
+  // the grid also reads the live key state: a Ctrl stuck down mid-run (RDP)
+  // makes a plain press add to the selection. Ctrl presses carry MK_CONTROL
+  if (msg === WM_LBUTTONDOWN) {
+    await ensureModifierKeysUp();
+  }
   // SetCapture injects a WM_MOUSEMOVE at the real cursor: keep it where we are
   const screen = clientToScreen(hwnd, pt.x, pt.y);
   setCursorPos(screen.x, screen.y);
   sendMessage(hwnd, msg, mk, packCoords(pt.x, pt.y));
+}
+
+async function key(client: ControlClient, hwnd: number, vk: number) {
+  if (IS_MAC) {
+    const res = await client.request(ControlCommand.TestToolWindow, ["input", "mergepdf", "key", vk, 0, 0, 0]);
+    const raw = String(res[1] ?? "");
+    if ((res[0] as number) !== 0 || raw.startsWith("ERR")) {
+      throw new Error(`issue-6070: merge key ${vk}: ${raw}`);
+    }
+    return;
+  }
+  postMessage(hwnd, WM_KEYDOWN, vk, 0);
 }
 
 // the "where to insert" question Add PDF... asks
@@ -158,14 +199,18 @@ export async function testit(): Promise<void> {
     sendCommand(frame, cmdId("CmdMergePDF"));
     // the current page starts selected
     await wantItems(client, "0:1s,0:2,0:3,0:4", "the dialog didn't open");
+    await waitFor("page 2 has no button", async () => {
+      const b = (await merge(client)).rects.get(1)?.btn;
+      return !!b && b.dy > 1;
+    });
     let s = await merge(client);
     const hwnd = s.hwnd;
 
     // page 2's corner button, shown on hover, removes it
     const btn = center(s.rects.get(1)!.btn);
-    mouse(hwnd, WM_MOUSEMOVE, 0, btn);
-    mouse(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, btn);
-    mouse(hwnd, WM_LBUTTONUP, 0, btn);
+    await mouse(client, hwnd, WM_MOUSEMOVE, 0, btn);
+    await mouse(client, hwnd, WM_LBUTTONDOWN, MK_LBUTTON, btn);
+    await mouse(client, hwnd, WM_LBUTTONUP, 0, btn);
     await wantItems(client, "0:1s,0:2r,0:3,0:4", "the corner button didn't remove page 2");
 
     // page 4 dragged in front of page 1
@@ -173,50 +218,76 @@ export async function testit(): Promise<void> {
     const from = center(pageRect(s, 3));
     const r0 = pageRect(s, 0);
     const to = { x: r0.x + Math.floor(r0.dx / 8), y: r0.y + Math.floor(r0.dy / 2) };
-    mouse(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, from);
-    mouse(hwnd, WM_MOUSEMOVE, MK_LBUTTON, to);
-    mouse(hwnd, WM_LBUTTONUP, 0, to);
+    await mouse(client, hwnd, WM_LBUTTONDOWN, MK_LBUTTON, from);
+    await mouse(client, hwnd, WM_MOUSEMOVE, MK_LBUTTON, to);
+    await mouse(client, hwnd, WM_LBUTTONUP, 0, to);
     await wantItems(client, "0:4s,0:1,0:2r,0:3", "dragging didn't move page 4 to the front");
 
-    // Ctrl click adds a page to the selection
+    // Ctrl click adds a page to the selection. SetCapture synthesizes a
+    // buttonless move at the real cursor, which must not turn it into a drag
     s = await merge(client);
-    mouse(hwnd, WM_LBUTTONDOWN, MK_LBUTTON | MK_CONTROL, center(pageRect(s, 3)));
-    mouse(hwnd, WM_LBUTTONUP, MK_CONTROL, center(pageRect(s, 3)));
+    await mouse(client, hwnd, WM_LBUTTONDOWN, MK_LBUTTON | MK_CONTROL, center(pageRect(s, 3)));
+    await mouse(client, hwnd, WM_MOUSEMOVE, MK_CONTROL, center(pageRect(s, 0)));
+    await mouse(client, hwnd, WM_LBUTTONUP, MK_CONTROL, center(pageRect(s, 3)));
     await wantItems(client, "0:4s,0:1,0:2r,0:3s", "Ctrl click didn't add to the selection");
 
     // a rubber band from the gap above the first page to the middle of the third
     s = await merge(client);
     const bandFrom = { x: pageRect(s, 0).x - 4, y: pageRect(s, 0).y - 4 };
     const bandTo = center(pageRect(s, 2));
-    mouse(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, bandFrom);
-    mouse(hwnd, WM_MOUSEMOVE, MK_LBUTTON, bandTo);
-    mouse(hwnd, WM_LBUTTONUP, 0, bandTo);
+    await mouse(client, hwnd, WM_LBUTTONDOWN, MK_LBUTTON, bandFrom);
+    await mouse(client, hwnd, WM_MOUSEMOVE, MK_LBUTTON, bandTo);
+    await mouse(client, hwnd, WM_LBUTTONUP, 0, bandTo);
     await wantItems(client, "0:4s,0:1s,0:2rs,0:3", "the rubber band didn't select pages 1-3");
 
     // Delete removes the selected pages; with all of them removed, restores them
-    postMessage(hwnd, WM_KEYDOWN, VK_DELETE, 0);
+    await key(client, hwnd, VK_DELETE);
     await wantItems(client, "0:4rs,0:1rs,0:2rs,0:3", "Delete didn't remove the selected pages");
-    postMessage(hwnd, WM_KEYDOWN, VK_DELETE, 0);
+    await key(client, hwnd, VK_DELETE);
     await wantItems(client, "0:4s,0:1s,0:2s,0:3", "Delete didn't restore the removed pages");
     await merge(client, "remove", "2");
 
     // Add PDF asks where; the page starts as the selected one (3). Esc adds nothing
     await merge(client, "askpos", other);
-    let ask = await waitForInsertQuestion(proc.pid);
-    let edit = findChildWindow(ask, "Edit");
-    if (getControlText(edit) !== "3") {
-      throw new Error(`issue-6070: want page 3 in the Add PDF question, got '${getControlText(edit)}'`);
+    if (USE_NG) {
+      // the question is a layer of the merge window, not an Edit of its own
+      let asked = "";
+      await waitFor("Add PDF didn't ask where to insert", async () => {
+        const m = /asking=1 ask=(\S*)/.exec((await merge(client)).raw);
+        if (!m) {
+          return false;
+        }
+        asked = m[1]!;
+        return true;
+      });
+      if (asked !== "3") {
+        throw new Error(`issue-6070: want page 3 in the Add PDF question, got '${asked}'`);
+      }
+      await key(client, hwnd, VK_ESCAPE);
+      await waitFor("Esc didn't close the Add PDF question", async () => !/asking=1/.test((await merge(client)).raw));
+    } else {
+      let ask = await waitForInsertQuestion(proc.pid);
+      let edit = findChildWindow(ask, "Edit");
+      if (getControlText(edit) !== "3") {
+        throw new Error(`issue-6070: want page 3 in the Add PDF question, got '${getControlText(edit)}'`);
+      }
+      postMessage(edit, WM_KEYDOWN, VK_ESCAPE, 0);
+      await waitFor("Esc didn't close the Add PDF question", async () => !isWindowVisible(ask));
     }
-    postMessage(edit, WM_KEYDOWN, VK_ESCAPE, 0);
-    await waitFor("Esc didn't close the Add PDF question", async () => !isWindowVisible(ask));
     await wantItems(client, "0:4,0:1,0:2rs,0:3", "a cancelled Add PDF added pages");
 
     // after page 4: at the end; its first page removed
     await merge(client, "askpos", other);
-    ask = await waitForInsertQuestion(proc.pid);
-    edit = findChildWindow(ask, "Edit");
-    sendText(edit, "4");
-    postMessage(edit, WM_KEYDOWN, VK_RETURN, 0);
+    if (USE_NG) {
+      await waitFor("Add PDF didn't ask where to insert", async () => /asking=1/.test((await merge(client)).raw));
+      await merge(client, "asktext", "4");
+      await key(client, hwnd, VK_RETURN);
+    } else {
+      const ask = await waitForInsertQuestion(proc.pid);
+      const edit = findChildWindow(ask, "Edit");
+      sendText(edit, "4");
+      postMessage(edit, WM_KEYDOWN, VK_RETURN, 0);
+    }
     await wantItems(client, "0:4,0:1,0:2r,0:3,1:1s,1:2s", "Add PDF after page 4");
     await merge(client, "remove", "4");
     await wantItems(client, "0:4,0:1,0:2r,0:3,1:1rs,1:2", "adding other.pdf");

@@ -28,6 +28,7 @@
 #include "DarkMode.h"
 #include "Translations.h"
 #include "ImageSaveCropResize.h"
+#include "AppHelpersCommon.h"
 
 using Gdiplus::Bitmap;
 
@@ -98,10 +99,6 @@ static void OpenSavedFile(HWND parent, Str path) {
     }
     LoadArgs args(path, win);
     StartLoadDocument(&args);
-}
-
-static Str TranslateStr(Str s) {
-    return Tr(s);
 }
 
 static void ApplyDarkMode(HWND hwnd) {

@@ -6,7 +6,8 @@
 
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { assemblePdf, runStandalone, tmpPath } from "./util";
+import { IS_MAC } from "./host";
+import { runStandalone, tmpPath, makeBlankPdf } from "./util";
 import { killAndWait, launchControlled } from "./win-automation";
 import {
   getWindowRect,
@@ -20,17 +21,6 @@ import {
   SWP_NOSENDCHANGING,
   SWP_NOZORDER,
 } from "./winapi";
-
-function makePdf(nPages: number): string {
-  const objs: string[] = [];
-  objs.push(`<< /Type /Catalog /Pages 2 0 R >>`);
-  const kids = Array.from({ length: nPages }, (_, i) => `${3 + i} 0 R`).join(" ");
-  objs.push(`<< /Type /Pages /Count ${nPages} /Kids [${kids}] >>`);
-  for (let i = 0; i < nPages; i++) {
-    objs.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>`);
-  }
-  return assemblePdf(objs);
-}
 
 const SETTINGS = [
   `DefaultDisplayMode = facing`,
@@ -46,7 +36,7 @@ const kTinyFrameDx = 8;
 
 export async function testit(): Promise<void> {
   const pdf = tmpPath("facing-fit-tiny-viewport.pdf");
-  writeFileSync(pdf, makePdf(6), "latin1");
+  writeFileSync(pdf, makeBlankPdf(6), "latin1");
 
   const appdata = tmpPath("facing-fit-tiny-viewport-appdata");
   rmSync(appdata, { recursive: true, force: true });
@@ -64,7 +54,18 @@ export async function testit(): Promise<void> {
 
     // SWP_NOSENDCHANGING skips the frame's min track size, so the canvas can
     // get as narrow as a squeezed or DPI-changed window leaves it
-    setWindowPos(frame, r.left, r.top, kTinyFrameDx, dy, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+    if (IS_MAC) {
+      if (!moveWindow(frame, r.left, r.top, kTinyFrameDx, dy)) {
+        throw new Error("facing-fit-tiny-viewport: could not shrink the frame");
+      }
+      const shrunk = getWindowRect(frame);
+      const shrunkDx = shrunk.right - shrunk.left;
+      if (shrunkDx > 40) {
+        throw new Error(`facing-fit-tiny-viewport: frame stayed ${shrunkDx}px wide`);
+      }
+    } else {
+      setWindowPos(frame, r.left, r.top, kTinyFrameDx, dy, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+    }
 
     // repaints the canvas; not idle at this size, so a timeout is expected
     await client.waitForRenderIdle(1000).catch(() => {});
