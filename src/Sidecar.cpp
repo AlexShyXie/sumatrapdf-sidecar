@@ -1,7 +1,7 @@
 /* Copyright 2026 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
-// JSON sidecar persistence for annotations ("SeparateSave" mode).
+// Markdown sidecar persistence for annotations ("SeparateSave" mode).
 //
 // When SumatraPDF-settings.txt contains
 //
@@ -10,16 +10,20 @@
 //     CentralFolder = D:\notes\sidecar   (optional)
 //   ]
 //
-// annotations of a PDF are persisted as a JSON file next to the PDF
-// (<pdf name>.json, "sibling") or, when no sibling file exists, inside
-// <CentralFolder>/<pdf parent folder name>/<pdf name w/o ext>.json
-// ("central"). The PDF itself is never modified.
+// annotations of a PDF are persisted as a Markdown file next to the PDF
+// (<pdf name>.md, "sibling") or, when no sibling file exists, inside
+// <CentralFolder>/<pdf parent folder name>/<pdf name w/o ext>.md
+// ("central"). The PDF itself is never modified. Annotations are stored as
+// Obsidian-style callouts and everything else in the file is preserved for
+// the user's own notes; see the "Markdown sidecar" section below. A .json
+// written by an older version is still imported (read-only - the next save
+// writes the .md and leaves the .json alone).
 //
 // Loading order mirrors the companion PDF-XChange scripts: sibling first,
 // then central. Saving resolves the target the same way, so both stay
 // consistent without extra per-tab state.
 //
-// Why JSON and not XFDF: XFDF interop between viewers is de-facto, not
+// Why our own format and not XFDF: XFDF interop between viewers is de-facto, not
 // de-jure (quad ordering differs between implementations, richtext
 // contents are non-uniform, PDF-XChange itself loses/garbles some fields
 // on re-import). The sidecar is a SumatraPDF-private cache; the
@@ -55,7 +59,11 @@
 //                                      // ("Approved"...) for stamps, icon for
 //                                      // file attachments
 //       "asset": "assets/1a2b...png", // stamp/attachment payload, relative
-//                                      // to this JSON (content-addressed)
+//                                      // to this sidecar (content-addressed).
+//                                      // Absent for a rubber stamp (no image)
+//                                      // and for a file attachment that was
+//                                      // never given a file: both round-trip
+//                                      // as-is
 //       "attachment": {               // file attachment metadata
 //         "filename": "notes.txt", "mimeType": "text/plain",
 //         "size": 1234,
@@ -130,11 +138,11 @@ bool SidecarSeparateSaveEnabled() {
     return gSettings && gSettings->annotations.separateSave;
 }
 
-// md mode: sidecar files are Markdown (.md) instead of JSON. The format
-// implementation lives in the "Markdown sidecar" section below.
-static bool SidecarMdEnabled() {
-    return gSettings && gSettings->annotations.separateSaveAsMd;
-}
+// sidecar files are Markdown (.md): annotations are Obsidian-style callouts
+// and everything else in the file is left alone for your own notes. The
+// format implementation lives in the "Markdown sidecar" section below. A
+// .json sidecar from an older version is still imported (read-only); the
+// next save writes the .md and leaves the .json untouched.
 
 bool SidecarWantsRedirect(EngineBase* engine) {
     if (!SidecarSeparateSaveEnabled()) {
@@ -150,8 +158,8 @@ bool SidecarWantsRedirect(EngineBase* engine) {
 // ---------------------------------------------------------------------------
 // path resolution (mirrors the PDF-XChange v5 scripts)
 //
-// sibling: <dir of pdf>/<pdf name>.json (".pdf" extension replaced)
-// central: <CentralFolder>/<pdf parent folder name>/<pdf name w/o ext>.json
+// sibling: <dir of pdf>/<pdf name>.md (".pdf" extension replaced)
+// central: <CentralFolder>/<pdf parent folder name>/<pdf name w/o ext>.md
 
 struct SidecarTarget {
     Str path;
@@ -163,14 +171,10 @@ struct SidecarTarget {
     // (2s per tab) and every save leaked the resolved path(s) - nothing
     // called str::Free on them anywhere
     SidecarTarget() = default;
-    ~SidecarTarget() {
-        str::Free(path);
-    }
+    ~SidecarTarget() { str::Free(path); }
     SidecarTarget(const SidecarTarget&) = delete;
     SidecarTarget& operator=(const SidecarTarget&) = delete;
-    SidecarTarget(SidecarTarget&& o) noexcept : path(o.path), central(o.central), exists(o.exists) {
-        o.path = {};
-    }
+    SidecarTarget(SidecarTarget&& o) noexcept : path(o.path), central(o.central), exists(o.exists) { o.path = {}; }
     SidecarTarget& operator=(SidecarTarget&& o) noexcept {
         if (this != &o) {
             str::Free(path);
@@ -190,7 +194,8 @@ static char PathSepFor(Str dir) {
     return '\\';
 }
 
-// "D:\books\report.pdf" -> "D:\books\report.json" (or .md in md mode)
+// "D:\books\report.pdf" -> "D:\books\report.md" (ext is ".json" only when
+// looking for a legacy sidecar to import)
 static SidecarTarget ResolveSiblingTargetExt(Str pdfPath, const char* ext) {
     SidecarTarget res;
     TempStr dir = path::GetDirTemp(pdfPath);
@@ -214,7 +219,7 @@ static SidecarTarget ResolveSiblingTargetExt(Str pdfPath, const char* ext) {
     return res;
 }
 
-// "D:\books\sub\report.pdf" + "D:\notes" -> "D:\notes\sub\report.json" (or .md)
+// "D:\books\sub\report.pdf" + "D:\notes" -> "D:\notes\sub\report.md"
 static SidecarTarget ResolveCentralTargetExt(Str pdfPath, const char* ext) {
     SidecarTarget res;
     Str folder = gSettings->annotations.centralFolder;
@@ -262,12 +267,14 @@ static SidecarTarget ResolveCentralTargetExt(Str pdfPath, const char* ext) {
     return res;
 }
 
+// sidecars are Markdown; the ".json" spelling is only ever resolved when
+// looking for a legacy file to import (see SidecarMaybeImport)
 static SidecarTarget ResolveSiblingTarget(Str pdfPath) {
-    return ResolveSiblingTargetExt(pdfPath, SidecarMdEnabled() ? ".md" : ".json");
+    return ResolveSiblingTargetExt(pdfPath, ".md");
 }
 
 static SidecarTarget ResolveCentralTarget(Str pdfPath) {
-    return ResolveCentralTargetExt(pdfPath, SidecarMdEnabled() ? ".md" : ".json");
+    return ResolveCentralTargetExt(pdfPath, ".md");
 }
 
 // order of preference: existing sibling wins, then existing central
@@ -342,9 +349,9 @@ struct SidecarAnnot {
     time_t creationDate = 0;
     time_t modDate = 0;
     // stamp / file attachment payload: the bytes live in an assets/ folder
-    // next to the JSON ("assets/<fnv1a-64-hex>.<ext>", content-addressed so
-    // identical payloads share one file); "asset" in the JSON is relative to
-    // the JSON itself, so pdf+json+assets move together
+    // next to the sidecar ("assets/<fnv1a-64-hex>.<ext>", content-addressed
+    // so identical payloads share one file); "asset" is relative to the
+    // sidecar itself, so pdf+sidecar+assets move together
     Str assetName;                 // "assets/1a2b3c....png", empty when no payload
     fz_buffer* assetBuf = nullptr; // owned payload bytes while in flight
     bool assetOk = true;           // false: payload expected but unextractable
@@ -437,7 +444,7 @@ static bool SidecarTypeSupported(AnnotationType tp) {
             // Link / Popup / Widget / Sound / Movie / RichMedia / media
             // types: not supported. Stamps and file attachments are
             // supported since schema version 2: their payloads live in an
-            // assets/ folder next to the JSON, not in the JSON itself
+            // assets/ folder next to the sidecar, not in the sidecar itself
             return false;
     }
 }
@@ -592,9 +599,9 @@ static void PdfColorToF(PdfColor col, float out[3]) {
 
 // ---------------------------------------------------------------------------
 // assets: binary payloads of stamp and file attachment annotations.
-// The JSON never holds binary data; payloads are written as
-// <json dir>/assets/<fnv1a-64-hex>.<ext> and referenced from the JSON by
-// their relative path. Content-addressed names dedup identical payloads
+// The sidecar never holds binary data; payloads are written as
+// <sidecar dir>/assets/<fnv1a-64-hex>.<ext> and referenced from the sidecar
+// by their relative path. Content-addressed names dedup identical payloads
 // and make the cleanup in SaveTab safe.
 
 static uint64_t Fnv1a64(const u8* d, size_t n) {
@@ -788,8 +795,11 @@ static fz_buffer* PngFromStampImage(fz_context* ctx, fz_image* img) {
 // extracts the payload bytes of a stamp (image XObject) or a file
 // attachment (embedded file) into sa.assetBuf and computes sa.assetName.
 // A stamp without an image (rubber stamp: "Approved" etc.) carries no
-// payload at all. Sets assetOk=false when a payload exists but cannot be
-// extracted; the entry is then skipped and counted on save.
+// payload at all, and neither does a file attachment that has not been
+// given a file yet: both are saved as-is (a "hollow" file attachment keeps
+// its icon, rect and note and can be filled in later with Attach File).
+// assetOk=false means the opposite - a payload is there but cannot be
+// extracted - and only then is the entry skipped and counted on save.
 static void CollectAssetPayload(Annotation* a, SidecarAnnot& sa) {
     EngineMupdf* e = a->engine;
     if (!e || !a->pdfannot) {
@@ -859,11 +869,12 @@ static void CollectAssetPayload(Annotation* a, SidecarAnnot& sa) {
                 sa.assetName = AssetPathForData(buf->data, buf->len, ext);
                 sa.assetBuf = buf;
                 buf = nullptr; // ownership moved into sa
-            } else {
-                // external file specification: points at a file on the
-                // author's machine, nothing embeddable to persist
-                sa.assetOk = false;
             }
+            // no embedded file: either an external file specification (points
+            // at a file on the author's machine, nothing embeddable) or an
+            // attachment that was dropped before a file was picked. Either way
+            // there is no payload, which is fine - the hollow icon is saved
+            // like a rubber stamp and Attach File can fill it in later
         }
     }
     fz_catch(ctx) {
@@ -876,9 +887,9 @@ static void CollectAssetPayload(Annotation* a, SidecarAnnot& sa) {
 }
 
 // writes the payload files referenced by entries into assets/ next to the
-// JSON. Returns the number of failed writes. Content-addressed names make
+// sidecar. Returns the number of failed writes. Content-addressed names make
 // this idempotent: unchanged payloads are simply overwritten in place
-static int WriteSidecarAssets(Str jsonPath, const Vec<SidecarAnnot>& entries) {
+static int WriteSidecarAssets(Str sidecarPath, const Vec<SidecarAnnot>& entries) {
     bool any = false;
     for (const SidecarAnnot& sa : entries) {
         if (sa.assetBuf && len(sa.assetName) > 0) {
@@ -889,7 +900,7 @@ static int WriteSidecarAssets(Str jsonPath, const Vec<SidecarAnnot>& entries) {
     if (!any) {
         return 0;
     }
-    TempStr jdir = path::GetDirTemp(jsonPath);
+    TempStr jdir = path::GetDirTemp(sidecarPath);
     if (len(jdir) == 0) {
         return 1;
     }
@@ -932,11 +943,11 @@ static int WriteSidecarAssets(Str jsonPath, const Vec<SidecarAnnot>& entries) {
     return failed;
 }
 
-// reads the payload files referenced by entries (relative to the JSON's
+// reads the payload files referenced by entries (relative to the sidecar's
 // directory). Entries whose file is missing or unreadable get assetOk=false
 // and are skipped by the import; every entry owns its buffer copy
-static void LoadSidecarAssetBuffers(fz_context* ctx, Str jsonPath, Vec<SidecarAnnot>& entries) {
-    TempStr jdir = path::GetDirTemp(jsonPath);
+static void LoadSidecarAssetBuffers(fz_context* ctx, Str sidecarPath, Vec<SidecarAnnot>& entries) {
+    TempStr jdir = path::GetDirTemp(sidecarPath);
     if (len(jdir) == 0) {
         return;
     }
@@ -969,11 +980,11 @@ static void LoadSidecarAssetBuffers(fz_context* ctx, Str jsonPath, Vec<SidecarAn
 }
 
 // after a save: delete files in assets/ that look like ours (16-hex names)
-// and are not referenced by ANY sidecar JSON in the folder (raw text scan:
-// the hex string appears verbatim in the referencing JSON, so assets
-// shared with other documents' sidecars are never removed)
-static void CleanupSidecarAssets(Str jsonPath) {
-    TempStr jdir = path::GetDirTemp(jsonPath);
+// and are not referenced by ANY sidecar in the folder (raw text scan: the
+// hex string appears verbatim in the referencing file, so assets shared
+// with other documents' sidecars are never removed)
+static void CleanupSidecarAssets(Str sidecarPath) {
+    TempStr jdir = path::GetDirTemp(sidecarPath);
     if (len(jdir) == 0) {
         return;
     }
@@ -981,18 +992,18 @@ static void CleanupSidecarAssets(Str jsonPath) {
     if (!dir::Exists(assetsDir)) {
         return;
     }
-    Vec<Str> jsons; // owned
+    Vec<Str> sidecars; // owned
     for (DirIterEntry* de : DirIter(jdir)) {
-        // md sidecars reference their assets the same way (in callout kv
-        // lines), so both suffixes must be scanned or a still-referenced
-        // payload would be deleted
+        // .md callouts reference their assets the same way (.json kv pairs,
+        // one per line), so both suffixes must be scanned or a
+        // still-referenced payload would be deleted
         if (!de->isFile || !(str::EndsWithI(de->name, StrL(".json")) || str::EndsWithI(de->name, StrL(".md")))) {
             continue;
         }
         Str data = file::ReadFile(de->filePath);
-        // an unreadable or empty json simply contributes no references
+        // an unreadable or empty sidecar simply contributes no references
         if (len(data) > 0) {
-            VecAppend(jsons, data);
+            VecAppend(sidecars, data);
         }
     }
     int nDeleted = 0;
@@ -1002,7 +1013,7 @@ static void CleanupSidecarAssets(Str jsonPath) {
         }
         TempStr hex = Str(de->name.s, 16);
         bool referenced = false;
-        for (Str j : jsons) {
+        for (Str j : sidecars) {
             if (StrContains(j, hex)) {
                 referenced = true;
                 break;
@@ -1016,7 +1027,7 @@ static void CleanupSidecarAssets(Str jsonPath) {
             }
         }
     }
-    for (Str j : jsons) {
+    for (Str j : sidecars) {
         str::Free(j);
     }
     if (nDeleted > 0) {
@@ -1676,41 +1687,10 @@ static void CollectSidecarEntries(EngineMupdf* e, const Vec<Annotation*>& annots
     logf("sidecar: exported %d annotations\n", nWritten);
 }
 
-static Str BuildSidecarJson(EngineMupdf* e, Str pdfPath, const Vec<SidecarAnnot>& entries) {
-    str::Builder b;
-    b.Append(fmt("{\n  \"version\": %d,\n  \"generator\": \"SumatraPDF-sidecar/2\",\n", kSidecarVersion));
-    TempStr base = path::GetBaseNameTemp(pdfPath);
-    if (base && len(base) > 0) {
-        b.Append(StrL("  \"file\": "));
-        AppendEscapedJson(b, Str(base));
-        b.Append(StrL(",\n"));
-    }
-    Str title = DocTitle(e);
-    if (len(title) > 0) {
-        b.Append(StrL("  \"title\": "));
-        AppendEscapedJson(b, title);
-        str::Free(title);
-        b.Append(StrL(",\n"));
-    }
-    b.Append(StrL("  \"annotations\": ["));
-    bool first = true;
-    for (const SidecarAnnot& sa : entries) {
-        if (!first) {
-            b.AppendChar(',');
-        }
-        b.AppendChar('\n');
-        SerializeAnnotJson(b, sa);
-        first = false;
-    }
-    if (!first) {
-        b.AppendChar('\n');
-    }
-    b.Append(StrL("  ]\n}\n"));
-    return b.TakeStr();
-}
-
 // ---------------------------------------------------------------------------
-// JSON reader (MuPDF's fz_parse_json produces a DOM owned by a pool)
+// JSON reader (MuPDF's fz_parse_json produces a DOM owned by a pool).
+// Only used to import a .json sidecar written by an older version: new files
+// are always Markdown (see "Markdown sidecar")
 
 static fz_json* JsonGet(fz_context* ctx, fz_json* o, const char* key) {
     return fz_json_object_get(ctx, o, key);
@@ -1994,10 +1974,10 @@ static bool JsonToSidecarAnnot(fz_context* ctx, fz_json* o, SidecarAnnot& sa) {
             sa.attachModified = ParseIsoDate(Str(am));
         }
     }
-    // a file attachment without its payload is just a dead icon: drop it
-    if (sa.type == AnnotationType::FileAttachment && len(sa.assetName) == 0) {
-        return false;
-    }
+    // a file attachment with no "asset" is a hollow icon: an attachment that
+    // was dropped but never given a file. It is imported as such (icon, rect
+    // and note, no /FS) and Attach File fills it in later. This is the same
+    // state a rubber stamp (a stamp with no image) is saved in
 
     // sanity per type: a markup without quads, a line without points, a
     // polygon without vertices and an ink without strokes are useless
@@ -2066,11 +2046,12 @@ static bool ParseSidecarJson(fz_context* ctx, char* data, Vec<SidecarAnnot>& out
 }
 
 // ---------------------------------------------------------------------------
-// Markdown sidecar (Annotations->SeparateSaveAsMd = true)
+// Markdown sidecar - the only format written. A .json written by an older
+// version is still imported (see the JSON reader above), read-only.
 //
-// The same data as the JSON sidecar, stored as Markdown so it can live in
-// an Obsidian vault: annotations become Obsidian-style callouts, everything
-// else in the file belongs to the user. Structure:
+// The same fields, stored as Markdown so it can live in an Obsidian vault:
+// annotations become Obsidian-style callouts, everything else in the file
+// belongs to the user. Structure:
 //
 //   ---                       front matter (created once, then verbatim)
 //   sumatrapdf_sidecar: 2
@@ -2092,8 +2073,9 @@ static bool ParseSidecarJson(fz_context* ctx, char* data, Vec<SidecarAnnot>& out
 //   every other body line is user text kept verbatim
 // - values are plain scalars (unquoted) or JSON literals (numbers,
 //   "escaped strings", [arrays], {objects}); MdIsPlainScalar decides
-// - import prefers .md and falls back to .json (read-only; the next manual
-//   save writes the .md - automatic migration; the .json is never touched)
+// - .md is the only format written; import falls back to a .json from an
+//   older version (read-only; the next save writes the .md - automatic
+//   migration; the .json is never touched)
 // - save merges: matched callouts are rewritten in place (engine data
 //   wins over edits made to kv values in the editor), callouts of deleted
 //   annotations are dropped, new annotations are appended at the end;
@@ -2107,12 +2089,10 @@ static bool ParseSidecarJson(fz_context* ctx, char* data, Vec<SidecarAnnot>& out
 // the keys SerializeAnnotJson emits; anything else in a callout body is
 // user text
 static const char* kMdKnownKeys[] = {
-    "type",     "page",       "rect",     "quads",      "start",       "end",
-    "vertices", "inkList",    "color",    "interiorColor", "opacity",  "borderWidth",
-    "lineStart", "lineEnd",   "icon",     "asset",      "attachment",  "isOpen",
-    "fontSize", "textColor",  "textAlign", "fontFamily", "textStyle",  "flags",
-    "author",   "subject",    "name",     "text",       "contents",    "creationDate",
-    "modDate",
+    "type",       "page",          "rect",     "quads",       "start",     "end",          "vertices",  "inkList",
+    "color",      "interiorColor", "opacity",  "borderWidth", "lineStart", "lineEnd",      "icon",      "asset",
+    "attachment", "isOpen",        "fontSize", "textColor",   "textAlign", "fontFamily",   "textStyle", "flags",
+    "author",     "subject",       "name",     "text",        "contents",  "creationDate", "modDate",
 };
 
 static bool MdIsKnownKey(Str k) {
@@ -2386,10 +2366,10 @@ static void MdEnsureBlankBefore(MdOut& o, bool crlf) {
 }
 
 struct MdBodyLine {
-    Str line;    // owned, the full "> ..." line without eol
+    Str line; // owned, the full "> ..." line without eol
     bool kv = false;
-    Str key;     // owned when kv
-    Str val;     // owned when kv
+    Str key; // owned when kv
+    Str val; // owned when kv
 };
 
 struct MdSeg {
@@ -2398,7 +2378,7 @@ struct MdSeg {
     Str header; // callout header line without eol (owned)
     Vec<MdBodyLine> body;
     bool isAnnot = false; // callout parsed to a valid annotation
-    SidecarAnnot annot;  // valid when isAnnot (strings owned)
+    SidecarAnnot annot;   // valid when isAnnot (strings owned)
 };
 
 struct MdDoc {
@@ -3300,7 +3280,7 @@ static int ImportSidecarEntries(EngineMupdf* e, const Vec<SidecarAnnot>& entries
         MarkNotificationAsModified(e, wa, AnnotationChange::Add);
         imported++;
     }
-    // the import mirrors the JSON on disk, it is not an unsaved change
+    // the import mirrors the sidecar on disk, it is not an unsaved change
     e->modifiedAnnotations = false;
     return imported;
 }
@@ -3622,10 +3602,10 @@ static bool SidecarReloadFromDisk(WindowTab* tab, EngineMupdf* e, const SidecarT
                             : (nAdded > 0 && nRemoved == 0 && nUpdated == 0 ? StrL("Loaded") : StrL("Reloaded"));
             auto why = nRemoved > 0 && nAdded == 0 && nUpdated == 0 ? StrL("deleted externally")
                                                                     : StrL("from external changes");
-            ShowPlainNotification(win->hwndCanvas,
-                                  fmt("%s %d annotation%s %s%s", what, nTouched,
-                                      nTouched == 1 ? StrL("") : StrL("s"), why, keptSuffix),
-                                  5000);
+            ShowPlainNotification(
+                win->hwndCanvas,
+                fmt("%s %d annotation%s %s%s", what, nTouched, nTouched == 1 ? StrL("") : StrL("s"), why, keptSuffix),
+                5000);
         }
         RefreshAnnotationLists(tab);
         if (IsMainWindowValidAndNotClosing(win)) {
@@ -3788,9 +3768,10 @@ void SidecarMaybeImport(EngineBase* engine) {
 
     SidecarTarget sib = ResolveSiblingTarget(pdfPath);
     SidecarTarget cen = ResolveCentralTarget(pdfPath);
-    if (SidecarMdEnabled() && !sib.exists && !cen.exists) {
-        // no .md anywhere: fall back to .json (read-only; the next manual
-        // save writes the .md - automatic migration, the .json is kept)
+    if (!sib.exists && !cen.exists) {
+        // no .md anywhere: fall back to a .json written by an older version.
+        // Read-only - the next save writes the .md and leaves the .json be,
+        // so an old build can still open it
         sib = ResolveSiblingTargetExt(pdfPath, ".json");
         cen = ResolveCentralTargetExt(pdfPath, ".json");
     }
@@ -3798,12 +3779,12 @@ void SidecarMaybeImport(EngineBase* engine) {
     if (sib.exists) {
         use = std::move(sib);
         if (cen.exists) {
-            logf("sidecar: both sibling and central JSON exist for '%s', using sibling\n", pdfPath);
+            logf("sidecar: both sibling and central sidecar exist for '%s', using sibling\n", pdfPath);
         }
     } else if (cen.exists) {
         use = std::move(cen);
     } else {
-        logf("sidecar: no JSON sidecar found for '%s'\n", pdfPath);
+        logf("sidecar: no sidecar found for '%s'\n", pdfPath);
         return;
     }
 
@@ -3816,8 +3797,8 @@ void SidecarMaybeImport(EngineBase* engine) {
     char* z = CStrTemp(data);
     Vec<SidecarAnnot> entries;
     fz_context* ctx = e->Ctx();
-    bool parseOk = str::EndsWithI(use.path, StrL(".md")) ? ParseSidecarMd(ctx, z, entries)
-                                                         : ParseSidecarJson(ctx, z, entries);
+    bool parseOk =
+        str::EndsWithI(use.path, StrL(".md")) ? ParseSidecarMd(ctx, z, entries) : ParseSidecarJson(ctx, z, entries);
     if (!parseOk) {
         logf("sidecar: failed to parse '%s'\n", use.path);
     }
@@ -3829,7 +3810,7 @@ void SidecarMaybeImport(EngineBase* engine) {
         logf("sidecar: no supported annotations in '%s'\n", use.path);
         return;
     }
-    // stamp / attachment payloads live in assets/ next to the JSON; load
+    // stamp / attachment payloads live in assets/ next to the sidecar; load
     // them (entries whose file is missing are skipped by the import)
     LoadSidecarAssetBuffers(ctx, use.path, entries);
     // suppress the auto-save arming that MarkNotificationAsModified would
@@ -3924,16 +3905,12 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate, bool forceOverwri
     Vec<SidecarAnnot> entries;
     CollectSidecarEntries(e, annots, nSkippedUnsupported, entries);
     Str data;
-    if (SidecarMdEnabled()) {
-        Str existing;
-        if (tgt.exists) {
-            existing = file::ReadFile(tgt.path);
-        }
-        data = BuildSidecarMd(e, pdfPath, entries, existing);
-        str::Free(existing);
-    } else {
-        data = BuildSidecarJson(e, pdfPath, entries);
+    Str existing;
+    if (tgt.exists) {
+        existing = file::ReadFile(tgt.path);
     }
+    data = BuildSidecarMd(e, pdfPath, entries, existing);
+    str::Free(existing);
     if (len(data) == 0) {
         ShowWarningNotification(win->hwndCanvas, StrL("Failed to build sidecar"), 5000);
         fz_context* ctx = e->Ctx();
@@ -3952,8 +3929,8 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate, bool forceOverwri
     }
     if (!WriteSidecarFileAtomic(tgt.path, data)) {
         ShowWarningNotification(
-            win->hwndCanvas, fmt(Tr("Failed to save '%s': %s").s, path::GetBaseNameTemp(tgt.path), StrL("cannot write file")),
-            5000);
+            win->hwndCanvas,
+            fmt(Tr("Failed to save '%s': %s").s, path::GetBaseNameTemp(tgt.path), StrL("cannot write file")), 5000);
         logf("sidecar: failed to write '%s'\n", tgt.path);
         str::Free(data);
         fz_context* ctx = e->Ctx();
@@ -3965,7 +3942,7 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate, bool forceOverwri
     str::Free(data);
 
     // write the payload files (stamp images / attachment contents) into
-    // assets/ next to the JSON, then remove asset files that no sidecar
+    // assets/ next to the sidecar, then remove asset files that no sidecar
     // in the folder references anymore
     {
         fz_context* ctx = e->Ctx();
@@ -3975,7 +3952,7 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate, bool forceOverwri
             FreeSidecarAnnotStrings(ctx, sa);
         }
         if (nAssetFailed > 0) {
-            // the JSON references the missing files; the annotations stay
+            // the sidecar references the missing files; the annotations stay
             // in the PDF until it is saved, so nothing is lost yet
             ShowWarningNotification(
                 win->hwndCanvas, fmt("Saved '%s', but %d asset file(s) failed to write", tgt.path, nAssetFailed), 5000);
@@ -3991,16 +3968,14 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate, bool forceOverwri
         // make it visible that some annotations (unsupported types or
         // unreadable payloads) are not in the sidecar and will be lost on
         // reopen (details in the log)
-        ShowPlainNotification(win->hwndCanvas, fmt("Saved annotations %s: '%s' (%d skipped)", loc, baseName,
-                                                  nSkippedUnsupported),
-                              5000);
-    } else {
         ShowPlainNotification(win->hwndCanvas,
-                              fmt(Tr(tgt.central ? "Saved annotations in central folder: '%s'"
-                                                 : "Saved annotations next to PDF: '%s'")
-                                      .s,
-                                  baseName),
-                              5000);
+                              fmt("Saved annotations %s: '%s' (%d skipped)", loc, baseName, nSkippedUnsupported), 5000);
+    } else {
+        ShowPlainNotification(
+            win->hwndCanvas,
+            fmt(Tr(tgt.central ? "Saved annotations in central folder: '%s'" : "Saved annotations next to PDF: '%s'").s,
+                baseName),
+            5000);
     }
     logf("sidecar: saved %d annotations to '%s' (%s, %d skipped)\n", len(annots), tgt.path,
          tgt.central ? StrL("central") : StrL("sibling"), nSkippedUnsupported);

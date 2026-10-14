@@ -1,7 +1,7 @@
 /* Copyright 2026 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
-// JSON sidecar persistence for annotations ("SeparateSave" mode).
+// Markdown sidecar persistence for annotations ("SeparateSave" mode).
 //
 // When SumatraPDF-settings.txt contains
 //
@@ -10,20 +10,20 @@
 //     CentralFolder = D:\notes\sidecar   (optional)
 //   ]
 //
-// annotations of a PDF are persisted as a JSON file next to the PDF
-// (<pdf name>.json, "sibling") or, when no sibling file exists, inside
-// <CentralFolder>/<pdf parent folder name>/<pdf name without ext>.json
+// annotations of a PDF are persisted as a Markdown file next to the PDF
+// (<pdf name>.md, "sibling") or, when no sibling file exists, inside
+// <CentralFolder>/<pdf parent folder name>/<pdf name without ext>.md
 // ("central"). The PDF itself is never modified.
 //
 // Loading order mirrors the companion PDF-XChange scripts: sibling first,
 // then central. Saving resolves the target the same way, so both stay
 // consistent without extra per-tab state.
 //
-// With Annotations->SeparateSaveAsMd the same data is stored as Markdown:
-// annotations become Obsidian-style callouts and everything else in the
-// file is preserved verbatim for the user's own notes. Import prefers the
-// .md file and falls back to .json (a legacy .json is never rewritten);
-// see the "Markdown sidecar" section in Sidecar.cpp for the format.
+// Annotations become Obsidian-style callouts and everything else in the
+// file is preserved verbatim for the user's own notes; see the "Markdown
+// sidecar" section in Sidecar.cpp for the format. A .json sidecar written
+// by an older version is still imported, read-only: the next save writes
+// the .md and leaves the .json alone.
 //
 // Schema (version 2), one file per document:
 //
@@ -57,21 +57,24 @@
 //   creationDate / modDate   ISO-8601 UTC ("2026-09-28T12:00:00Z")
 //   flags        PDF annotation flags bits (print|nozoom|...)
 //
-// Stamp (image) and FileAttachment annotations carry binary payloads.
-// The JSON never holds binary data: payloads are written as
-// <json dir>/assets/<fnv1a-64-hex>.<ext> (content-addressed, deduped) and
-// referenced by "asset" ("assets/<hex>.<ext>", relative to the JSON, so
-// pdf+json+assets move together). Attachment metadata lives in an
+// Stamp (image) and FileAttachment annotations carry binary payloads, but
+// a payload is optional: a stamp without an image (a rubber stamp) and a
+// file attachment that was dropped but never given a file both save as-is
+// and are restored as such - the hollow file attachment is then filled in
+// with Attach File. Payloads are written as <sidecar dir>/assets/
+// <fnv1a-64-hex>.<ext> (content-addressed, deduped) and referenced by
+// "asset" ("assets/<hex>.<ext>", relative to the sidecar, so
+// pdf+sidecar+assets move together). Attachment metadata lives in an
 // "attachment" object (filename/mimeType/size/created/modified). On save
 // asset files that no sidecar in the folder references anymore are
 // deleted. Version 1 files (no asset fields) still parse.
 //
-// Why JSON and not XFDF: XFDF interop between viewers is de-facto, not
-// de-jure (quad ordering differs between implementations, richtext
-// contents are non-uniform, PDF-XChange itself loses/garbles some fields
-// on re-import). JSON keeps the format under our control while the
-// migration story stays "save back into the PDF" (disable SeparateSave,
-// reopen, save normally).
+// Why our own format and not XFDF: XFDF interop between viewers is
+// de-facto, not de-jure (quad ordering differs between implementations,
+// richtext contents are non-uniform, PDF-XChange itself loses/garbles
+// some fields on re-import). Our own format stays under our control while
+// the migration story stays "save back into the PDF" (disable
+// SeparateSave, reopen, save normally).
 //
 // All logic lives in Sidecar.cpp. Integration points in existing files are
 // marked with "// SIDECAR:" so the change stays easy to re-apply after
@@ -92,7 +95,7 @@ void SidecarNotifyAnnotsChanged(EngineBase* engine);
 
 enum class SidecarResult {
     NotHandled, // feature off or engine is not a mupdf PDF: caller uses the normal path
-    Saved,      // JSON written (or nothing to write)
+    Saved,      // sidecar written (or nothing to write)
     Failed,     // writing failed (error already reported to the user)
 };
 
@@ -103,11 +106,12 @@ bool SidecarSeparateSaveEnabled();
 bool SidecarWantsRedirect(EngineBase* engine);
 
 // called right after a document engine has been created and before it is
-// displayed: imports the JSON sidecar into the engine (sibling first, then
-// central). Never marks the document as modified.
+// displayed: imports the sidecar into the engine (sibling first, then
+// central; a .json from an older version is imported too). Never marks the
+// document as modified.
 void SidecarMaybeImport(EngineBase* engine);
 
-// write the JSON sidecar for the tab's document; also clears the "modified"
+// write the sidecar for the tab's document; also clears the "modified"
 // state on success (like the PDF annotation save does). With allowCreate
 // false, an existing sidecar file is updated but no new file is created
 // (used by the debounced auto-save). With forceOverwrite true, the external

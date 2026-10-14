@@ -796,17 +796,16 @@ struct Annotations {
     // Windows user name is used; set it to (none) to leave the author out
     // entirely
     Str defaultAuthor;
-    // if true, annotations are saved as a separate JSON file next to the
-    // PDF (or under CentralFolder) instead of inside the PDF; the PDF is
-    // never modified
+    // if true, annotations are saved as a separate Markdown (.md) file
+    // next to the PDF (or under CentralFolder) instead of inside the PDF;
+    // the PDF is never modified. Annotations are stored as Obsidian-style
+    // callouts and everything else in the file is preserved for your own
+    // notes. A .json sidecar written by an older version is still
+    // imported, but never written again
     bool separateSave;
-    // if true, sidecar files are Markdown (.md) instead of JSON:
-    // annotations are stored as Obsidian-style callouts and everything
-    // else in the file is preserved for your own notes
-    bool separateSaveAsMd;
-    // central folder for JSON annotation files, used when no such file
-    // exists next to the PDF: the file is looked up in
-    // <CentralFolder>/<pdf parent folder name>/<pdf name>.json
+    // central folder for annotation files, used when no such file exists
+    // next to the PDF: the file is looked up in <CentralFolder>/<pdf
+    // parent folder name>/<pdf name>.md
     Str centralFolder;
     // image (e.g. a transparent .png of your signature) that Sign With
     // Image stamps on the page. If not set, or the file is missing, Sign

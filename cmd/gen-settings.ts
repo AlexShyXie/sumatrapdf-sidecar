@@ -1013,22 +1013,17 @@ const annotations: Field[] = [
     "SeparateSave",
     Bool,
     false,
-    "if true, annotations are saved as a separate JSON file next to the PDF (or under CentralFolder) instead of " +
-      "inside the PDF; the PDF is never modified",
-  ),
-  field(
-    "SeparateSaveAsMd",
-    Bool,
-    false,
-    "if true, sidecar files are Markdown (.md) instead of JSON: annotations are stored as Obsidian-" +
-      "style callouts and everything else in the file is preserved for your own notes",
+    "if true, annotations are saved as a separate Markdown (.md) file next to the PDF (or under CentralFolder) " +
+      "instead of inside the PDF; the PDF is never modified. Annotations are stored as Obsidian-style callouts and " +
+      "everything else in the file is preserved for your own notes. A .json sidecar written by an older version is " +
+      "still imported, but never written again",
   ),
   field(
     "CentralFolder",
     Str,
     "",
-    "central folder for JSON annotation files, used when no such file exists next to the PDF: the file is looked up " +
-      "in <CentralFolder>/<pdf parent folder name>/<pdf name>.json",
+    "central folder for annotation files, used when no such file exists next to the PDF: the file is looked up " +
+      "in <CentralFolder>/<pdf parent folder name>/<pdf name>.md",
   ),
   field(
     "SignatureImage",
