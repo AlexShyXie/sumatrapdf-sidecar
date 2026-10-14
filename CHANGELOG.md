@@ -14,40 +14,17 @@ release notes. A tag without a matching section fails the build.
 
 ### Annotation sidecar changes
 
-- **Empty file attachments are now persisted.** A FileAttachment annotation
-  placed without a file attached ("empty paperclip") is saved to the sidecar
-  and restored after reopening — position, icon, contents and timestamps
-  are kept. Use *Attach File* in the annotation toolbar to add the file
-  later. Attachments whose embedded file exists but cannot be extracted are
-  still skipped and reported as `(N skipped)`, so real data loss is never
-  silently converted into an empty icon.
-- **Markdown is now the only sidecar format.** Saving always produces a
-  `.md` file (Obsidian-style callouts), editable directly in Obsidian.
-  The `.md` format is no longer experimental.
-- **Legacy `.json` sidecars: read-only fallback.** Existing `.json`
-  sidecars are still imported when opening a PDF, but are never written
-  again and are left untouched — the next save creates a sibling `.md`
-  file. No data is lost during the transition.
-- **Removed setting:** `Annotations.separateSaveAsMd`. With Markdown as
-  the only format this switch has no effect. `Annotations.separateSave`
-  is unchanged and still controls whether the sidecar feature is enabled.
-
+- **Empty file attachments are now persisted.** A FileAttachment annotation   placed without a file attached ("empty paperclip") is saved to the sidecar   and restored after reopening — position, icon, contents and timestamps   are kept. Use *Attach File* in the annotation toolbar to add the file   later. Attachments whose embedded file exists but cannot be extracted are   still skipped and reported as `(N skipped)`, so real data loss is never   silently converted into an empty icon.
+- **Markdown is now the only sidecar format.** Saving always produces a    `.md` file (Obsidian-style callouts), editable directly in Obsidian.    The `.md` format is no longer experimental.
+- **Legacy `.json` sidecars: read-only fallback.** Existing `.json`    sidecars are still imported when opening a PDF, but are never written    again and are left untouched — the next save creates a sibling `.md`    file. No data is lost during the transition.
+- **Removed setting:** `Annotations.separateSaveAsMd`. With Markdown as    the only format this switch has no effect. `Annotations.separateSave`    is unchanged and still controls whether the sidecar feature is enabled.  
+- 
 ### 批注 sidecar 变更
 
-- **空文件附件现在会被持久化。** 放下了 FileAttachment 注解但尚未挂文件的
-  「空回形针」会正常写入 sidecar 并在重开文档后还原——位置、图标、内容
-  与时间戳全部保留。之后可通过注解工具栏的 *Attach File* 随时补挂文件。
-  嵌入文件存在但读取失败的附件仍会跳过并计入 `(N skipped)`，避免把真实的
-  数据丢失静默保存成一个空图标。
-- **Markdown 成为唯一的 sidecar 格式。** 保存一律产出 `.md` 文件
-  （Obsidian 风格 callout），可在 Obsidian 中直接编辑。
-  `.md` 格式不再是「实验性」。
-- **旧 `.json` sidecar：只读回退。** 打开 PDF 时仍会导入已有的 `.json`
-  sidecar，但不再写出该格式，原文件保留不动——下次保存会生成同名的
-  `.md` 文件，迁移过程零数据丢失。
-- **删除设置项：** `Annotations.separateSaveAsMd`。Markdown 成为唯一格式后
-  该开关已无意义。`Annotations.separateSave` 保持不变，仍单独控制 sidecar
-  功能开关。
+- **空文件附件现在会被持久化。** 放下了 FileAttachment 注解但尚未挂文件的  「空回形针」会正常写入 sidecar 并在重开文档后还原——位置、图标、内容  与时间戳全部保留。之后可通过注解工具栏的 *Attach File* 随时补挂文件。  嵌入文件存在但读取失败的附件仍会跳过并计入 `(N skipped)`，避免把真实的  数据丢失静默保存成一个空图标。
+- **Markdown 成为唯一的 sidecar 格式。** 保存一律产出 `.md` 文件  （Obsidian 风格 callout），可在 Obsidian 中直接编辑。  `.md` 格式不再是「实验性」。
+- **旧 `.json` sidecar：只读回退。** 打开 PDF 时仍会导入已有的 `.json`  sidecar，但不再写出该格式，原文件保留不动——下次保存会生成同名的  `.md` 文件，迁移过程零数据丢失。
+- **删除设置项：** `Annotations.separateSaveAsMd`。Markdown 成为唯一格式后该开关已无意义。`Annotations.separateSave` 保持不变，仍单独控制 sidecar 功能开关。
 
 
 ## v3.7-sidecar.4

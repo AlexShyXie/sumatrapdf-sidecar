@@ -454,6 +454,8 @@ struct VirtListBox : VirtCtrl {
     // Shift/Ctrl click, Shift+arrows and Ctrl+A; off by default so other
     // lists stay single-select
     bool multiSelect = false;
+    // the dashed outline while the list has the keys
+    bool showFocusRing = true;
 
     VirtListBox();
     ~VirtListBox() override;
@@ -700,19 +702,6 @@ struct VirtButton : VirtText {
 };
 
 VirtButton* AsVirtButton(ILayout*);
-
-// the buttons of the redrawn dialogs: the one action filled with the text
-// color, Cancel outlined, the quiet ones plain words that fill on hover
-enum class DlgButtonStyle {
-    Filled,
-    Outline,
-    Ghost
-};
-VirtButton* NewDlgButton(HWND hwndForDpi, Str text, PlatformFont* font, DlgButtonStyle style, bool isDefault);
-// a filled button goes pale while disabled
-void SetDlgButtonEnabled(VirtButton* b, DlgButtonStyle style, bool enabled);
-// the dialogs' UI font at `px`
-PlatformFont* DlgUiFont(int px);
 
 struct VirtIconButton : VirtCtrl {
     // not owned; in SumatraPDF it comes from GetCachedPixmapForSvg()
