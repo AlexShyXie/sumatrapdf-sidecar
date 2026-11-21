@@ -9,6 +9,7 @@
 #include "base/Win.h"
 #include "gui/PlatformFont.h"
 #include "gui/PlatformText.h"
+#include "gui/Dpi.h"
 
 #include "gui/UIModels.h"
 
@@ -23,6 +24,8 @@
 #include "PdfPreview.h"
 
 constexpr Color kColWindowBg = MkRgb(0x99, 0x99, 0x99);
+constexpr Color kColPageNoBg = MkRgb(0x33, 0x33, 0x33);
+constexpr Color kColPageNoText = MkRgb(0xff, 0xff, 0xff);
 constexpr int kPreviewMargin = 2;
 constexpr UINT kUwmPaintAgain = (WM_USER + 101);
 // Engine-scale zoom (1 = 100%). Below fit-page we snap back to fit.
@@ -270,7 +273,19 @@ class PageRenderer {
         BlitPixmapRegion(bmp, hdc, dst, src);
     }
 
+    // Once pr->thread is null nothing waits for this thread, so the host may
+    // unload the DLL while it still runs: hold a module ref until it exits.
     static DWORD WINAPI RenderThread(LPVOID data) {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)&RenderThread, &self);
+        RenderThreadBody(data);
+        if (self) {
+            FreeLibraryAndExitThread(self, 0);
+        }
+        return 0;
+    }
+
+    static void RenderThreadBody(LPVOID data) {
         log(StrL("PageRenderer::RenderThread started\n"));
         AutoCoUninitialize comScope; // because the engine reads data from a COM IStream
 
@@ -281,6 +296,7 @@ class PageRenderer {
 
         AbortCookie* toDelete = nullptr;
         ThreadHandle th = nullptr;
+        HWND hwnd = nullptr;
         {
             AutoUnlockMutex scope(&pr->currAccess);
             if (bmp && !pr->reqAbort) {
@@ -295,16 +311,17 @@ class PageRenderer {
             toDelete = pr->abortCookie;
             pr->abortCookie = nullptr;
 
+            // once thread is null ~PageRenderer won't wait for us, so don't touch pr after this
             th = pr->thread;
             pr->thread = nullptr;
+            hwnd = pr->hwnd;
         }
         delete toDelete;
 
-        PostMessageW(pr->hwnd, kUwmPaintAgain, 0, 0);
+        PostMessageW(hwnd, kUwmPaintAgain, 0, 0);
 
         SafeCloseThreadHandle(&th);
         DestroyTempArena();
-        return 0;
     }
 };
 
@@ -410,6 +427,40 @@ static PreviewLayout ComputePreviewLayout(HWND hwnd, PdfPreview* preview, int pa
     return lo;
 }
 
+// "3 / 120" in the bottom-right corner: shows the page count without opening the file
+static void DrawPageNumber(HWND hwnd, HDC hdc, Rect client) {
+    SCROLLINFO si{};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_POS | SIF_RANGE;
+    if (!GetScrollInfo(hwnd, SB_VERT, &si)) {
+        return;
+    }
+    NONCLIENTMETRICS ncm{};
+    if (!GetNonClientMetricsForDpi(DpiGetForHwnd(hwnd), &ncm)) {
+        return;
+    }
+
+    TempStr s = fmt("%d / %d", si.nPos, si.nMax);
+    HFONT font = CreateFontIndirectW(&ncm.lfMessageFont);
+    uint format = DT_SINGLELINE | DT_NOPREFIX;
+    Size sz = HdcMeasureText(hdc, s, client.dx, format, font);
+    int pad = sz.dy / 4;
+    int dx = sz.dx + 4 * pad;
+    int dy = sz.dy + 2 * pad;
+    Rect r(client.x + client.dx - dx - 2 * pad, client.y + client.dy - dy - 2 * pad, dx, dy);
+
+    HBRUSH brush = CreateSolidBrush(kColPageNoBg);
+    HdcFillRect(hdc, r, brush);
+    DeleteObject(brush);
+
+    int prevMode = SetBkMode(hdc, TRANSPARENT);
+    COLORREF prevCol = SetTextColor(hdc, kColPageNoText);
+    HdcDrawText(hdc, s, r, format | DT_CENTER | DT_VCENTER, font);
+    SetTextColor(hdc, prevCol);
+    SetBkMode(hdc, prevMode);
+    DeleteObject(font);
+}
+
 static LRESULT OnPaint(HWND hwnd) {
     Rect rect = HwndClientRect(hwnd);
     DoubleBuffer buffer(hwnd, rect);
@@ -427,6 +478,7 @@ static LRESULT OnPaint(HWND hwnd) {
             HdcFillRect(hdc, lo.visible, brushWhite);
             preview->renderer->Render(hdc, lo, pageNo);
         }
+        DrawPageNumber(hwnd, hdc, rect);
     }
 
     DeleteObject(brushBg);
@@ -644,6 +696,8 @@ static LRESULT OnDestroy(HWND hwnd) {
     return 0;
 }
 
+static const WCHAR* kPreviewWndClass = L"SumatraPDF_PreviewPane";
+
 static LRESULT CALLBACK PreviewWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     PdfPreview* preview = PreviewFromHwnd(hwnd);
     switch (msg) {
@@ -708,6 +762,10 @@ static LRESULT CALLBACK PreviewWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
+void UnregisterPreviewWndClass() {
+    UnregisterClassW(kPreviewWndClass, GetInstance());
+}
+
 IFACEMETHODIMP PdfPreview::DoPreview() {
     log(StrL("PdfPreview::DoPreview()\n"));
 
@@ -715,12 +773,17 @@ IFACEMETHODIMP PdfPreview::DoPreview() {
     wcex.cbSize = sizeof(wcex);
     wcex.lpfnWndProc = PreviewWndProc;
     wcex.hCursor = GetCachedCursor(IDC_ARROW);
-    wcex.lpszClassName = L"SumatraPDF_PreviewPane";
+    wcex.lpszClassName = kPreviewWndClass;
     wcex.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
-    RegisterClassEx(&wcex);
+    // owned by this DLL so it can be unregistered when the DLL unloads; a
+    // class left behind would point a reloaded DLL's windows at a stale proc
+    wcex.hInstance = GetInstance();
+    if (!RegisterClassEx(&wcex) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
 
-    m_hwnd = CreateWindow(wcex.lpszClassName, nullptr, WS_CHILD | WS_VSCROLL | WS_VISIBLE, m_rcParent.x, m_rcParent.x,
-                          m_rcParent.dx, m_rcParent.dy, m_hwndParent, nullptr, nullptr, nullptr);
+    m_hwnd = CreateWindow(wcex.lpszClassName, nullptr, WS_CHILD | WS_VSCROLL | WS_VISIBLE, m_rcParent.x, m_rcParent.y,
+                          m_rcParent.dx, m_rcParent.dy, m_hwndParent, nullptr, GetInstance(), nullptr);
     if (!m_hwnd) {
         return HRESULT_FROM_WIN32(GetLastError());
     }
@@ -860,6 +923,8 @@ EngineBase* PdfPreview::LoadEngine(const Str& data) {
             return CreateEngineCbxFromData(data);
         case PreviewType::Tga:
             return CreateEngineImageFromData(data);
+        case PreviewType::Ofd:
+            return CreateEngineMupdfFromData(data, StrL("foo.ofd"), nullptr);
     }
     return nullptr;
 }

@@ -81,9 +81,15 @@ void SetMsg(Str msg, Gdiplus::Color color) {
 // whether the previous installation registered the search filter / previewer
 void GetPrevInstallShellExt(PreviousInstallationInfo* info) {
     info->searchFilterInstalled = IsSearchFilterInstalled();
-    info->previewInstalled = IsPreviewInstalled();
-    logf("GetPrevInstallShellExt: search filter: %d, preview: %d\n", (int)info->searchFilterInstalled,
-         (int)info->previewInstalled);
+    PreviewHandlers ours = GetOurPreviewHandlers();
+    PreviewHandlers foreign = GetForeignPreviewHandlers();
+    info->previewInstalled = ours.preview != 0;
+    info->thumbnailsInstalled = ours.thumbnails != 0;
+    info->foreignPreview = foreign.preview;
+    info->foreignThumbnails = foreign.thumbnails;
+    logf("GetPrevInstallShellExt: search filter: %d, preview: %d, thumbnails: %d, foreign: 0x%x 0x%x\n",
+         (int)info->searchFilterInstalled, (int)info->previewInstalled, (int)info->thumbnailsInstalled, foreign.preview,
+         foreign.thumbnails);
 }
 
 static TempStr GetExistingInstallationFilePathTemp(Str name) {
@@ -131,10 +137,10 @@ void UnRegisterSearchFilter() {
 
 constexpr const char* kPreviewDllName = "PdfPreview.dll";
 
-void RegisterPreviewer(bool allUsers, Str installDir) {
+void RegisterPreviewer(bool allUsers, Str installDir, const PreviewHandlers& which) {
     TempStr dllPath = GetInstallationFilePathTemp(installDir, Str(kPreviewDllName));
     logf("RegisterPreviewer() dllPath=%s\n", dllPath);
-    bool ok = InstallPreviewDll(dllPath, allUsers);
+    bool ok = InstallPreviewDll(dllPath, allUsers, which);
     if (ok) {
         log(StrL("  did register\n"));
         return;
@@ -153,17 +159,6 @@ void UnRegisterPreviewer() {
     }
     log(StrL(" failed to unregister\n"));
     NotifyFailed(Tr("Couldn't uninstall PDF previewer"));
-}
-
-// Kill a process with given <processId> if it has a module (dll or exe) <modulePath>.
-// If <waitUntilTerminated> is true, will wait until process is fully killed.
-// Returns TRUE if killed a process
-bool KillProcWithIdAndModule(DWORD processId, Str modulePath, bool waitUntilTerminated) {
-    if (!IsProcWithModule(processId, modulePath)) {
-        return false;
-    }
-    logf("KillProcWithIdAndModule() processId=%d, modulePath=%s\n", processId, modulePath);
-    return KillProcWithId(processId, waitUntilTerminated);
 }
 
 // Kill processes that have any of our install-dir modules loaded:
@@ -231,7 +226,9 @@ void FreeInstallationFilesInUse(Str installDir, bool allUsers, ShellExtInstallSt
 
     ShellExtInstallState removed{};
     removed.searchFilter = IsSearchFilterInstalled();
-    removed.preview = IsPreviewInstalled();
+    PreviewHandlers ours = GetOurPreviewHandlers();
+    removed.ourPreview = ours.preview;
+    removed.ourThumbnails = ours.thumbnails;
     removed.allUsers = allUsers;
     if (installDir) {
         removed.installDir = str::Dup(installDir);
@@ -241,7 +238,7 @@ void FreeInstallationFilesInUse(Str installDir, bool allUsers, ShellExtInstallSt
         log(StrL("  unregistering search filter before file overwrite\n"));
         UninstallSearchFilter();
     }
-    if (removed.preview) {
+    if (removed.ourPreview || removed.ourThumbnails) {
         log(StrL("  unregistering previewer before file overwrite\n"));
         UninstallPreviewDll();
     }
@@ -272,13 +269,13 @@ void RestoreShellExtensions(const ShellExtInstallState& state) {
         log(StrL("RestoreShellExtensions: no installDir, skip\n"));
         return;
     }
-    logf("RestoreShellExtensions: filter=%d preview=%d allUsers=%d dir='%s'\n", (int)state.searchFilter,
-         (int)state.preview, (int)state.allUsers, state.installDir);
+    logf("RestoreShellExtensions: filter=%d preview=0x%x thumbnails=0x%x allUsers=%d dir='%s'\n",
+         (int)state.searchFilter, state.ourPreview, state.ourThumbnails, (int)state.allUsers, state.installDir);
     if (state.searchFilter) {
         RegisterSearchFilter(state.allUsers, state.installDir);
     }
-    if (state.preview) {
-        RegisterPreviewer(state.allUsers, state.installDir);
+    if (state.ourPreview || state.ourThumbnails) {
+        RegisterPreviewer(state.allUsers, state.installDir, {state.ourPreview, state.ourThumbnails});
     }
 }
 
@@ -576,4 +573,13 @@ void OnPaintFrame(HWND hwnd, bool skipMessage, VirtRoot* virt) {
         virt->Paint(&gfx, HwndClientRect(hwnd));
     }
     EndPaint(hwnd, &ps);
+}
+
+// WM_COMMAND handling shared by the installer and uninstaller windows: only Cancel, which exits
+bool InstallerWmCommand(WPARAM wp, void (*onExit)()) {
+    if (LOWORD(wp) != IDCANCEL) {
+        return false;
+    }
+    onExit();
+    return true;
 }

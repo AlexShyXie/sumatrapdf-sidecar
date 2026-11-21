@@ -29,6 +29,11 @@ bool IsFileSupportedByContent(Str filePath);
 TempStr NormalizeFuzzyTemp(Str str);
 bool MatchFuzzy(Str s1, Str s2, bool partially);
 bool IsRightDragging(MainWindow* win);
+void PopulateTabCloseFlags(AppCommandCtx& ctx);
 
 // implemented by each app
 void SelectTocItemInTree(MainWindow* win, TocItem* tocItem);
+
+// implemented by each app: its own AppCommandCtx fields; the annotation hovered at cursorPos
+void FillAppCommandCtx(AppCommandCtx& ctx, MainWindow* win);
+Annotation* AnnotationUnderCursor(MainWindow* win, DisplayModel* dm, Point cursorPos);

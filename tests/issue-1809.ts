@@ -13,7 +13,7 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ControlCommand, withControlledSumatra } from "./control.ts";
-import { EXE, ROOT, runStandalone, assemblePdf } from "./util.ts";
+import { EXE, ROOT, runStandalone, tmpPath, assemblePdf } from "./util.ts";
 
 const PDF = join(ROOT, "tests", "issue-1809.pdf");
 
@@ -65,12 +65,9 @@ export async function testit(): Promise<void> {
 
 if (import.meta.main) {
   writeFileSync(PDF, makeTransparentPdf());
-  const bugs = "C:\\Users\\kjk\\OneDrive\\!sumatra\\bugs\\bug-1809.pdf";
-  try {
-    writeFileSync(bugs, makeTransparentPdf());
-    console.log(`wrote ${PDF} and ${bugs}`);
-  } catch {
-    console.log(`wrote ${PDF}`);
-  }
+  // a copy to open by hand, named like the files of the bug folder
+  const bugs = tmpPath("bug-1809.pdf");
+  writeFileSync(bugs, makeTransparentPdf());
+  console.log(`wrote ${PDF} and ${bugs}`);
   await runStandalone(testit);
 }

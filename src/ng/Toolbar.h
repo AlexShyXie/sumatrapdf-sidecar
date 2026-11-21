@@ -49,7 +49,7 @@ struct Toolbar {
 
     // overlay mode: whether the floating bar is up and the hide countdown
     bool overlayShown = false;
-    int overlayHideLeftMs = 0;
+    Countdown overlayHide;
 
     // the hover drop-down: the button it is up for, the one the mouse is
     // resting on and how long is left before it opens. The anchor is the
@@ -61,9 +61,9 @@ struct Toolbar {
     // from the one already up. Crossing Zoom In / Zoom Out does not.
     int hoverGen = 0;
     int hoverPendingCmdId = 0;
-    int hoverOpenLeftMs = 0;
-    // > 0 while the open drop-down waits out orig's close grace
-    int hoverCloseLeftMs = 0;
+    Countdown hoverOpen;
+    // armed while the open drop-down waits out orig's close grace
+    Countdown hoverClose;
 
     ~Toolbar();
 };
@@ -74,7 +74,6 @@ void EnablePdfAnnotationsToolbar(MainWindow*);
 // the colors an annotation drop-down offers (Annotations.PresetColors, or
 // Annotations.InkColors for the ink button); cmdId 0 gets the presets
 void AnnotPresetColors(int cmdId, Vec<Color>& out);
-Color AnnotColorForCmd(int cmdId);
 void SetAnnotPresetColor(int cmdId, Color col);
 
 gpui::El* ToolbarBuild(MainWindow*, gpui::Ctx*);
@@ -101,6 +100,7 @@ void UpdateToolbarAfterThemeChange(MainWindow*);
 int ToolbarIconSize();
 // height the toolbar takes in the frame, 0 when it is hidden or floating
 int ToolbarDy(MainWindow*);
+int ToolbarDocTabDy(MainWindow*);
 // ng: orig's GetToolbarButtonScreenRect is in screen coordinates, for the
 // popup windows it anchors; here everything is drawn in the frame
 Rect GetToolbarButtonRect(MainWindow*, int cmdId);

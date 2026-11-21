@@ -32,6 +32,34 @@ bool HasPendingPreReleaseUpdate() {
     return gPendingUpdate != nullptr;
 }
 
+#if OS_WIN
+// Portable update: copy this process onto dstPath, relaunch it, and delete us.
+void UpdateSelfTo(Str dstPath, int sleepMs) {
+    ReportIf(len(dstPath) == 0);
+    if (!file::Exists(dstPath)) {
+        logf("UpdateSelfTo: failed because destination doesn't exist\n");
+        return;
+    }
+
+    logf("UpdateSelfTo: '%s', sleep for %d ms\n", dstPath, sleepMs);
+    // the launcher must exit before we overwrite it
+    SleepInMs(sleepMs);
+
+    TempStr srcPath = GetSelfExePathTemp();
+    bool ok = file::OverwriteAtomicRetry(dstPath, srcPath, 20, 250);
+    if (!ok) {
+        logf("UpdateSelfTo: failed to overwrite '%s' with '%s'\n", dstPath, srcPath);
+        return;
+    }
+    logf("UpdateSelfTo: copied self to '%s'\n", dstPath);
+
+    TempStr args = fmt(R"(-sleep-ms 500 -delete-file "%s")", srcPath);
+    CreateProcessHelper(dstPath, args);
+}
+#else
+void UpdateSelfTo(Str, int) {}
+#endif
+
 bool IsTrustedUpdateDlUrl(Str dlURL) {
     return str::StartsWith(dlURL, kExpectedDlHost);
 }
@@ -91,6 +119,19 @@ UpdateInfo* ParseUpdateInfo(Str d) {
     res->portable32 = str::Dup(node->GetValue(StrL("PortableExe32")));
     res->downloadPage = str::Dup(node->GetValue(StrL("DownloadPage")));
 
+#if OS_DARWIN
+    // ng: a mac build replaces itself with the .zip of its architecture:
+    // ZipArm64 / ZipX64, ZipArm64Sha256 / ZipX64Sha256; DmgArm64 / DmgX64 is
+    // what the browser gets when we can't
+    Str arch = IsArmBuild() ? StrL("Arm64") : StrL("X64");
+    res->dlURL = str::Dup(node->GetValue(fmt("Zip%s", arch)));
+    res->dlSha256 = str::Dup(node->GetValue(fmt("Zip%sSha256", arch)));
+    Str dmg = node->GetValue(fmt("Dmg%s", arch));
+    if (len(dmg) > 0) {
+        str::ReplaceWithCopy(&res->downloadPage, dmg);
+    }
+#else
+
     // figure out which executable to download
     Str dlURL;
     bool isDll = IsDllBuild();
@@ -102,5 +143,28 @@ UpdateInfo* ParseUpdateInfo(Str d) {
         dlURL = isDll ? res->installer32 : res->portable32;
     }
     res->dlURL = str::Dup(dlURL);
+#endif
     return res;
+}
+
+// gathers the facts DecideUpdateCheck needs from settings and permissions
+bool ShouldCheckForUpdate(UpdateCheck updateCheckType, bool inProgress) {
+    UpdateCheckFacts f;
+    f.inProgress = inProgress;
+    // when forcing, we download pre-release, which shows a greater version
+    // than our build, so only a user-initiated check may download it
+#ifdef FORCE_AUTO_UPDATE
+    f.forcePreReleaseOnly = true;
+#endif
+    f.userInitiated = updateCheckType == UpdateCheck::UserInitiated;
+    f.hasInternet = HasPermission(Perm::InternetAccess);
+    f.canSavePrefs = HasPermission(Perm::SavePreferences);
+    f.checkForUpdates = gSettings->checkForUpdates;
+    FILETIME never{};
+    f.firstStart = FileTimeEq(gSettings->timeOfLastUpdateCheck, never);
+    f.isPreRelease = gIsPreReleaseBuild;
+    FILETIME currentTimeFt;
+    GetSystemTimeAsFileTime(&currentTimeFt);
+    f.secsSinceLast = FileTimeDiffInSecs(currentTimeFt, gSettings->timeOfLastUpdateCheck);
+    return DecideUpdateCheck(f) == UpdateCheckChoice::Check;
 }

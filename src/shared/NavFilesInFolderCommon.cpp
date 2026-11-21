@@ -15,6 +15,20 @@
 #include "NavFilesInFolder.h"
 #include "NavFilesInFolderCommon.h"
 
+// entry display name without a trailing path separator (dirs use "name\\")
+Str NavEntryBaseName(const NavFileEntry& e) {
+    Str name = e.name;
+    if (!e.isDir || len(name) < 2) {
+        return name;
+    }
+    // a directory's name ends with "\\", which is not a separator off Windows
+    char last = name.s[len(name) - 1];
+    if (last == '\\' || path::IsSep(last)) {
+        return Str(name.s, len(name) - 1);
+    }
+    return name;
+}
+
 void FreeNavEntry(NavFileEntry& e) {
     str::Free(e.name);
     str::Free(e.path);
@@ -160,4 +174,25 @@ void CollectHomeEntries(Vec<NavFileEntry>& out) {
     for (int i = 0; i < len(files); i++) {
         AppendHomeFileEntry(out, files[i]);
     }
+}
+
+// dirs visited ("" for home), kept for the whole session so a re-opened
+// window can still go Back to where the previous one was
+StrVec gNavHistory;
+int gNavHistIdx = -1;
+
+// record dir in the session history, dropping the forward entries
+void NavHistoryPush(Str dir) {
+    bool same = gNavHistIdx >= 0 && str::EqI(gNavHistory[gNavHistIdx], dir);
+    if (same) {
+        return;
+    }
+    while (len(gNavHistory) > gNavHistIdx + 1) {
+        gNavHistory.RemoveAt(len(gNavHistory) - 1);
+    }
+    if (len(gNavHistory) >= kNavHistoryMax) {
+        gNavHistory.RemoveAt(0);
+    }
+    gNavHistory.Append(dir);
+    gNavHistIdx = len(gNavHistory) - 1;
 }

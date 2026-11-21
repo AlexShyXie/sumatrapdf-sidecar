@@ -67,6 +67,12 @@ static LRESULT CALLBACK PlatformWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
     if (!window) {
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
+    // destroyed by Windows (e.g. with its owner): the destructor must not destroy a recycled HWND
+    if (msg == WM_NCDESTROY) {
+        window->native = nullptr;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
 
     switch (msg) {
         case WM_ERASEBKGND:
@@ -174,40 +180,11 @@ void PlatformWindow::Invalidate() {
     HwndInvalidate(native, false);
 }
 
-static LPWSTR CursorName(CursorId id) {
-    switch (id) {
-        case CursorId::Arrow:
-            return IDC_ARROW;
-        case CursorId::IBeam:
-            return IDC_IBEAM;
-        case CursorId::Hand:
-            return IDC_HAND;
-        case CursorId::Cross:
-            return IDC_CROSS;
-        case CursorId::Move:
-            return IDC_SIZEALL;
-        case CursorId::SizeNS:
-            return IDC_SIZENS;
-        case CursorId::SizeWE:
-            return IDC_SIZEWE;
-        case CursorId::No:
-            return IDC_NO;
-        case CursorId::None:
-            return nullptr;
-    }
-    return nullptr;
-}
-
 void PlatformWindow::SetCursor(CursorId id) {
-    LPWSTR name = CursorName(id);
+    LPWSTR name = ToWin32Cursor(id);
     if (name) {
         SetCursorCached(name);
     }
-}
-
-void PlatformWindow::BeginMove(const PlatformPointerEvent&) {
-    ReleaseCapture();
-    SendMessageW(native, WM_NCLBUTTONDOWN, HTCAPTION, 0);
 }
 
 Rect PlatformWindowRect(NativeWnd native) {
@@ -231,8 +208,4 @@ void PlatformWindowActivateIfForeground(NativeWnd native) {
     if (!fg || fg == native) {
         SetActiveWindow(native);
     }
-}
-
-void PlatformPostTask(const Func0& fn) {
-    uitask::Post(fn, "PlatformWindowTask");
 }

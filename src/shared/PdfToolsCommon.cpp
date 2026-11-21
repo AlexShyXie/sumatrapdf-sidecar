@@ -20,6 +20,7 @@
 #include "SumatraPDF.h"
 #include "SumatraConfig.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Translations.h"
 #include "Flags.h"
@@ -37,6 +38,12 @@ extern "C" int muconvert_main(int argc, char** argv);
 extern "C" void fz_set_optind(int val);
 
 // a usable page range: Delete Pages cannot take every page
+// the value of -p for a tool re-opening srcPath, the current tab's file
+char* PdfToolPasswordTemp(MainWindow* win, Str srcPath) {
+    WindowTab* tab = win ? win->CurrentTab() : nullptr;
+    return CStrTemp(EngineMupdfToolPasswordTemp(tab ? tab->GetEngine() : nullptr, srcPath));
+}
+
 bool PageRangeOk(Str s, int pageCount, bool isExtract, Vec<int>& pages) {
     if (!ParseDeletePages(s, pageCount, pages)) {
         return false;
@@ -248,6 +255,18 @@ TempStr DefaultPdfDestPathTemp(Str srcPath) {
     return MakeUniqueFilePathTemp(pdfPath);
 }
 
+// Extract Pages from XPS, EPUB, ... (IsMupdfNonPdfDoc): the pages of the open
+// document as laid out, written to a new PDF (#6509)
+bool ExtractPagesToNewPdf(WindowTab* tab, const Vec<int>& pages, Str destPath) {
+    if (!IsMupdfNonPdfDoc(tab)) {
+        return false;
+    }
+    // the destination folder may not exist yet (issue #6424)
+    dir::CreateForFile(destPath);
+    logf("ExtractPagesToNewPdf: %d pages from '%s' to '%s'\n", len(pages), tab->filePath, destPath);
+    return EngineMupdfExtractPagesToPdf(tab->GetEngine(), pages, destPath);
+}
+
 // Same conversion as File → Convert to PDF (issue #4118).
 bool ConvertImageCollectionToPdf(EngineBase* engine, Str destPath) {
     if (!engine || !engine->isImageCollection || len(destPath) == 0) {
@@ -256,19 +275,62 @@ bool ConvertImageCollectionToPdf(EngineBase* engine, Str destPath) {
 
     TempStr producer = fmt("SumatraPDF %s", currentVersion);
     PdfCreator::SetProducerName(producer);
-    // Formats PDF cannot re-wrap (WebP, JXL, HEIC, AVIF, TGA, …): decode via
-    // the same codecs we use for viewing, then PNG + zopfli before embed.
-    auto toOptimizedPng = [](Str data) -> Str {
-        Pixmap* px = PixmapFromData(data);
-        if (!px) {
-            logf("ConvertToPdf: decode-to-pixmap failed (%d bytes)\n", len(data));
+    return PdfCreator::SaveImageCollectionAsPdf(destPath, engine);
+}
+
+// 0 if not a usable font size
+int EbookPdfFontSizeFromText(Str s) {
+    str::TrimWsBoth(s);
+    int n = ParseInt(s);
+    if (n < 1 || n > kEbookPdfMaxFontSize) {
+        return 0;
+    }
+    return n;
+}
+
+// why caj2pdf failed for this file, {} if it didn't
+TempStr CajErrorReasonTemp(Str path) {
+    u32 code = 0;
+    switch (GetCajError(path, &code)) {
+        case CajError::None:
             return {};
+        case CajError::NoConverter:
+            return str::DupTemp(Tr("Opening CAJ files needs the caj2pdf converter"));
+        case CajError::DownloadFailed:
+            return str::DupTemp(Tr("Downloading the caj2pdf converter failed"));
+        case CajError::ConverterDidNotRun:
+            return fmt(Tr("The caj2pdf converter failed to run (error 0x%x)").s, code);
+        case CajError::ConversionFailed:
+            return fmt(Tr("The caj2pdf converter couldn't convert this file (exit code %d)").s, (int)code);
+        case CajError::TimedOut:
+            return str::DupTemp(Tr("The caj2pdf converter took too long"));
+    }
+    return {};
+}
+
+// Convert EPUB to PDF on the current document without its dialog. Used by
+// tests/convert-epub-to-pdf.ts
+TempStr ConvertEpubToPdfResultTemp(Str destPath, int pageSizeIdx, int fontSize, int* exitCodeOut) {
+    auto finish = [&](int code, TempStr s) -> TempStr {
+        if (exitCodeOut) {
+            *exitCodeOut = code;
         }
-        Str png = EncodeAndOptimizePngFromPixmap(px);
-        FreePixmap(px);
-        return png;
+        return s;
     };
-    return PdfCreator::SaveImageCollectionAsPdf(destPath, engine, toOptimizedPng);
+    MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
+    WindowTab* tab = win ? win->CurrentTab() : nullptr;
+    if (!IsEpubDoc(tab)) {
+        return finish(2, str::DupTemp(StrL("NOTREADY no-epub")));
+    }
+    if (pageSizeIdx < 0 || pageSizeIdx >= dimofi(kEbookPdfPageSizes) || fontSize < 1) {
+        return finish(1, str::DupTemp(StrL("ERROR bad-args")));
+    }
+    const EbookPdfPageSize& ps = kEbookPdfPageSizes[pageSizeIdx];
+    int n = EngineMupdfEbookToPdf(tab->filePath, destPath, ps.dx, ps.dy, (float)fontSize);
+    if (n == 0) {
+        return finish(1, str::DupTemp(StrL("ERROR convert-failed")));
+    }
+    return finish(0, fmt("OK pages=%d", n));
 }
 
 TempStr ConvertImageCollectionToPdfResultTemp(Str srcPath, Str destPath, int* exitCodeOut) {
@@ -285,7 +347,9 @@ TempStr ConvertImageCollectionToPdfResultTemp(Str srcPath, Str destPath, int* ex
     if (!engine) {
         return finish(1, str::DupTemp(StrL("ERROR engine-create-failed")));
     }
-    bool ok = ConvertImageCollectionToPdf(engine, destPath);
+    // as the Convert to PDF dialog: OFD as vector pages
+    bool ok = EngineMupdfIsOfd(engine) ? EngineMupdfSaveAsPdf(engine, destPath)
+                                       : ConvertImageCollectionToPdf(engine, destPath);
     SafeEngineRelease(&engine);
     if (!ok) {
         return finish(1, str::DupTemp(StrL("ERROR convert-failed")));
@@ -317,6 +381,12 @@ TempStr ExtractPdfPagesResultTemp(Str destPath, Str pagesSpec, int annotsOnly, i
     if (!ParseDeletePages(pagesSpec, pageCount, parsedPages)) {
         return finish(1, str::DupTemp(StrL("ERROR bad-pages")));
     }
+    if (IsMupdfNonPdfDoc(tab)) {
+        if (!ExtractPagesToNewPdf(tab, parsedPages, destPath)) {
+            return finish(1, str::DupTemp(StrL("ERROR extract")));
+        }
+        return finish(0, str::DupTemp(StrL("OK")));
+    }
     if (annotsOnly) {
         if (!KeepOnlyPagesWithAnnotations(engine, parsedPages)) {
             return finish(1, str::DupTemp(StrL("ERROR annots")));
@@ -335,11 +405,15 @@ TempStr ExtractPdfPagesResultTemp(Str destPath, Str pagesSpec, int annotsOnly, i
         }
         inputPath = tmpPath;
     }
-    char* argv[] = {(char*)"clean",      (char*)"-gggg",     (char*)"-e",        (char*)"100",
-                    (char*)"-f",         (char*)"-i",        (char*)"-t",        (char*)"-Z",
-                    CStrTemp(inputPath), CStrTemp(destPath), CStrTemp(pageRange)};
+    dir::CreateForFile(destPath);
+    char* argv[] = {
+        (char*)"clean",     (char*)"-p",         CStrTemp(EngineMupdfToolPasswordTemp(engine, tab->filePath)),
+        (char*)"-gggg",     (char*)"-e",         (char*)"100",
+        (char*)"-f",        (char*)"-i",         (char*)"-t",
+        (char*)"-Z",        CStrTemp(inputPath), CStrTemp(destPath),
+        CStrTemp(pageRange)};
     fz_set_optind(0);
-    int res = pdfclean_main(11, argv);
+    int res = pdfclean_main(dimofi(argv), argv);
     if (tmpPath) {
         file::Delete(tmpPath);
     }
@@ -381,19 +455,35 @@ bool EstimateSelectionPx(RectF rect, float zoom, int& w, int& h) {
     return w > 0 && h > 0;
 }
 
+const ConvertImageFormat kConvertImageFormats[kConvertImageFormatCount] = {
+    {StrL("PNG"), StrL(".png")},
+    {StrL("JPEG"), StrL(".jpg")},
+    {StrL("BMP"), StrL(".bmp")},
+    {StrL("GIF"), StrL(".gif")},
+};
+constexpr int kConvertImageJpegIdx = 1;
+
+// index into kConvertImageFormats for path's extension, -1 if none
+static int FindConvertImageFormat(Str path) {
+    if (str::EndsWithI(path, StrL(".jpeg"))) {
+        return kConvertImageJpegIdx;
+    }
+    for (int i = 0; i < kConvertImageFormatCount; i++) {
+        if (str::EndsWithI(path, kConvertImageFormats[i].ext)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// index into kConvertImageFormats for path, PNG when the extension is unknown
 int ConvertImageFormatIdxFromPath(Str path) {
-    if (str::EndsWithI(path, StrL(".jpg")) || str::EndsWithI(path, StrL(".jpeg"))) {
-        return 1;
-    }
-    if (str::EndsWithI(path, StrL(".bmp"))) {
-        return 2;
-    }
-    return 0; // PNG
+    int idx = FindConvertImageFormat(path);
+    return idx < 0 ? 0 : idx;
 }
 
 bool IsSupportedConvertImageExt(Str path) {
-    return str::EndsWithI(path, StrL(".png")) || str::EndsWithI(path, StrL(".jpg")) ||
-           str::EndsWithI(path, StrL(".jpeg")) || str::EndsWithI(path, StrL(".bmp"));
+    return FindConvertImageFormat(path) >= 0;
 }
 
 bool PathHasPagePlaceholder(Str path) {
@@ -433,6 +523,56 @@ static TempStr ReplacePagePlaceholderTemp(Str path, int pageNo) {
         s = str::ReplaceTemp(s, StrL("<n>"), n);
     }
     return s;
+}
+
+// the template ConvertPagesToImages writes: with an image extension and, for
+// more than one page, <N>
+static TempStr ImagesTemplateTemp(Str templatePath, int nPages) {
+    TempStr withExt = WithDefaultImageExtTemp(templatePath);
+    if (len(withExt) == 0) {
+        return {};
+    }
+    return EnsurePagePlaceholderTemp(withExt, nPages > 1);
+}
+
+// how many of the files converting pages to templatePath writes already exist
+int CountExistingImages(Str templatePath, const Vec<int>& pages) {
+    TempStr templ = ImagesTemplateTemp(templatePath, len(pages));
+    if (len(templ) == 0) {
+        return 0;
+    }
+    int n = 0;
+    for (int pageNo : pages) {
+        if (file::Exists(ReplacePagePlaceholderTemp(templ, pageNo))) {
+            n++;
+        }
+    }
+    return n;
+}
+
+// templatePath with ".<k>" before the extension, the smallest k that
+// overwrites none of the files: book-<N>.png => book-<N>.1.png (#6439)
+TempStr UniqueImagesTemplateTemp(Str templatePath, const Vec<int>& pages) {
+    if (CountExistingImages(templatePath, pages) == 0) {
+        return str::DupTemp(templatePath);
+    }
+    TempStr templ = ImagesTemplateTemp(templatePath, len(pages));
+    TempStr noExt = path::GetPathNoExtTemp(templ);
+    TempStr ext = path::GetExtTemp(templ);
+    for (int k = 1; k < 10000; k++) {
+        TempStr candidate = fmt("%s.%d%s", noExt, k, ext);
+        if (CountExistingImages(candidate, pages) == 0) {
+            return candidate;
+        }
+    }
+    return str::DupTemp(templatePath);
+}
+
+TempStr ExistingImagesTextTemp(int nExisting) {
+    if (nExisting == 1) {
+        return str::DupTemp(Tr("1 file already exists"));
+    }
+    return fmt(Tr("%d files already exist").s, nExisting);
 }
 
 static bool PageFitsDpi(EngineBase* engine, int pageNo, int dpi) {
@@ -484,6 +624,8 @@ int ConvertPagesToImages(EngineBase* engine, int rotation, Str templatePath, con
         }
         px->xres = (float)dpi;
         px->yres = (float)dpi;
+        // the destination folder may not exist yet (issue #6424)
+        dir::CreateForFile(dest);
         bool ok = SavePixmapAsImageFile(px, dest);
         FreePixmap(px);
         if (!ok) {
@@ -581,6 +723,8 @@ bool WriteSelectionPixmap(Pixmap* px, Str destPath) {
     if (!px || len(destPath) == 0) {
         return false;
     }
+    // the destination folder may not exist yet (issue #6424)
+    dir::CreateForFile(destPath);
     bool ok = false;
     if (str::EndsWithI(destPath, StrL(".png"))) {
         // lodepng (no pHYs, so EngineImages displays 1:1) now, zopfli in the

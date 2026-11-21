@@ -28,9 +28,11 @@ void BuildOpenFileFilters(OpenFileFilterList& out) {
     } fileFormats[] = {
         {Tr("PDF documents"), StrL("*.pdf;*.p7m"), true},
         {Tr("XPS documents"), StrL("*.xps;*.oxps"), true},
+        {Tr("OFD documents"), StrL("*.ofd"), true},
         {Tr("DjVu documents"), StrL("*.djvu"), true},
         {Tr("PostScript documents"), StrL("*.ps;*.eps"), IsEnginePsAvailable()},
         {Tr("DVI documents"), StrL("*.dvi"), IsEngineDviAvailable()},
+        {Tr("CAJ documents"), StrL("*.caj;*.kdh;*.nh"), IsEngineCajAvailable()},
         {Tr("Comic books"), StrL("*.cbz;*.cbr;*.cb7;*.cbt"), true},
         {Tr("CHM documents"), StrL("*.chm"), true},
         {Tr("SVG documents"), StrL("*.svg"), true},
@@ -44,6 +46,7 @@ void BuildOpenFileFilters(OpenFileFilterList& out) {
          StrL("*.bmp;*.dib;*.gif;*.jpg;*.jpeg;*.jfif;*.jxr;*.hdp;*.wdp;*.png;*.tga;*.tif;*.tiff;*.webp;*.heic;*.heif;"
               "*.avif;*.jxl;*.jp2;*.j2k;*.jpx;*.jpf;*.jpm;*.j2c;*.ico"),
          true},
+        {Tr("Rich Text documents"), StrL("*.rtf"), true},
         {Tr("Text documents"), StrL("*.txt;*.log;*.nfo;file_id.diz;read.me;*.tcr"), true},
     };
 

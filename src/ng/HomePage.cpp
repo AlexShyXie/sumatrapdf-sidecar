@@ -39,6 +39,7 @@
 #include "Version.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Menu.h"
 #include "PagePosition.h"
@@ -54,50 +55,6 @@
 #include "HomePageCommon.h"
 
 #include "SumatraLog.h"
-
-// --- tips and promotions (orig's) -------------------------------------------
-
-static Str sumatraPromos = StrL(R"promos(Try [Edna](https://edna.arslexis.io): a note taking web app for power users.
-Try [MarkLexis](https://marklexis.arslexis.io): a bookmarking web application.
-Try [Sumatra File Manager](https://sumatrafilemanager.com): file manager with super powers.
-)promos");
-
-static Str promoFromServer;
-
-static void EnsureTipsParsed() {
-    if (gTipsParsed) {
-        return;
-    }
-    CollectTipsFromString(sumatraTips, &gTipLines);
-    CollectTipsFromString(sumatraPromos, &gPromoLines);
-    if (len(promoFromServer) > 0) {
-        CollectTipsFromString(promoFromServer, &gPromoLines);
-    }
-    gTipsParsed = true;
-    PickRandomTipOrPromo();
-}
-
-void FreeHomePageTips() {
-    if (gTipsParsed) {
-        gTipLines.Reset();
-        gPromoLines.Reset();
-        gTipsParsed = false;
-    }
-    str::Free(promoFromServer);
-    promoFromServer = {};
-    HomePageInvalidateLayoutCache();
-}
-
-void PickAnotherRandomPromotion() {
-    PickAnotherRandomTip();
-}
-
-void SetPromoString(Str s) {
-    if (len(s) == 0) {
-        return;
-    }
-    str::ReplaceWithCopy(&promoFromServer, s);
-}
 
 // --- the About rows (orig's) -------------------------------------------------
 
@@ -119,10 +76,16 @@ static AboutRow gAboutRows[] = {
     {StrL("forums"), StrL("SumatraPDF forums"), StrL("https://github.com/sumatrapdfreader/sumatrapdf/discussions")},
     {StrL("licenses"), StrL("Various Open Source"),
      StrL("https://github.com/sumatrapdfreader/sumatrapdf/blob/master/AUTHORS")},
+    // filled in by AboutSourceRow()
+    {StrL("source"), {}, {}},
     {StrL("more software by me"), StrL("Sumatra File Manager"), StrL("https://sumatrafilemanager.com")},
+    {{}, StrL("Sumatra File Manager Web"), StrL("https://web.sumatrafilemanager.com")},
     {{}, {}, {}}};
 
-constexpr int kAboutSoftwareRow = dimofi(gAboutRows) - 2;
+// the rows from kAboutSoftwareRow on are the other software, in the footer
+constexpr int kAboutSoftwareEnd = dimofi(gAboutRows) - 1;
+constexpr int kAboutSoftwareRow = kAboutSoftwareEnd - 2;
+constexpr int kAboutSourceRow = kAboutSoftwareRow - 1;
 
 // the About box (orig's): the brand over the version, the link rows, a note,
 // then a hairline over the copy link and the other software. Every row has a
@@ -146,37 +109,6 @@ constexpr int kAboutNoteMarkDy = 3;
 constexpr int kAboutNoteGap = 8;
 constexpr int kAboutTextFontPx = 13;
 constexpr int kAboutMetaFontPx = 12;
-
-// the line under the rows that says this isn't a release build
-static Str AboutNoteText() {
-#if defined(PRE_RELEASE_VER)
-    return StrL("pre-release build");
-#elif IS_DEBUG
-    return StrL("debug build, for testing only");
-#else
-    return {};
-#endif
-}
-
-static TempStr GetAppVersionTemp() {
-    TempStr s = str::JoinTemp(StrL("v"), currentVersion);
-    bool is64 = sizeof(void*) == 8;
-    s = str::JoinTemp(s, is64 ? StrL(" 64-bit") : StrL(" 32-bit"));
-    if (gIsDebugBuild) {
-        s = str::JoinTemp(s, StrL(" (dbg)"));
-    }
-    return s;
-}
-
-// "26.10.14 64-bit, built Oct 14 2026 01:46"
-static TempStr AboutVersionLineTemp() {
-    bool is64 = sizeof(void*) == 8;
-    Str bits = is64 ? StrL("64-bit") : StrL("32-bit");
-    Str built = StrL(__DATE__ " " __TIME__);
-    // without the seconds
-    built.len = std::max(0, len(built) - 3);
-    return fmt("%s %s, built %s", currentVersion, bits, built);
-}
 
 constexpr Color kCol1 = MkRgb(196, 64, 50);
 constexpr Color kCol2 = MkRgb(227, 107, 35);
@@ -319,6 +251,7 @@ struct HomeView;
 struct HomePageUI {
     gp::Entity<HomeView> view;
     gpui::InputState* search = nullptr;
+    bool focusSearchOnBuild = false;
     Str searchQuery;
     float scrollY = 0;
     // scrollY the last laid-out frame used, so a bottom scroll can measure
@@ -333,6 +266,8 @@ struct HomePageUI {
     // the entries' height is only known once they were painted: the first
     // frame asks for a second one so the scrollbar can be there
     bool askedForMeasure = false;
+    // the vertical scrollbar was built last frame
+    bool vbarShown = false;
     // false from invalidate until the next HomePageBuild refills files
     bool filesLaidOut = false;
     Vec<FileState*> files;
@@ -353,7 +288,13 @@ struct HomePageUI {
     // LayoutHomePage needs their widths, and gpui measures text only while
     // painting
     gpui::Bounds openGroupBounds{};
+    gpui::Bounds openTextBounds{};
     gpui::Bounds brandBounds{};
+    // the header row last frame: what the test state reports (issue #6367)
+    bool brandShown = true;
+    gpui::Bounds viewBtnsBounds{};
+    float tipPadL = 0;
+    float tipPadR = 0;
     // the entries as laid out last frame, for the hover tooltip
     Vec<gpui::Bounds> entryBounds;
     // each thumbnail's selection ring, drawn for the selected one
@@ -498,36 +439,6 @@ static TempStr HomeSearchQueryTemp(MainWindow* win) {
     return str::DupTemp(h->searchQuery);
 }
 
-// orig's LayoutHomePage's file collection
-static void CollectHomePageFiles(MainWindow* win, Vec<FileState*>& fileStates, StrVec& filterWords) {
-    Vec<FileState*> allFileStates;
-    if (gSettings->homePageSortByFrequentlyRead) {
-        FileHistoryGetFrequencyOrder(allFileStates);
-    } else {
-        FileHistoryGetRecentlyOpenedOrder(allFileStates);
-    }
-
-    TempStr searchQuery = HomeSearchQueryTemp(win);
-    bool hasFilter = len(searchQuery) > 0;
-    if (hasFilter) {
-        SplitFilterToWords(searchQuery, filterWords);
-    }
-    for (int i = 0; i < len(allFileStates); i++) {
-        FileState* fs = allFileStates[i];
-        // a state without a path can't be opened or thumbnailed - don't show it
-        if (len(fs->filePath) == 0) {
-            continue;
-        }
-        if (hasFilter) {
-            TempStr baseName = path::GetBaseNameTemp(fs->filePath);
-            if (!FilterMatches(baseName, filterWords)) {
-                continue;
-            }
-        }
-        VecAppend(fileStates, fs);
-    }
-}
-
 // --- the view ----------------------------------------------------------------
 
 struct HomeView {
@@ -613,8 +524,8 @@ void HomeView::OnEntryHover(HomeView* self, gp::Ctx* cx, const gp::HoverEvent* e
     }
     // Same text as the keyboard selection's: path + size (size looked up only
     // when shown)
-    TempStr tip = str::DupTemp(fs->filePath);
-    i64 size = file::GetSize(fs->filePath);
+    TempStr tip = PathForDisplayTemp(fs->filePath);
+    i64 size = GetHomeFileSize(fs->filePath);
     if (size >= 0) {
         tip = fmt("%s  %s", tip, str::FormatSizeShortTemp(size, nullptr));
     }
@@ -808,28 +719,6 @@ static float HomeClampScrollY(HomePageUI* h, float y) {
     return std::max(0.f, std::min(y, maxY));
 }
 
-// a third of a row per notch. WM_MOUSEWHEEL on the frame uses the same step:
-// the test harness posts the wheel with the cursor parked off the window.
-void HomePageOnMouseWheel(MainWindow* win, int delta) {
-    if (!win || !win->IsCurrentTabAbout() || delta == 0) {
-        return;
-    }
-    HomePageUI* h = Ui(win);
-    int thumbsRowDy = HomePageIsListView() ? kHomeListRowDy : ThumbnailFrameSize().dy + kThumbsSpaceBetweenY;
-    int scrollBy = thumbsRowDy / 3;
-    if (delta > 0) {
-        scrollBy = -scrollBy;
-    }
-    float newScrollY = HomeClampScrollY(h, h->scrollY + (float)scrollBy);
-    if (newScrollY == h->scrollY) {
-        return;
-    }
-    h->scrollToEnd = false;
-    h->scrollY = newScrollY;
-    OverlayScrollbarsNotifyScroll(win);
-    AppShellInvalidate(win);
-}
-
 // orig's HomePageOnMouseWheel: a third of a row per notch
 void HomeView::OnWheel(HomeView* self, gp::Ctx* cx, const gp::ScrollWheelEvent* ev) {
     if (ev->deltaY == 0) {
@@ -907,7 +796,7 @@ void HomeView::OnTipBand(HomeView* self, gp::Ctx* cx, const gp::ClickEvent* ev) 
     if (ev->clickCount < 2) {
         return;
     }
-    PickAnotherRandomPromotion();
+    PickAnotherRandomTip();
     HomeNotify(self->win, cx);
 }
 
@@ -1015,6 +904,8 @@ static gp::El* AboutBoxEl(MainWindow* win, gp::Ctx* cx, bool withBorder) {
     // the rows: muted labels, right-aligned, then the links
     gp::El* labels = gp::Div(cx->a)->FlexCol()->ItemsEnd()->Gap((float)kAboutRowGap)->Shrink0();
     gp::El* values = gp::Div(cx->a)->FlexCol()->ItemsStart()->Gap((float)kAboutRowGap)->Flex1()->MinW(0);
+    AboutRow* source = &gAboutRows[kAboutSourceRow];
+    AboutSourceRow(&source->rightTxt, &source->url);
     for (int i = 0; i < kAboutSoftwareRow; i++) {
         AboutRow* el = &gAboutRows[i];
         labels->Child(gp::TextEl(cx->a, GpuiDup(cx->a, el->leftTxt))
@@ -1058,17 +949,16 @@ static gp::El* AboutBoxEl(MainWindow* win, gp::Ctx* cx, bool withBorder) {
                     ->Cursor(gp::CursorKind::Pointer)
                     ->PathClick(GStrL("about-copy-info"))
                     ->OnClick(gp::ListenTo(Ui(win)->view, &HomeView::OnCopyInfo)));
-    AboutRow& software = gAboutRows[kAboutSoftwareRow];
-    foot->Child(
-        gp::Div(cx->a)
-            ->FlexCol()
-            ->ItemsCenter()
-            ->Gap((float)kAboutSoftwareGap)
-            ->Child(gp::TextEl(cx->a, GpuiDup(cx->a, software.leftTxt))
+    gp::El* software = gp::Div(cx->a)->FlexCol()->ItemsCenter()->Gap((float)kAboutSoftwareGap);
+    software->Child(gp::TextEl(cx->a, GpuiDup(cx->a, gAboutRows[kAboutSoftwareRow].leftTxt))
                         ->Font((float)kAboutMetaFontPx)
                         ->Fg(ToGpui(colMuted))
-                        ->H((float)kAboutMetaDy))
-            ->Child(AboutLinkEl(win, cx, software.rightTxt, software.url, StrL("about-software"), kAboutSoftwareRow)));
+                        ->H((float)kAboutMetaDy));
+    for (int i = kAboutSoftwareRow; i < kAboutSoftwareEnd; i++) {
+        AboutRow* el = &gAboutRows[i];
+        software->Child(AboutLinkEl(win, cx, el->rightTxt, el->url, fmt("about-software-%d", i), i));
+    }
+    foot->Child(software);
     box->Child(foot);
     return box;
 }
@@ -1081,8 +971,9 @@ static int AboutBoxDy() {
     if (len(AboutNoteText()) > 0) {
         dy += kAboutGroupGap + kAboutMetaDy;
     }
-    dy += kAboutGroupGap + 1 + kAboutFootGap + kAboutRowDy + kAboutFootRowGap + kAboutMetaDy + kAboutSoftwareGap +
-          kAboutRowDy + kAboutPadBottom;
+    int nSoftware = kAboutSoftwareEnd - kAboutSoftwareRow;
+    dy += kAboutGroupGap + 1 + kAboutFootGap + kAboutRowDy + kAboutFootRowGap + kAboutMetaDy +
+          (nSoftware * (kAboutSoftwareGap + kAboutRowDy)) + kAboutPadBottom;
     return dy;
 }
 
@@ -1472,14 +1363,16 @@ static gp::El* HomeListRowEl(MainWindow* win, gp::Ctx* cx, int idx, bool isSelec
     row->Child(
         FilterHighlightText(cx, path::GetBaseNameTemp(fs->filePath), filterWords, ToGpui(colText), kHomeTextFontPx)
             ->Shrink0());
-    row->Child(gp::TextEl(cx->a, GpuiDup(cx->a, path::GetDirTemp(fs->filePath)))
+    // the wasm build's directories are the page's own (/uploads)
+    TempStr dir = OS_WASM ? TempStr{} : path::GetDirTemp(fs->filePath);
+    row->Child(gp::TextEl(cx->a, GpuiDup(cx->a, dir))
                    ->Font(12)
                    ->Fg(ToGpui(colDim))
                    ->Flex1()
                    ->MinW(0)
                    ->Truncate()
                    ->BoundsOut(&Ui(win)->listPathBounds[idx]));
-    i64 size = file::GetSize(fs->filePath);
+    i64 size = GetHomeFileSize(fs->filePath);
     if (size >= 0) {
         row->Child(gp::TextEl(cx->a, GpuiDup(cx->a, str::FormatSizeShortTemp(size)))
                        ->Font(12)
@@ -1595,7 +1488,7 @@ gp::El* HomePageBuild(MainWindow* win, gp::Ctx* cx) {
     HomePageUI* h = Ui(win);
     VecReset(h->files);
     StrVec filterWords;
-    CollectHomePageFiles(win, h->files, filterWords);
+    CollectHomePageFiles(HomeSearchQueryTemp(win), h->files, filterWords);
     h->filesLaidOut = true;
     int nFiles = len(h->files);
     h->entryCount = nFiles;
@@ -1651,9 +1544,13 @@ gp::El* HomePageBuild(MainWindow* win, gp::Ctx* cx) {
         thumbsStartX = kInnerPadding;
     }
     float startX = (float)thumbsStartX;
-    float endX = std::max(0.f, frameDx - startX - (float)contentDx);
 
-    gp::El* root = gp::Div(cx->a)->FlexCol()->SizeFull()->Bg(ToGpui(colBg));
+    // orig scrolls the entries from a wheel anywhere on the page
+    gp::El* root = gp::Div(cx->a)
+                       ->FlexCol()
+                       ->SizeFull()
+                       ->Bg(ToGpui(colBg))
+                       ->OnScrollWheel(gp::ListenTo(Ui(win)->view, &HomeView::OnWheel));
 
     // one header row. The brand ends on the first column's right edge, the
     // Open link and view icons end on the last column's, and the search field
@@ -1680,21 +1577,6 @@ gp::El* HomePageBuild(MainWindow* win, gp::Ctx* cx) {
         brandDx = HomeBrandStripesDx() + kHomeBrandGap + (len(logoName) * 8);
     }
 
-    // [open] "Open..."  [thumbnails] [list]
-    Str openTxt = Tr("Open...");
-    int openTextGap = 6;
-    gp::El* openGroup = gp::Div(cx->a)
-                            ->FlexRow()
-                            ->ItemsCenter()
-                            ->Gap((float)openTextGap)
-                            ->Shrink0()
-                            ->BoundsOut(&h->openGroupBounds)
-                            ->Cursor(gp::CursorKind::Pointer)
-                            ->PathClick(GStrL("home-open-doc"))
-                            ->OnClick(gp::ListenTo(Ui(win)->view, &HomeView::OnOpenDoc));
-    openGroup->Child(HomeSvgIcon(cx, gIconFileOpen, (float)HomePageIconSize(), colText));
-    openGroup->Child(gp::TextEl(cx->a, GpuiDup(cx->a, openTxt))->Font((float)kHomeTextFontPx)->Fg(ToGpui(colText)));
-
     if (!h->search) {
         h->search = new gp::InputState();
         h->search->focus = gp::FocusHandleNew(cx->app);
@@ -1702,42 +1584,78 @@ gp::El* HomePageBuild(MainWindow* win, gp::Ctx* cx) {
             gp::InputSetValue(h->search, ToGpui(h->searchQuery));
         }
     }
+    if (h->focusSearchOnBuild) {
+        h->focusSearchOnBuild = false;
+        HomePageFocusSearch(win);
+    }
     TempStr cue = fmt(Tr("Search %d files (Ctrl + F)").s, CountHomePageFiles());
     gp::InputSetPlaceholder(h->search, ToGpui(cue));
     h->search->onChange = gp::ListenTo(Ui(win)->view, &HomeView::OnSearch);
 
-    // the search box is centered; the brand and the Open group bound its width
+    // orig's LayoutHomeHeader inputs
+    Str openTxt = Tr("Open...");
     int iconGap = 4;
     int viewBtnDx = HomePageIconSize() + 6;
     int viewIconsDx = (2 * viewBtnDx) + iconGap;
-    int openGroupDx = (int)h->openGroupBounds.w;
-    if (openGroupDx <= 0) {
+    int openTextDx = (int)h->openTextBounds.w;
+    if (openTextDx <= 0) {
         // first frame: not measured yet
-        openGroupDx = HomePageIconSize() + openTextGap + (len(openTxt) * 7);
+        openTextDx = len(openTxt) * 7;
     }
-    int rowGapX = 16;
-    int leftDx = std::max(brandDx, frame.dx) + rowGapX;
-    int rightDx = openGroupDx + rowGapX + viewIconsDx + rowGapX;
-    int flankDx = std::max(leftDx, rightDx);
-    int borderDx = std::min(contentDx - (2 * flankDx), kHomeSearchMaxDx);
-    borderDx = std::max(borderDx, 200);
+    HomeHeaderIn hin;
+    hin.gridX = thumbsStartX;
+    hin.gridDx = contentDx;
+    hin.pageX = kInnerPadding;
+    hin.pageDx = (int)frameDx - (2 * kInnerPadding);
+    hin.firstColDx = frame.dx;
+    hin.brandDx = brandDx;
+    hin.openIconDx = HomePageIconSize();
+    hin.openTextGap = 6;
+    hin.openTextDx = openTextDx;
+    hin.viewIconsDx = viewIconsDx;
+    hin.gapX = 16;
+    hin.searchMinDx = 200;
+    hin.searchMaxDx = kHomeSearchMaxDx;
+    HomeHeaderOut hdrRow;
+    LayoutHomeHeader(hin, hdrRow);
+    h->brandShown = hdrRow.showBrand;
+
+    // [open] "Open..."  [thumbnails] [list]
+    gp::El* openGroup = gp::Div(cx->a)
+                            ->FlexRow()
+                            ->ItemsCenter()
+                            ->Gap((float)hin.openTextGap)
+                            ->Shrink0()
+                            ->BoundsOut(&h->openGroupBounds)
+                            ->Cursor(gp::CursorKind::Pointer)
+                            ->PathClick(GStrL("home-open-doc"))
+                            ->OnClick(gp::ListenTo(Ui(win)->view, &HomeView::OnOpenDoc));
+    openGroup->Child(HomeSvgIcon(cx, gIconFileOpen, (float)HomePageIconSize(), colText));
+    if (hdrRow.showOpenText) {
+        openGroup->Child(gp::TextEl(cx->a, GpuiDup(cx->a, openTxt))
+                             ->Font((float)kHomeTextFontPx)
+                             ->Fg(ToGpui(colText))
+                             ->BoundsOut(&h->openTextBounds));
+    }
+
     int borderDy = AppShellDpiPx(win, kSearchEditDy) + 2; // 1px border on each side
     int rowDy = std::max({viewBtnDx, borderDy, kHomeBrandStripeDy});
 
     // every row item (brand, link, search box, view icons) is centered on the
-    // row's vertical centerline. Both flanks are as wide, so the middle is
-    // centered over the grid
-    gp::El* toolRow = gp::Div(cx->a)->FlexRow()->W((float)contentDx)->H((float)rowDy)->Shrink0()->ItemsCenter();
-    gp::El* brandBox = gp::Div(cx->a)
-                           ->FlexRow()
-                           ->W((float)std::max(frame.dx, brandDx))
-                           ->Shrink0()
-                           ->ItemsCenter()
-                           ->JustifyEnd()
-                           ->Child(brand);
-    toolRow->Child(gp::Div(cx->a)->FlexRow()->W((float)flankDx)->Shrink0()->ItemsCenter()->Child(brandBox));
+    // row's vertical centerline, at the x LayoutHomeHeader picked
+    gp::El* toolRow = gp::Div(cx->a)->FlexRow()->W((float)hdrRow.rowDx)->H((float)rowDy)->Shrink0()->ItemsCenter();
+    gp::El* lead = gp::Div(cx->a)
+                       ->FlexRow()
+                       ->W((float)(hdrRow.searchX - hdrRow.rowX))
+                       ->Shrink0()
+                       ->ItemsCenter()
+                       ->PadL((float)(hdrRow.brandX - hdrRow.rowX));
+    if (hdrRow.showBrand) {
+        lead->Child(brand);
+    }
+    toolRow->Child(lead);
     gp::El* searchBox = gp::Div(cx->a)
-                            ->W((float)borderDx)
+                            ->W((float)hdrRow.searchDx)
                             ->Shrink0()
                             ->H((float)borderDy)
                             ->BoundsOut(&h->searchBounds)
@@ -1747,24 +1665,20 @@ gp::El* HomePageBuild(MainWindow* win, gp::Ctx* cx) {
                                         ->IntoEl()
                                         ->Font((float)AppShellDpiPx(win, kHomeSearchFontPx))
                                         ->H((float)borderDy));
-    toolRow->Child(gp::Div(cx->a)->FlexRow()->Flex1()->MinW(0)->ItemsCenter()->JustifyCenter()->Child(searchBox));
-    gp::El* viewBtns = gp::Div(cx->a)->FlexRow()->ItemsCenter()->Gap((float)iconGap)->Shrink0();
+    toolRow->Child(searchBox);
+    int searchEnd = hdrRow.searchX + hdrRow.searchDx;
+    toolRow->Child(gp::Div(cx->a)->W((float)(hdrRow.openX - searchEnd))->Shrink0());
+    gp::El* viewBtns =
+        gp::Div(cx->a)->FlexRow()->ItemsCenter()->Gap((float)iconGap)->Shrink0()->BoundsOut(&h->viewBtnsBounds);
     viewBtns->Child(HomeViewModeBtn(win, cx, false));
     viewBtns->Child(HomeViewModeBtn(win, cx, true));
-    toolRow->Child(gp::Div(cx->a)
-                       ->FlexRow()
-                       ->W((float)flankDx)
-                       ->Shrink0()
-                       ->ItemsCenter()
-                       ->JustifyEnd()
-                       ->Gap((float)rowGapX)
-                       ->Child(openGroup)
-                       ->Child(viewBtns));
+    toolRow->Child(
+        gp::Div(cx->a)->FlexRow()->Flex1()->ItemsCenter()->JustifyBetween()->Child(openGroup)->Child(viewBtns));
     root->Child(gp::Div(cx->a)
                     ->FlexRow()
                     ->W(gp::kFill)
                     ->Shrink0()
-                    ->PadL(startX)
+                    ->PadL((float)hdrRow.rowX)
                     ->PadT((float)kHomeHeaderTopY)
                     ->PadB((float)kSearchThumbnailsGapY)
                     ->Child(toolRow));
@@ -1815,7 +1729,10 @@ gp::El* HomePageBuild(MainWindow* win, gp::Ctx* cx) {
     // orig: thumbsBottomY = rc.dy - tipHeight - kThumbsMiddleMargin
     root->Child(gp::Div(cx->a)->W(gp::kFill)->H((float)kThumbsMiddleMargin)->Shrink0());
     h->tipBounds = {};
-    gp::El* tip = HomeTipBandEl(win, cx, startX, endX);
+    // the tip wraps at the header row's width
+    h->tipPadL = (float)hdrRow.rowX;
+    h->tipPadR = std::max(0.f, frameDx - (float)(hdrRow.rowX + hdrRow.rowDx));
+    gp::El* tip = HomeTipBandEl(win, cx, h->tipPadL, h->tipPadR);
     if (tip) {
         tip->BoundsOut(&h->tipBounds);
         root->Child(tip);
@@ -1842,6 +1759,7 @@ gp::El* HomePageBuild(MainWindow* win, gp::Ctx* cx) {
         OverlayScrollbarsSyncMode(win);
         show = IsOverlayScrollbarVisible(win->overlayScrollV);
     }
+    h->vbarShown = show;
     if (show) {
         OverlayScrollbar* sb = win->overlayScrollV;
         OverlayScrollbarSetInfo(sb, 0, totalContentDy - 1, thumbsVisibleDy, (int)h->scrollY);
@@ -1914,12 +1832,22 @@ TempStr HomeSelectionForWindowTemp(int* exitCodeOut, int winIdx) {
         lastCaption = BoundsRect(h->entryBounds[len(h->entryBounds) - 1]);
     }
     Rect tipRect = BoundsRect(h->tipBounds);
-    return finish(0, fmt("OK sel=%d entries=%d searchFocus=%d searchBox=%d search=%s outline=%s outlineFull=%s path=%s "
-                         "listView=%d listIcon=%s thumbsArea=%s lastCaption=%s tip=%d,%d tipRect=%s",
-                         sel, h->entryCount, searchFocus ? 1 : 0, searchBox, RectCsvTemp(search), RectCsvTemp(outline),
-                         RectCsvTemp(outlineFull), path, HomePageIsListView() ? 1 : 0,
-                         RectCsvTemp(BoundsRect(h->listIconBounds)), RectCsvTemp(BoundsRect(h->entriesView)),
-                         RectCsvTemp(lastCaption), gSelectedIsPromo ? 1 : 0, gSelectedTipIdx, RectCsvTemp(tipRect)));
+    // the header row's items, which must not overlap (issue #6367)
+    Rect logo = h->brandShown ? BoundsRect(h->brandBounds) : Rect{};
+    Rect tipText;
+    if (!tipRect.IsEmpty()) {
+        tipText = {tipRect.x + (int)h->tipPadL, tipRect.y, tipRect.dx - (int)(h->tipPadL + h->tipPadR), tipRect.dy};
+    }
+    TempStr header = fmt("vbar=%d logo=%s open=%s views=%s tipText=%s", h->vbarShown ? 1 : 0, RectCsvTemp(logo),
+                         RectCsvTemp(BoundsRect(h->openGroupBounds)), RectCsvTemp(BoundsRect(h->viewBtnsBounds)),
+                         RectCsvTemp(tipText));
+    return finish(
+        0, fmt("OK sel=%d entries=%d searchFocus=%d searchBox=%d search=%s outline=%s outlineFull=%s path=%s "
+               "listView=%d listIcon=%s thumbsArea=%s lastCaption=%s tip=%d,%d tipRect=%s %s",
+               sel, h->entryCount, searchFocus ? 1 : 0, searchBox, RectCsvTemp(search), RectCsvTemp(outline),
+               RectCsvTemp(outlineFull), path, HomePageIsListView() ? 1 : 0, RectCsvTemp(BoundsRect(h->listIconBounds)),
+               RectCsvTemp(BoundsRect(h->entriesView)), RectCsvTemp(lastCaption), gSelectedIsPromo ? 1 : 0,
+               gSelectedTipIdx, RectCsvTemp(tipRect), header));
 }
 
 TempStr HomeSelectionResultTemp(int* exitCodeOut) {
@@ -1961,7 +1889,11 @@ TempStr HomeListRowsResultTemp(int* exitCodeOut) {
         return finish(2);
     }
     for (int i = 0; i < n; i++) {
-        i64 size = file::GetSize(h->files[i]->filePath);
+        i64 size = GetHomeFileSize(h->files[i]->filePath);
+        if (size == kHomeFileSizePending) {
+            out.Append(StrL("NOTREADY size-pending\n"));
+            return finish(2);
+        }
         gpui::Bounds& b = h->listSizeBounds[i];
         if (size >= 0 && (b.w <= 0 || b.h <= 0)) {
             out.Append(StrL("NOTREADY no-layout\n"));
@@ -1971,7 +1903,7 @@ TempStr HomeListRowsResultTemp(int* exitCodeOut) {
     out.Append(fmt("OK rows=%d\n", n));
     for (int i = 0; i < n; i++) {
         FileState* fs = h->files[i];
-        i64 size = file::GetSize(fs->filePath);
+        i64 size = GetHomeFileSize(fs->filePath);
         TempStr sizeText = size < 0 ? str::DupTemp(StrL("")) : str::FormatSizeShortTemp(size);
         Rect r = size < 0 ? Rect{} : BoundsRect(h->listSizeBounds[i]);
         TempStr progress;
@@ -2006,7 +1938,12 @@ Str HomePageSelectedFilePathTemp(MainWindow* win) {
 
 void HomePageFocusSearch(MainWindow* win) {
     HomePageUI* h = Ui(win);
-    if (!h->search || !win->gpuiWin) {
+    if (!h->search) {
+        // not built yet: HomePageBuild comes back here
+        h->focusSearchOnBuild = true;
+        return;
+    }
+    if (!win->gpuiWin) {
         return;
     }
     gp::InputFocus(h->search, win->gpuiWin->app, win->gpuiWin);

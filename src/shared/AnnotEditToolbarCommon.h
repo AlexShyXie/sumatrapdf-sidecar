@@ -85,6 +85,7 @@ Color PdfToWinColorWithAlpha(PdfColor c);
 PdfColor WinToPdfColor(Color c);
 PdfColor OpaquePdfColor(PdfColor c);
 void CollectItems(Annotation* annot, Vec<AnnotEditItem>& out);
+TempStr ChipLabelTemp(const AnnotEditItem& item);
 void ScheduleShowSelectedAnnotationView(WindowTab* tab);
 void CollectPriorityAnnotPages(WindowTab* tab, Annotation* extra, Vec<int>& pages);
 
@@ -125,3 +126,6 @@ constexpr int kOpacityPercentMin = 10;
 // GDI's Arial is not quite MuPDF's Helvetica; leave room rather than let the
 // annotation wrap a line the box showed whole
 constexpr float kInPlaceWidthSlack = 1.03f;
+
+void PostedStartContentsEdit(MainWindow* win);
+Size FreeTextGrowth(Size box, Size fitOld, Size fitNew);

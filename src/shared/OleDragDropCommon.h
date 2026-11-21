@@ -1,32 +1,16 @@
 /* Copyright 2026 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
-// --- shared by OleDragDropCommon_win.cpp, orig's Canvas.cpp and ng's gui/OleDragDrop_win.cpp ---
-
-// for the automation channel, which must never drop anything on whatever
-// window the real cursor is over: the drag is cancelled by its drop source as
-// soon as OLE asks, as if Esc was pressed
-extern bool gTestCancelDrag;
+// --- shared by OleDragDropCommon_win.cpp and orig's Canvas.cpp ---
 
 void FinishDragDrop(IDataObject* dataObj);
 HGLOBAL EncodeBitmapToPngGlobal(HBITMAP hbmp);
 HBITMAP CreateProportionalDragThumbnail(HBITMAP src, int maxEdge);
 HIMAGELIST CreateDragImageList(HBITMAP hbmp);
-TempStr GetDownloadsDirTemp();
-TempStr FileNameFromUrlTemp(Str url);
 TempStr GetTextFromDataObject(IDataObject* dataObj);
 TempStr GetUrlFromDataObject(IDataObject* dataObj);
 bool DataObjectHasFiles(IDataObject* dataObj);
 bool DataObjectHasUrl(IDataObject* dataObj);
-
-struct DownloadAndOpenUrlData {
-    Str url;
-    HWND hwndCanvas;
-};
-void DownloadAndOpenUrl(DownloadAndOpenUrlData* data);
-
-// implemented by each app
-void OpenDownloadedPath(Str* path);
 
 // OLE drag-drop support for dragging selected text out of the window
 class TextDropSource : public IDropSource {
@@ -51,7 +35,7 @@ class TextDropSource : public IDropSource {
         return r;
     }
     STDMETHODIMP QueryContinueDrag(BOOL fEscapePressed, DWORD grfKeyState) override {
-        if (fEscapePressed || gTestCancelDrag) {
+        if (fEscapePressed) {
             return DRAGDROP_S_CANCEL;
         }
         if (!(grfKeyState & MK_LBUTTON)) {
@@ -123,7 +107,7 @@ class ImageDropSource : public IDropSource {
         return r;
     }
     STDMETHODIMP QueryContinueDrag(BOOL fEscapePressed, DWORD grfKeyState) override {
-        if (fEscapePressed || gTestCancelDrag) {
+        if (fEscapePressed) {
             return DRAGDROP_S_CANCEL;
         }
         if (!(grfKeyState & MK_LBUTTON)) {

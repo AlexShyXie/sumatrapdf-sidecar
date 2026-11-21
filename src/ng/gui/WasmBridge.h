@@ -19,6 +19,7 @@ constexpr const char* kWasmSettingsDir = "/settings";
 // the callback runs on the main thread with its path; it is not called if the
 // user cancels. Only one pick can be in flight.
 void WasmPickFile(const Func1<Str>& onPicked);
+void WasmFetchUrl(Str url, Str name, const Func1<Str>& onStored);
 
 // Hands the file's bytes to the browser as a download named after it.
 bool WasmDownloadFile(Str path);
@@ -29,6 +30,10 @@ bool WasmCopyImageFile(Str path);
 // browser cannot share files, so callers can fall back to a URL.
 bool WasmShareFile(Str path);
 
+// Opens an html file from MEMFS in a new browser tab. False if the browser
+// blocked the tab.
+bool WasmOpenHtmlFile(Str path);
+
 // Opens the browser print dialog for a PDF in the virtual file system.
 bool WasmPrintPdf(Str path);
 
@@ -36,10 +41,22 @@ bool WasmPrintPdf(Str path);
 // many calls in a row cost one sync. Unchanged files are not rewritten.
 void WasmPersistSettings();
 
+void WasmNotifyExit();
+
 // The page's `?file=` query parameter, a path in MEMFS. It is the browser's
 // version of a file name on the command line.
 TempStr WasmQueryFileTemp();
 
 void WasmFocusCanvas();
+
+// Paths of files dropped on the page, already stored in kWasmUploadDir by
+// WasmShell.js. The strings are temp-allocated.
+void WasmTakeDroppedPathsTemp(Vec<Str>& out);
+
+// why the last save to OPFS failed (WasmShell.js), for sumatra_wasm_storage_error
+TempStr WasmStorageErrorTemp();
+
+// empty when the stored documents and settings loaded at startup
+TempStr WasmStorageLoadErrorTemp();
 
 #endif

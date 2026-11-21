@@ -27,6 +27,7 @@
 #include "DisplayModel.h"
 #include "MainWindow.h"
 #include "Theme.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "SumatraConfig.h"
 #include "Commands.h"
@@ -38,6 +39,7 @@
 #include "FileHistory.h"
 #include "Menu.h"
 #include "Translations.h"
+#include "FilterUtil.h"
 #include "PagePosition.h"
 #include "Installer.h"
 #include "RegistryPreview.h"
@@ -49,6 +51,7 @@
 #include "Accelerators.h"
 #include "FilterHighlightDraw.h"
 #include "Annotation.h"
+#include "CanvasCommon.h"
 #include "AnnotSearch.h"
 #include "AnnotEditToolbar.h"
 #include "AnnotPlacement.h"
@@ -102,6 +105,8 @@ struct CommandPaletteWnd : WindowBase, PaletteSources {
     bool thumbnailMode = false;
     bool smartTabMode = false;
     bool stickyMode = false;
+    // closing: a delete is posted, so it must not be reused
+    bool deleteScheduled = false;
 
     void PreTranslate(WindowBase::PreTranslateEvent*);
     void OnKeyDown(KeyEvent*);
@@ -129,12 +134,6 @@ struct CommandPaletteWnd : WindowBase, PaletteSources {
     bool MoveSelection(int vkey);
     bool RemoveSelectedItem();
     void SwitchToPrefix(Str prefix);
-    void SwitchToCommands();
-    void SwitchToTabs();
-    void SwitchToEverything();
-    void SwitchToFileHistory();
-    void SwitchToTOC();
-    void SwitchToFavorites();
     void SwitchToSettings();
     void BeginEditSettingValue(Str path);
     void ReturnToSettings(Str selPath);
@@ -147,10 +146,10 @@ struct CommandPaletteWnd : WindowBase, PaletteSources {
     void DrawListBoxItem(VirtListBox::DrawItemEvent* ev);
 };
 
-extern CommandPaletteWnd* gCommandPaletteWnd;
+static CommandPaletteWnd* gCommandPaletteWnd = nullptr;
 
 // the palette: a query line over a hairline, the mode switches, the rows on
-// an inset with a rounded selection, and the key hints under a hairline
+// an inset with a rounded selection, and the key hints
 constexpr int kPaletteQueryFontPx = 15;
 constexpr int kPaletteTextFontPx = 13;
 constexpr int kPaletteMetaFontPx = 12;
@@ -160,6 +159,7 @@ constexpr int kPaletteInsetDx = 8;
 constexpr int kPalettePadDx = 16;
 constexpr int kPaletteQueryPadDy = 6;
 constexpr int kPaletteSelectionRadius = 4;
+constexpr int kPaletteSwatchDx = 12;
 
 static PlatformFont* PaletteFont(int px) {
     return GetUserGuiFont(StrL("Segoe UI"), DpiScale(px));
@@ -179,7 +179,6 @@ static VirtCustom* NewPaletteRule() {
 }
 
 Str CommandPaletteSkipWS(Str s);
-bool CommandPaletteUiRtl();
 TempStr CommandPaletteShortcutTemp(i32 cmdId);
 void CommandPaletteSetCurrentSelection(CommandPaletteWnd* wnd, int idx);
 void ScheduleDeleteAndExecCommand(i32 cmdId = 0);
@@ -213,13 +212,6 @@ static i32 gCommandsNoActivate[] = {
 };
 // clang-format on
 
-// UI language (and the debug RTL toggle), not the palette hwnd: that window
-// stays LTR so virtual-control coords and clicks are not mirrored (#5956).
-bool CommandPaletteUiRtl() {
-    return IsUIRtl();
-}
-
-CommandPaletteWnd* gCommandPaletteWnd = nullptr;
 static int gPaletteOpDepth = 0;
 static HWND gHwndToActivateOnClose = nullptr;
 static WindowTab* gTabToSelectOnClose = nullptr;
@@ -244,20 +236,21 @@ void CommandPaletteWnd::SetThumbnailMode(ThumbnailMode mode) {
         listBox->SetIsVisible(false);
         thumbnailCtrl->SetIsVisible(true);
         thumbnailMode = true;
-        DoLayout(HwndClientRect(hwnd).Size());
+        DoLayout();
         thumbnailCtrl->Activate();
     } else {
         thumbnailCtrl->Deactivate();
         thumbnailCtrl->SetIsVisible(false);
         listBox->SetIsVisible(true);
         thumbnailMode = false;
-        DoLayout(HwndClientRect(hwnd).Size());
+        DoLayout();
     }
     EditSetFocus(editQuery);
 }
 
 void SafeDeleteCommandPaletteWnd() {
-    if (!gCommandPaletteWnd) {
+    // a delete posted for an earlier palette must not take a newer one
+    if (!gCommandPaletteWnd || !gCommandPaletteWnd->deleteScheduled) {
         return;
     }
 
@@ -275,7 +268,8 @@ void SafeDeleteCommandPaletteWnd() {
     if (gTabToSelectOnClose) {
         WindowTab* tab = gTabToSelectOnClose;
         gTabToSelectOnClose = nullptr;
-        if (IsMainWindowValidAndNotClosing(tab->win) && tab->win->GetTabIdx(tab) >= 0) {
+        // the tab may have been closed (and freed) since it was picked
+        if (IsMainWindowValidAndNotClosing(FindMainWindowByTab(tab))) {
             SelectTabInWindow(tab);
         }
     }
@@ -302,7 +296,11 @@ void ScheduleDeleteAndExecCommand(i32 cmdId) {
     if (!gCommandPaletteWnd) {
         return;
     }
-    gCmdIdToExecOnClose = cmdId;
+    // a later close request (deactivation) must not drop the picked command
+    if (cmdId != 0) {
+        gCmdIdToExecOnClose = cmdId;
+    }
+    gCommandPaletteWnd->deleteScheduled = true;
     if (IsMainWindowValidAndNotClosing(gCommandPaletteWnd->win)) {
         HighlightTab(gCommandPaletteWnd->win, nullptr);
     }
@@ -313,6 +311,14 @@ void ScheduleDeleteAndExecCommand(i32 cmdId) {
 void CommandPaletteSetCurrentSelection(CommandPaletteWnd* wnd, int idx) {
     wnd->listBox->SetCurrentSelection(idx);
     wnd->OnSelectionChange();
+}
+
+// fav is still one of fs's favorites and fs is still in the file history
+static bool FavoriteIsLive(FileState* fs, Favorite* fav) {
+    if (!gSettings->fileStates || !VecContains(*gSettings->fileStates, fs)) {
+        return false;
+    }
+    return fs->favorites && VecContains(*fs->favorites, fav);
 }
 
 struct RemoveItemOp {
@@ -347,10 +353,16 @@ static void ApplyRemoveItem(RemoveItemOp* op) {
         gPaletteOpDepth--;
     };
 
+    // the tab or favorite may be gone by the time this runs
     MainWindow* host = wnd->win;
     if (tab) {
-        CloseTab(tab, false);
+        if (IsWindowTabValid(tab)) {
+            CloseTab(tab, false);
+        }
     } else if (fav && favFs) {
+        if (!FavoriteIsLive(favFs, fav)) {
+            return;
+        }
         DelFavorite(favFs, fav);
     } else if (len(filePath) > 0 && host) {
         ForgetFileFromFrequentlyRead(host, filePath);
@@ -393,30 +405,6 @@ static void EditSetTextAndFocus(Edit* e, Str s) {
 
 void CommandPaletteWnd::SwitchToPrefix(Str prefix) {
     EditSetTextAndFocus(editQuery, prefix);
-}
-
-void CommandPaletteWnd::SwitchToCommands() {
-    SwitchToPrefix(Str(kPalettePrefixCommands));
-}
-
-void CommandPaletteWnd::SwitchToTabs() {
-    SwitchToPrefix(Str(kPalettePrefixTabs));
-}
-
-void CommandPaletteWnd::SwitchToEverything() {
-    SwitchToPrefix(Str(kPalettePrefixEverything));
-}
-
-void CommandPaletteWnd::SwitchToFileHistory() {
-    SwitchToPrefix(Str(kPalettePrefixFileHistory));
-}
-
-void CommandPaletteWnd::SwitchToTOC() {
-    SwitchToPrefix(Str(kPalettePrefixTOC));
-}
-
-void CommandPaletteWnd::SwitchToFavorites() {
-    SwitchToPrefix(Str(kPalettePrefixFavorites));
 }
 
 void CommandPaletteWnd::SwitchToSettings() {
@@ -883,14 +871,14 @@ void CommandPaletteWnd::FillSwitchRow() {
     }
     Color colBg = ThemeWindowControlBackgroundColor();
     Color colTxt = ThemeWindowTextColor();
-    Color colMuted = ThemeWindowTextDisabledColor();
+    Color colMuted = ThemeWindowDarkerTextColor();
     PaletteSwitch switches[kPaletteMaxSwitches];
     int n = PaletteSwitches(*this, win && win->AsFixed(), switches);
     for (int i = 0; i < n; i++) {
         PaletteSwitch& sw = switches[i];
         bool active = PaletteSwitchIsActive(filter, sw.prefix);
         auto* t = new PaletteSwitchCtrl();
-        InitKeyHint(t, PaletteFont(kPaletteMetaFontPx), Str(sw.label.s, 1), Str(sw.label.s + 2, len(sw.label) - 2),
+        InitKeyHint(t, PaletteFont(kPaletteMetaFontPx), sw.prefix, PaletteSwitchLabel(sw.label, sw.prefix),
                     active ? colTxt : colMuted, colBg);
         t->wnd = this;
         t->prefix = sw.prefix;
@@ -932,7 +920,7 @@ void CommandPaletteWnd::UpdateHelpRow() {
     countText = nullptr;
 
     Color colBg = ThemeWindowControlBackgroundColor();
-    Color colMuted = ThemeWindowTextDisabledColor();
+    Color colMuted = ThemeWindowDarkerTextColor();
     PaletteHint hints[kPaletteMaxHints];
     int nHelp = PaletteHelpHints(kind, hints);
     for (int i = 0; i < nHelp; i++) {
@@ -1073,7 +1061,7 @@ bool CommandPaletteWnd::Create(MainWindow* win, Str prefix, int smartTabAdvance)
 
     if (!smartTabMode) {
         auto* box = new HBox();
-        box->rtl = CommandPaletteUiRtl();
+        box->rtl = IsUIRtl();
         switchRow = NewHelpRow(box, MainAxisAlign::MainCenter);
         FillSwitchRow();
         vbox->AddChild(new Padding(switchRow, DpiScaledInsets(6, kPaletteInsetDx, 4, kPaletteInsetDx)));
@@ -1126,11 +1114,10 @@ bool CommandPaletteWnd::Create(MainWindow* win, Str prefix, int smartTabAdvance)
         vbox->AddChild(box);
     }
 
-    // the footer: the key hints and the count under a hairline
+    // the footer: the key hints and the count
     {
-        vbox->AddChild(NewPaletteRule());
         auto* box = new HBox();
-        box->rtl = CommandPaletteUiRtl();
+        box->rtl = IsUIRtl();
         helpRow = NewHelpRow(box, MainAxisAlign::MainStart);
         vbox->AddChild(new Padding(helpRow, DpiScaledInsets(5, kPaletteInsetDx)));
         UpdateHelpRow();
@@ -1156,7 +1143,7 @@ bool CommandPaletteWnd::Create(MainWindow* win, Str prefix, int smartTabAdvance)
     LayoutAndSizeToContent(layout, dx, dy, hwnd);
     // the help rows are virtual controls: pick them up so we paint them and
     // they get their input
-    DoLayout(HwndClientRect(hwnd).Size());
+    DoLayout();
     if (str::StartsWith(prefix, Str(kPalettePrefixThumbnails))) {
         SetThumbnailMode(ThumbnailMode::Enabled);
     }
@@ -1181,11 +1168,16 @@ bool CommandPaletteWnd::Create(MainWindow* win, Str prefix, int smartTabAdvance)
 
 void RunCommandPalette(MainWindow* win, Str prefix, int smartTabAdvance) {
     if (gCommandPaletteWnd) {
-        if (gCommandPaletteWnd->hwnd && IsWindow(gCommandPaletteWnd->hwnd)) {
-            HwndSetFocus(gCommandPaletteWnd->hwnd);
+        CommandPaletteWnd* prev = gCommandPaletteWnd;
+        bool alive = prev->hwnd && IsWindow(prev->hwnd) && !prev->deleteScheduled;
+        if (alive) {
+            HwndSetFocus(prev->hwnd);
             return;
         }
-        ScheduleDeleteAndExecCommand();
+        // gone or closing: delete it now, so its posted delete can't take the
+        // palette created below
+        prev->deleteScheduled = true;
+        SafeDeleteCommandPaletteWnd();
     }
 
     gCursorPosLParam = 0;
@@ -1333,165 +1325,28 @@ TempStr CommandPaletteStateTemp(int* exitCodeOut) {
     out.Append(
         fmt("OK sel=%d items=%d querySel=%d,%d queryLen=%d cmd=%d rtl=%d thumb=%d page=%d rendered=%d annots=%d "
             "annotPage=%d annotsDone=%d ",
-            sel, n, qStart, qEnd, qLen, selectedCmdId, (int)CommandPaletteUiRtl(), (int)wnd->thumbnailMode, thumbPage,
-            rendered, nAnnots, annotPage, annotsDone));
+            sel, n, qStart, qEnd, qLen, selectedCmdId, (int)IsUIRtl(), (int)wnd->thumbnailMode, thumbPage, rendered,
+            nAnnots, annotPage, annotsDone));
     out.Append(fmt("settingHelp=%d selValue=%s selText=%s\n", (int)helpShown, selValue, selText));
     return finish(0);
 }
 
 static TempStr UpdateCommandNameTemp(MainWindow* win, int cmdId, Str s) {
-    bool isToggle = false;
-    bool newIsOn = false;
-    switch (cmdId) {
-        case CmdToggleInverseSearch: {
-            extern bool gDisableInteractiveInverseSearch;
-            isToggle = true;
-            newIsOn = !gDisableInteractiveInverseSearch;
-        } break;
-        case CmdToggleFullscreen: {
-            isToggle = true;
-            newIsOn = !(win->isFullScreen || win->presentation);
-        } break;
-        case CmdToggleToolbar: {
-            isToggle = true;
-            bool currentlyOn =
-                win->isFullScreen ? FullscreenToolbarModeFromPrefs() != kToolbarHide : !ToolbarModeIsHidden();
-            newIsOn = !currentlyOn;
-        } break;
-        case CmdToggleMenuBar: {
-            isToggle = true;
-            bool visible = SettingsUseTabs() ? gSettings->showMenubarWithTabs : gSettings->showMenubar;
-            newIsOn = !visible;
-        } break;
-        case CmdToggleBookmarks:
-        case CmdToggleTableOfContents: {
-            isToggle = true;
-            newIsOn = !IsSidebarViewShown(win, SidebarView::Bookmarks);
-        } break;
-        case CmdToggleThumbnails: {
-            isToggle = true;
-            newIsOn = !IsSidebarViewShown(win, SidebarView::Thumbnails);
-        } break;
-        case CmdTogglePresentationMode: {
-            isToggle = true;
-            newIsOn = !win->presentation;
-        } break;
-        case CmdToggleLinks: {
-            isToggle = true;
-            newIsOn = !gSettings->showLinks;
-        } break;
-        case CmdToggleHighlightFormFields: {
-            isToggle = true;
-            newIsOn = !gSettings->highlightFormFields;
-        } break;
-        case CmdToggleDisableLinks: {
-            isToggle = true;
-            newIsOn = !gSettings->disableLinks;
-        } break;
-        case CmdToggleImages: {
-            isToggle = true;
-            newIsOn = !ShowImageOutlines();
-        } break;
-        case CmdToggleTransparencyGrid: {
-            isToggle = true;
-            newIsOn = !ShowTransparencyGrid();
-        } break;
-        case CmdTogglePageGrid: {
-            isToggle = true;
-            newIsOn = !ShowPageGrid();
-        } break;
-        case CmdToggleLaserPointer: {
-            isToggle = true;
-            newIsOn = !IsLaserPointerActive();
-        } break;
-        case CmdToggleHoverPreview: {
-            isToggle = true;
-            newIsOn = gSettings->citationHoverDelay < 0;
-        } break;
-        case CmdDebugShowFitContentArea: {
-            isToggle = true;
-            newIsOn = !ShowFitContentArea();
-        } break;
-        case CmdToggleShowAnnotations: {
-            WindowTab* tab = win->CurrentTab();
-            if (tab) {
-                isToggle = true;
-                newIsOn = tab->hideAnnotations;
-            }
-        } break;
-        case CmdToggleContinuousView: {
-            if (win->ctrl) {
-                isToggle = true;
-                newIsOn = !IsContinuous(win->ctrl->GetDisplayMode());
-            }
-        } break;
-        case CmdToggleMangaMode: {
-            DisplayModel* dm = win->AsFixed();
-            if (dm) {
-                isToggle = true;
-                newIsOn = !dm->GetDisplayR2L();
-            }
-        } break;
-        case CmdToggleUniformPageWidth: {
-            DisplayModel* dm = win->AsFixed();
-            if (dm) {
-                isToggle = true;
-                newIsOn = !dm->GetUniformPageWidth();
-            }
-        } break;
-        case CmdToggleTrimEmptyMargins: {
-            DisplayModel* dm = win->AsFixed();
-            if (dm) {
-                isToggle = true;
-                newIsOn = !dm->GetTrimEmptyMargins();
-            }
-        } break;
-        case CmdToggleFreePan: {
-            DisplayModel* dm = win->AsFixed();
-            if (dm) {
-                isToggle = true;
-                newIsOn = !dm->GetFreePan();
-            }
-        } break;
-        case CmdFindToggleMatchCase: {
-            isToggle = true;
-            newIsOn = !win->findMatchCase;
-        } break;
-        case CmdFindToggleMatchWholeWord: {
-            isToggle = true;
-            newIsOn = !win->findMatchWholeWord;
-        } break;
-        case CmdFavoriteToggle: {
-            isToggle = true;
-            newIsOn = !gSettings->showFavorites;
-        } break;
-        case CmdTogglePageInfo: {
-            isToggle = true;
-            newIsOn = !win->pageInfoWanted;
-        } break;
-        case CmdTogglePageBoxes: {
-            isToggle = true;
-            newIsOn = !win->showPageBoxes;
-        } break;
-        case CmdTogglePreservePdfImages: {
-            isToggle = true;
-            newIsOn = !GetPreservePdfImagesInDarkMode();
-        } break;
-        case CmdDebugTogglePredictiveRender: {
-            isToggle = true;
-            newIsOn = !gPredictiveRender;
-        } break;
-        case CmdToggleEngineeringDrawingEnhance: {
-            DisplayModel* dm = win->AsFixed();
-            if (dm) {
-                isToggle = true;
-                newIsOn = !EngineMupdfCadEnhanceActive(dm->GetEngine());
-            }
-        } break;
+    bool isOn = false;
+    // these two name the action instead (below)
+    bool namesAction = cmdId == CmdToggleWindowsPreviewer || cmdId == CmdToggleWindowsSearchFilter;
+    bool isToggle = !namesAction && ToggleCmdState(win, nullptr, cmdId, isOn);
+    // debug toggles: not in toggleCommands, so no state argument
+    if (cmdId == CmdDebugShowFitContentArea) {
+        isToggle = true;
+        isOn = ShowFitContentArea();
     }
-
+    if (cmdId == CmdDebugTogglePredictiveRender) {
+        isToggle = true;
+        isOn = gPredictiveRender;
+    }
     if (isToggle) {
-        return str::JoinTemp(s, newIsOn ? StrL(": set to true") : StrL(": set to false"));
+        return str::JoinTemp(s, isOn ? StrL(": set to false") : StrL(": set to true"));
     }
 
     // these two cycle through values rather than on and off, so they name what
@@ -1819,7 +1674,7 @@ void CommandPaletteWnd::DrawListBoxItem(VirtListBox::DrawItemEvent* ev) {
     // hwnd stays LTR so mouse hit-testing and virtual-control coords match
     // (issue #5956). If the DC is still mirrored (nested RTL hwnd), turn it
     // off so Hebrew glyphs are not reversed.
-    bool isRtl = CommandPaletteUiRtl();
+    bool isRtl = IsUIRtl();
     bool hwndRtl = HwndIsRtl(hwndList);
     bool prevMirrored = hwndRtl ? gfx->SetMirrored(false) : false;
 
@@ -1827,7 +1682,7 @@ void CommandPaletteWnd::DrawListBoxItem(VirtListBox::DrawItemEvent* ev) {
 
     TempStr rightStr = PaletteRightColumnTemp(data);
     PlatformFont* rightFont = PaletteFont(kPaletteMetaFontPx);
-    Color rightCol = ThemeWindowTextDisabledColor();
+    Color rightCol = ThemeWindowDarkerTextColor();
     // a setting's value reads as part of the row; one off its default is bold
     if (IsSettingRow(data) && len(data->settingPath) == 0) {
         rightCol = colText;
@@ -1882,6 +1737,23 @@ void CommandPaletteWnd::DrawListBoxItem(VirtListBox::DrawItemEvent* ev) {
                 rcText.dx -= rightW + gap;
             }
         }
+    }
+
+    // a color setting shows its color before the value, as in advanced settings
+    Color swatch;
+    if (PaletteRowColor(data, itemText, &swatch)) {
+        int dx = DpiScale(kPaletteSwatchDx);
+        int gap = DpiScale(8);
+        Rect rs{0, rc.y + (rc.dy - dx) / 2, dx, dx};
+        if (isRtl) {
+            rs.x = rcText.x;
+            rcText.x += dx + gap;
+        } else {
+            rs.x = rcText.Right() - dx;
+        }
+        rcText.dx -= dx + gap;
+        gfx->FillRect(rs, swatch);
+        gfx->DrawRect(rs, ThemeEdgeColor());
     }
 
     {

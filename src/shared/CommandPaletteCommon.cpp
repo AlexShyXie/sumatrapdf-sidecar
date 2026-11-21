@@ -16,6 +16,7 @@
 #include "DisplayModel.h"
 #include "MainWindow.h"
 #include "Theme.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "SumatraConfig.h"
 #include "Commands.h"
@@ -202,6 +203,16 @@ bool SettingDiffersFromDefault(const ItemDataCP* d) {
     }
     TempStr val = FormatSettingValueTemp(d->settingType, SettingRowPtr(d));
     return !str::Eq(val, FormatSettingDefaultTemp(d->settingType, d->settingDefault));
+}
+
+// The color a "= settings" row shows a swatch of: a color setting's value, or
+// the value typed for one in the value stage
+bool PaletteRowColor(const ItemDataCP* d, Str rowText, Color* colOut) {
+    if (!IsSettingRow(d) || d->settingType != SettingType::Color) {
+        return false;
+    }
+    Str val = len(d->settingPath) > 0 ? rowText : FormatSettingValueTemp(d->settingType, SettingRowPtr(d));
+    return ParseColor(colOut, val);
 }
 
 // Delete on a "= settings" row puts the setting's default back. rowText is the

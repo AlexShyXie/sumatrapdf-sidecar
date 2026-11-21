@@ -10,14 +10,20 @@ FullPathInTitle = false
 LazyLoading = false
 MainWindowBackground = #80fff200
 NoHomeTab = false
+NoCaj2pdfConverterDownload = false
 HomePageSortByFrequentlyRead = false
 HomePageViewMode = thumbnails
 ThumbnailsType = full
 ReloadModifiedDocuments = true
+ShowSignatureStatus = true
+TemporaryFileShowNotification = true
+TemporaryFileAutoMove = true
 RememberOpenedFiles = true
 RememberStatePerDocument = true
 RestoreSession = true
+KeepMissingSessionTabs = true
 ReuseInstance = true
+OpenOnOtherDesktop = switch
 ShowMenubar = true
 ShowMenubarWithTabs = false
 ShowPageNumberInTabs = false
@@ -27,25 +33,34 @@ ShowTips = true
 ShowToolbar = true
 Toolbar = show
 ToolbarPosition = top
+PageInfoLocation = notification
 SearchUIFloating = false
 ShowFavorites = false
+ShowSidebarMiddle = false
 SortFavoritesByName = false
+FavoritesManualOrder = false
 ShowToc = true
 AlwaysShowSidebar = false
+ShowThumbnailsIfNoToc = false
 SidebarOnRight = false
+SidebarAutoHide = false
 ShowLinks = false
+ShowDocumentErrors = true
 HighlightFormFields = true
 ClickEdgeToTurnPage = false
 DisableLinks = false
+DisableLeftDragPan = false
 ExplorerQuickLook = false
 RememberViewOffsetOnPageTurn = false
 MouseWheelTurnsPage = false
+InvertMouseWheel = false
 ScrollEdgeTurnsPage = true
 ShowDocumentFocusIndicator = false
 ShowAnnotationNotification = true
 ShowFileNavigateHint = true
 ShowAnnotationAuthorInTooltip = false
 ShowTocPageNumbers = true
+TocWrapText = false
 AutoGenerateTOC = false
 ShowStartPage = true
 SidebarDx = 0
@@ -55,11 +70,16 @@ SmoothScroll = true
 ScrollLineAmount = 16
 SaveMemory = 50
 PaddingAfterLastPage = false
+ContinuousScrollFollowsRotation = false
 IgnoreDestinationZoom = false
 HighlightLinkDestination = false
+FlashFindMatch = true
 CitationHoverDelay = -1
 ReadAloudSpeed = 1
+ReadAloudSentenceColor = #3b82f6
+ReadAloudWordColor = #f59e0b
 ReadingAutoScrollSpeed = 40
+ReadingAutoScrollMinutes = 0
 ReadingBar [
 	Background = #66ffe082
 	Invert = false
@@ -68,10 +88,12 @@ ReadingBar [
 FastScrollOverScrollbar = false
 PreventSleepInFullscreen = true
 TabWidth = 300
+TabsEqualWidth = true
 Theme = Light
 HelpTheme = app
 DocumentColorsFollowTheme = off
 TocDy = 0
+SidebarMiddleDy = 0
 ToolbarShowReadAloud = false
 ToolbarSize = 18
 TreeFontName = automatic
@@ -79,14 +101,17 @@ TreeFontSize = 0
 UIFontSize = 0
 DisableAntiAlias = false
 EngineeringDrawingEnhance = off
+ShowLineWeights = true
 DisableAutoLinks = false
 UseSysColors = false
 UseTabs = true
+ShowCaption = true
 SelectionToolbar = true
 TabsMru = false
 CtrlTabSimple = false
 ZoomLevels = 
 ZoomIncrement = 0
+FitWidthPercent = 100
 
 FixedPageUI [
 	Grayscale = false
@@ -101,6 +126,7 @@ FixedPageUI [
 		Subdivisions = 4
 		OffsetX = 0
 		OffsetY = 0
+		Slant = 90
 		Color = #8080ff
 		Style = dots
 		Units = in
@@ -138,6 +164,7 @@ ChmUI [
 
 MarkdownUI [
 	UseFixedPageUI = false
+	PreserveLineBreaks = false
 ]
 
 HtmlUI [
@@ -172,6 +199,13 @@ AntiGravity [
 	BgColor = #ffffff
 ]
 
+CustomAI [
+	Name = Custom AI
+	ApiKeyEnv = CUSTOM_AI_API_KEY
+	IncludeCurrentPage = false
+	BgColor = #ffffff
+]
+
 AIChat [
 	FontSize = 0
 	LineSpacing = 0
@@ -195,6 +229,7 @@ Annotations [
 	InkColor = #66ffff00
 	InkColors = #66ffff00 #668bf05d #6699defa #66f199d2 #66e24745
 	InkBorderWidth = 16
+	PopupFontSize = 0
 ]
 
 ExternalViewers [
@@ -211,6 +246,7 @@ PrinterDefaults [
 	PrintScale = shrink
 	Collate = default
 	PrintDpi = 0
+	AutoRotate = true
 ]
 
 Fullscreen [

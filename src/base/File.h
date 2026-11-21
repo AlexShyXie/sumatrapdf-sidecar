@@ -54,9 +54,9 @@ bool IsOnAvailableDrive(Str path);
 bool IsCloudPlaceholder(Str path);
 TempStr StorageInfoTemp(Str path);
 bool IsEphemeralHostFile(Str path);
+bool IsInTempDir(Str path);
 bool SupportsChangeNotifications(Str path);
 bool IsAbsolute(Str path);
-bool IsDriveRoot(Str path);
 bool IsInDir(Str path, Str dir);
 
 bool IsWslUnc(Str path);
@@ -78,7 +78,6 @@ Type GetType(Str path);
 TempStr GetTempFilePathTemp(Str filePrefix = Str());
 TempStr GetSelfExePathTemp();
 #if OS_WIN
-TempWStr GetSelfExePathW();
 // initialCch is only a starting guess; the buffer grows until the path fits.
 // Tests pass a tiny value to exercise that.
 TempWStr GetModulePathTemp(HMODULE mod, int initialCch);
@@ -107,9 +106,7 @@ FileHandle OpenReadWrite(Str path, bool createIfMissing);
 void Close(FileHandle);
 i64 SeekEnd(FileHandle);
 bool WriteAll(FileHandle, Str data);
-bool ReadAt(FileHandle, i64 offset, void* buf, int size);
 bool Flush(FileHandle);
-TempStr LastErrorTemp();
 
 Str ReadFileWithArena(Str path, Arena*);
 Str ReadFile(Str path);
@@ -137,7 +134,6 @@ bool SetModificationTime(Str path, FILETIME lastMod);
 DWORD GetAttributes(Str path);
 bool SetAttributes(Str path, DWORD attrs);
 
-bool StartsWithN(Str path, Str s);
 bool StartsWith(Str path, Str s);
 
 int GetZoneIdentifier(Str path);
@@ -163,7 +159,6 @@ bool RenameReplace(Str newPath, Str oldPath);
 bool OverwriteAtomicRetry(Str dst, Str src, int retryCount, int retrySleepMs);
 
 bool SetAccessTime(Str path, FILETIME accessTime);
-FILETIME GetAccessTime(Str path);
 
 } // namespace file
 
@@ -182,10 +177,7 @@ bool HasWriteAccess(Str dir);
 } // namespace dir
 
 bool FileSystemEntryExists(Str s);
-Str FindFirstValidParentDir(Str path);
-Str PathGetDirTemp(Str path);
-Str PathGetNameTemp(Str path);
-Str SmartResolveDirectory(Str dir);
+TempStr GetDownloadsDirTemp();
 
 bool FileTimeEq(const FILETIME& a, const FILETIME& b);
 int FileTimeDiffInSecs(const FILETIME& ft1, const FILETIME& ft2);

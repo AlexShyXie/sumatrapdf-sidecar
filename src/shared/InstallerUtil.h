@@ -6,6 +6,7 @@
 constexpr DWORD kTenSecondsInMs = 10 * 1000;
 bool IsProcWithModule(DWORD processId, Str modulePath);
 bool KillProcWithId(DWORD processId, bool waitUntilTerminated);
+bool KillProcWithIdAndModule(DWORD processId, Str modulePath, bool waitUntilTerminated);
 Str ReadableProcName(Str procPath);
 extern PreviousInstallationInfo gPrevInstall;
 extern Flags gCliNew;
@@ -39,7 +40,7 @@ void ProcessesUsingInstallation(StrVec& names);
 
 // --- shared by InstallerUtil_win.cpp and each app's Installer.cpp ---
 
-void RestartElevatedForAllUsers(Flags* cli);
+int RestartElevatedForAllUsers(Flags* cli);
 
 // --- shared by InstallerUtil_win.cpp and each app's Uninstaller.cpp ---
 

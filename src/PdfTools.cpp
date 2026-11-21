@@ -30,6 +30,7 @@
 #include "SumatraPDF.h"
 #include "SumatraConfig.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Translations.h"
 #include "ExternalViewers.h"
@@ -59,6 +60,15 @@ static int CalcDlgWidth(PlatformFont* font, Str path, int minW, int padding) {
 // process runs so the next one opens that wide, as Advanced Settings does
 static int gToolDlgLastClientDx = 0;
 
+// shows a tool's output in the file manager; a -for-testing run must not leave
+// file manager windows behind
+static void ShowToolOutput(Str path) {
+    if (gForTesting) {
+        return;
+    }
+    OpenPathInDefaultFileManager(path);
+}
+
 // the Sumatra app icon, shown in each tool dialog's title bar / taskbar
 static HICON GetAppIcon() {
     return LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(GetAppIconID()));
@@ -80,36 +90,31 @@ static void BrowseForDest(HWND owner, Edit* edit, WStr filter, WStr defExt) {
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
     ofn.lpstrDefExt = defExt.s;
 
-    if (GetSaveFileNameW(&ofn)) {
+    if ((TakeTestSaveFileName(&ofn) || GetSaveFileNameW(&ofn))) {
         edit->SetText(ToUtf8Temp(dstFileName));
     }
 }
 
-// PNG / JPEG / BMP, same core formats as the Save Image dialog
-struct ConvertImageFormat {
-    Str label;
-    Str ext; // including the dot, e.g. ".png"
+// GDI+ encoder data for kConvertImageFormats, by the same index
+struct ConvertImageEncoder {
     WStr mime;
     WStr defExt; // OPENFILENAME lpstrDefExt, no dot
 };
 
-static const ConvertImageFormat kConvertImageFormats[] = {
-    {StrL("PNG"), StrL(".png"), L"image/png", L"png"},
-    {StrL("JPEG"), StrL(".jpg"), L"image/jpeg", L"jpg"},
-    {StrL("BMP"), StrL(".bmp"), L"image/bmp", L"bmp"},
+static const ConvertImageEncoder kConvertImageEncoders[] = {
+    {L"image/png", L"png"},
+    {L"image/jpeg", L"jpg"},
+    {L"image/bmp", L"bmp"},
+    {L"image/gif", L"gif"},
 };
-
-static int ConvertImageFormatCount() {
-    return dimofi(kConvertImageFormats);
-}
+static_assert(dimof(kConvertImageEncoders) == kConvertImageFormatCount);
 
 // Every dialog here has the same shape, drawn like the palette: the lines
-// the user types in (a page range, a password), then the files - the source
-// and a destination over a hairline, with Browse - then the footer with a
-// hint, Cancel and the one filled action button, hairlines between the
-// three. The labels and buttons are virtual controls, the text fields
-// native edits, all in one layout tree. Each dialog adds its lines and
-// implements DoIt().
+// the user types in (a page range, a password), a hairline, then the files -
+// the source and a destination over a hairline, with Browse - then the footer
+// with a hint, Cancel and the one filled action button. The labels and
+// buttons are virtual controls, the text fields native edits, all in one
+// layout tree. Each dialog adds its lines and implements DoIt().
 struct PdfToolDialog : WindowBase {
     Str srcPath; // owned
     MainWindow* win = nullptr;
@@ -119,12 +124,15 @@ struct PdfToolDialog : WindowBase {
 
     VBox* mainBox = nullptr;
     Edit* destEdit = nullptr;
-    // PNG / JPEG / BMP next to the destination of the image tools
+    // PNG / JPEG / BMP / GIF next to the destination of the image tools
     DropDown* dropFormat = nullptr;
     bool syncingFormat = false;
     VirtButton* browseBtn = nullptr;
     VirtButton* actionBtn = nullptr;
     VirtButton* cancelBtn = nullptr;
+    VirtText* hintText = nullptr;
+    // a ghost button after the hint, collapsed until a dialog shows it
+    VirtButton* footerBtn = nullptr;
     // the line AddLine() built last, so a dialog can put more in it
     HBox* lastLine = nullptr;
     // the text at a line's right end: the pages a range picks, an image's size
@@ -150,7 +158,7 @@ struct PdfToolDialog : WindowBase {
     VirtText* AddLineMeta();
     void SetMeta(Str s, bool ok);
     void AddFilesBlock(Str destPath, WStr filter, WStr defExt, bool withFormat = false);
-    void AddFooter(Str actionText, Str hint = {});
+    void AddFooter(Str actionText, Str hint = {}, Str footerBtnText = {});
     void FinishDialog(Edit* focusOn);
     void SetActionEnabled(bool enabled);
 
@@ -214,7 +222,7 @@ bool PdfToolDialog::CreateToolDialog(MainWindow* w, WindowTab* tab, Str title) {
     srcPath = str::Dup(tab->filePath);
     colTxt = ThemeWindowTextColor();
     colBg = ThemeWindowControlBackgroundColor();
-    colMuted = ThemeWindowTextDisabledColor();
+    colMuted = ThemeWindowDarkerTextColor();
     closeOnEsc = true;
     onClose = MkFunc1Void(PdfToolDialogOnClose);
 
@@ -244,13 +252,8 @@ bool PdfToolDialog::CreateToolDialog(MainWindow* w, WindowTab* tab, Str title) {
     return true;
 }
 
-// a row with its content centered and the dialog's gap between the controls
 HBox* PdfToolDialog::NewRow() {
-    auto* row = new HBox();
-    row->alignCross = CrossAxisAlign::CrossCenter;
-    row->rtl = IsUIRtl();
-    row->gap = DpiScale(kToolDlgGapDx);
-    return row;
+    return NewDlgRow();
 }
 
 // `dy`: the label pads itself to that height, and so sets its row's;
@@ -339,7 +342,7 @@ static void PaintSrcPath(PdfToolDialog* dlg, VirtPaintCtx* ctx) {
     ctx->gfx->DrawText(name, {r.x + dirDx, r.y, r.dx - dirDx, r.dy}, flags | gfxTextEllipsis, font, dlg->colTxt);
 }
 
-// PNG / JPEG / BMP, as the Save Image dialog has them
+// PNG / JPEG / BMP / GIF, as the Save Image dialog has them
 static DropDown* NewFormatDropDown(HWND parent, PlatformFont* font) {
     auto* dd = new DropDown();
     DropDown::CreateArgs args;
@@ -348,7 +351,7 @@ static DropDown* NewFormatDropDown(HWND parent, PlatformFont* font) {
     args.isRtl = IsUIRtl();
     dd->Create(args);
     StrVec items;
-    for (int i = 0; i < ConvertImageFormatCount(); i++) {
+    for (int i = 0; i < kConvertImageFormatCount; i++) {
         items.Append(kConvertImageFormats[i].label);
     }
     dd->SetItems(items);
@@ -401,11 +404,16 @@ void PdfToolDialog::AddFilesBlock(Str destPath, WStr filter, WStr defExt, bool w
 }
 
 // the hint on the left, Cancel and the action button (the default) on the right
-void PdfToolDialog::AddFooter(Str actionText, Str hint) {
-    mainBox->AddChild(new VirtLine());
+void PdfToolDialog::AddFooter(Str actionText, Str hint, Str footerBtnText) {
     HBox* row = NewRow();
     if (hint) {
-        row->AddChild(NewLabel(hint, fontMeta, colMuted));
+        hintText = NewLabel(hint, fontMeta, colMuted);
+        row->AddChild(hintText);
+    }
+    if (footerBtnText) {
+        footerBtn = NewDlgButton(hwnd, footerBtnText, fontMeta, DlgButtonStyle::Ghost, false);
+        footerBtn->SetIsVisible(false);
+        row->AddChild(footerBtn);
     }
     row->AddChild(new Spacer(0, 0), 1);
 
@@ -427,7 +435,7 @@ void PdfToolDialog::FinishDialog(Edit* focusOn) {
         clientW = std::max(gToolDlgLastClientDx, DpiScale(kToolDlgMinDx));
     }
     Size size = layout->Layout(ExpandHeight(clientW));
-    ResizeHwndToClientArea(hwnd, size.dx, size.dy, false);
+    HwndResizeClientSize(hwnd, size.dx, size.dy);
     windowDy = HwndWindowRect(hwnd).dy;
     // positions everything and picks up the virtual controls to paint
     DoLayout(size);
@@ -449,7 +457,7 @@ int PdfToolDialog::SelectedFormatIdx() const {
         return 0;
     }
     int idx = CbGetCurrentSelection(dropFormat);
-    if (idx < 0 || idx >= ConvertImageFormatCount()) {
+    if (idx < 0 || idx >= kConvertImageFormatCount) {
         return 0;
     }
     return idx;
@@ -547,8 +555,9 @@ void PdfBakeDialog::DoIt(VirtMouseEvent*) {
     logf("PdfBakeDoIt: baking '%s' to '%s'\n", inputPath, destPath);
 
     // build argv for pdfbake_main: "bake" input output
-    char* argv[] = {(char*)"bake", CStrTemp(inputPath), CStrTemp(destPath)};
-    int argc = 3;
+    char* argv[] = {(char*)"bake", (char*)"-p", PdfToolPasswordTemp(win, srcPath), CStrTemp(inputPath),
+                    CStrTemp(destPath)};
+    int argc = dimofi(argv);
 
     fz_set_optind(0);
     int res = pdfbake_main(argc, argv);
@@ -623,8 +632,10 @@ void PdfExtractTextDialog::DoIt(VirtMouseEvent*) {
     bool isPdf = tab && IsPdfDoc(tab);
     if (isPdf) {
         // use muconvert for PDF
-        char* argv[] = {(char*)"convert", (char*)"-o", CStrTemp(destPath), CStrTemp(srcPath), CStrTemp(pages)};
-        int argc = 5;
+        char* argv[] = {(char*)"convert", (char*)"-p",        PdfToolPasswordTemp(win, srcPath),
+                        (char*)"-o",      CStrTemp(destPath), CStrTemp(srcPath),
+                        CStrTemp(pages)};
+        int argc = dimofi(argv);
         fz_set_optind(0);
         ok = muconvert_main(argc, argv) == 0;
     } else {
@@ -636,7 +647,7 @@ void PdfExtractTextDialog::DoIt(VirtMouseEvent*) {
         logf("PdfExtractTextDoIt: extracted successfully\n");
         TempStr path = str::DupTemp(destPath);
         Close();
-        OpenPathInDefaultFileManager(path);
+        ShowToolOutput(path);
     } else {
         logf("PdfExtractTextDoIt: failed to extract text, isPdf: %d\n", (int)isPdf);
         MessageBoxWarning(hwnd, StrL("Failed to extract text."), Tr("Extract Text"));
@@ -691,9 +702,11 @@ void PdfCompressDialog::DoIt(VirtMouseEvent*) {
     logf("PdfCompressDoIt: compressing '%s' to '%s'\n", srcPath, destPath);
 
     // equivalent of: clean -gggg -e 100 -f -i -t -Z input output
-    char* argv[] = {(char*)"clean", (char*)"-gggg", (char*)"-e", (char*)"100",      (char*)"-f",
-                    (char*)"-i",    (char*)"-t",    (char*)"-Z", CStrTemp(srcPath), CStrTemp(destPath)};
-    int argc = 10;
+    char* argv[] = {(char*)"clean", (char*)"-p",       PdfToolPasswordTemp(win, srcPath),
+                    (char*)"-gggg", (char*)"-e",       (char*)"100",
+                    (char*)"-f",    (char*)"-i",       (char*)"-t",
+                    (char*)"-Z",    CStrTemp(srcPath), CStrTemp(destPath)};
+    int argc = dimofi(argv);
 
     fz_set_optind(0);
     int res = pdfclean_main(argc, argv);
@@ -755,8 +768,9 @@ void PdfDecompressDialog::DoIt(VirtMouseEvent*) {
     logf("PdfDecompressDoIt: decompressing '%s' to '%s'\n", srcPath, destPath);
 
     // equivalent of: clean -d input output
-    char* argv[] = {(char*)"clean", (char*)"-d", CStrTemp(srcPath), CStrTemp(destPath)};
-    int argc = 4;
+    char* argv[] = {(char*)"clean", (char*)"-p",       PdfToolPasswordTemp(win, srcPath),
+                    (char*)"-d",    CStrTemp(srcPath), CStrTemp(destPath)};
+    int argc = dimofi(argv);
 
     fz_set_optind(0);
     int res = pdfclean_main(argc, argv);
@@ -823,7 +837,25 @@ void PdfDeletePageDialog::DoIt(VirtMouseEvent*) {
         return;
     }
 
-    WindowTab* sourceTab = isExtract ? FindTabByFile(srcPath, win) : nullptr;
+    // XPS, EPUB, ...: MuPDF draws the pages of the open document into a new PDF
+    WindowTab* docTab = FindTabByFilePath(srcPath, win);
+    if (isExtract && IsMupdfNonPdfDoc(docTab)) {
+        HCURSOR prev = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+        bool ok = ExtractPagesToNewPdf(docTab, parsedPages, destPath);
+        SetCursor(prev);
+        if (!ok) {
+            MessageBoxWarning(hwnd, Tr("Failed to save a file"), Tr("Extract Pages"));
+            return;
+        }
+        MainWindow* w = win;
+        TempStr path = str::DupTemp(destPath);
+        Close();
+        LoadArgs args(path, w);
+        StartLoadDocument(&args);
+        return;
+    }
+
+    WindowTab* sourceTab = isExtract ? FindTabByFilePath(srcPath, win) : nullptr;
     EngineBase* sourceEngine = sourceTab ? sourceTab->GetEngine() : nullptr;
 
     TempStr pageRange;
@@ -850,14 +882,19 @@ void PdfDeletePageDialog::DoIt(VirtMouseEvent*) {
         inputPath = tmpPath;
     }
 
+    // the destination folder may not exist yet (issue #6424)
+    dir::CreateForFile(destPath);
+
     // equivalent of: clean -gggg -e 100 -f -i -t -Z input.pdf output.pdf <page-range>
     // use the same compression flags as Compress PDF so the result is re-written
     // compactly; otherwise the kept pages drag along the original's full content
     // and the output is nearly as big as the source
-    char* argv[] = {(char*)"clean",      (char*)"-gggg",     (char*)"-e",        (char*)"100",
-                    (char*)"-f",         (char*)"-i",        (char*)"-t",        (char*)"-Z",
-                    CStrTemp(inputPath), CStrTemp(destPath), CStrTemp(pageRange)};
-    int argc = 11;
+    char* argv[] = {(char*)"clean",     (char*)"-p",         PdfToolPasswordTemp(win, srcPath),
+                    (char*)"-gggg",     (char*)"-e",         (char*)"100",
+                    (char*)"-f",        (char*)"-i",         (char*)"-t",
+                    (char*)"-Z",        CStrTemp(inputPath), CStrTemp(destPath),
+                    CStrTemp(pageRange)};
+    int argc = dimofi(argv);
 
     fz_set_optind(0);
     int res = pdfclean_main(argc, argv);
@@ -906,14 +943,17 @@ void PdfDeletePageDialog::PreTranslate(WindowBase::PreTranslateEvent* ev) {
 
 bool PdfDeletePageDialog::Create(MainWindow* w, WindowTab* tab, bool isExtractArg) {
     isExtract = isExtractArg;
-    Str title = isExtract ? Tr("Extract Pages From PDF") : Tr("Delete Pages From PDF");
+    // from XPS, EPUB, ... the pages go to a new PDF next to the document
+    bool toNewPdf = isExtract && IsMupdfNonPdfDoc(tab);
+    Str title = isExtract ? Tr("Extract Pages") : Tr("Delete Pages From PDF");
     if (!CreateToolDialog(w, tab, title)) {
         return false;
     }
     pageCount = w->ctrl ? w->ctrl->PageCount() : 0;
     int currentPage = w->ctrl ? w->ctrl->CurrentPageNo() : 1;
     AddPagesLine(fmt("%d", currentPage));
-    AddFilesBlock(MakeUniqueFilePathTemp(srcPath), L"PDF Files\0*.pdf\0All Files\0*.*\0", L"pdf");
+    TempStr destPath = toNewPdf ? DefaultPdfDestPathTemp(srcPath) : MakeUniqueFilePathTemp(srcPath);
+    AddFilesBlock(destPath, L"PDF Files\0*.pdf\0All Files\0*.*\0", L"pdf");
 
     Str actionText = isExtract ? Tr("Extract Pages") : Tr("Delete Pages");
     AddFooter(actionText, PageRangeHint());
@@ -936,7 +976,9 @@ void ShowPdfPageRangeDialog(MainWindow* win, bool isExtract) {
     if (!tab || len(tab->filePath) == 0) {
         return;
     }
-    if (!IsPdfDoc(tab)) {
+    // extract also works for XPS, EPUB, ...; delete rewrites the PDF itself
+    bool canExtract = isExtract && IsMupdfNonPdfDoc(tab);
+    if (!IsPdfDoc(tab) && !canExtract) {
         return;
     }
 
@@ -1043,17 +1085,9 @@ void ShowPdfEncryptDialog(MainWindow* win) {
 // --- Decrypt PDF dialog ---
 
 struct PdfDecryptDialog : PdfToolDialog {
-    // the password the document was opened with
-    Str password;
-
-    ~PdfDecryptDialog() override;
-    bool Create(MainWindow* win, WindowTab* tab, Str pwd);
+    bool Create(MainWindow* win, WindowTab* tab);
     void DoIt(VirtMouseEvent* ev = nullptr) override;
 };
-
-PdfDecryptDialog::~PdfDecryptDialog() {
-    str::FreePtr(&password);
-}
 
 void PdfDecryptDialog::DoIt(VirtMouseEvent*) {
     TempStr destPath = destEdit->GetTextTemp();
@@ -1061,16 +1095,14 @@ void PdfDecryptDialog::DoIt(VirtMouseEvent*) {
         return;
     }
 
-    logf("PdfDecryptDoIt: decrypting '%s' to '%s', password len: %d\n", srcPath, destPath, len(password));
+    logf("PdfDecryptDoIt: decrypting '%s' to '%s'\n", srcPath, destPath);
 
-    // equivalent of: clean -p <pwd> -D input output
-    // -p provides the password to open the encrypted input, -D removes encryption from output
-    char* argv[] = {(char*)"clean", (char*)"-p",       CStrTemp(password),
+    // equivalent of: clean -p <key> -D input output
+    char* argv[] = {(char*)"clean", (char*)"-p",       PdfToolPasswordTemp(win, srcPath),
                     (char*)"-D",    CStrTemp(srcPath), CStrTemp(destPath)};
-    int argc = 6;
 
     fz_set_optind(0);
-    int res = pdfclean_main(argc, argv);
+    int res = pdfclean_main(dimofi(argv), argv);
     if (res == 0) {
         logf("PdfDecryptDoIt: decrypted successfully\n");
         MainWindow* w = win;
@@ -1079,17 +1111,15 @@ void PdfDecryptDialog::DoIt(VirtMouseEvent*) {
         LoadArgs args(path, w);
         StartLoadDocument(&args);
     } else {
-        logf("PdfDecryptDoIt: pdfclean_main failed with %d, src: '%s', password len: %d\n", res, srcPath,
-             len(password));
-        MessageBoxWarning(hwnd, StrL("Failed to decrypt PDF file."), Tr("Decrypt PDF"));
+        logf("PdfDecryptDoIt: failed, src: '%s'\n", srcPath);
+        ShowWarningNotification(win, Tr("Failed to decrypt PDF file."), kNotif5SecsTimeOut);
     }
 }
 
-bool PdfDecryptDialog::Create(MainWindow* w, WindowTab* tab, Str pwd) {
+bool PdfDecryptDialog::Create(MainWindow* w, WindowTab* tab) {
     if (!CreateToolDialog(w, tab, Tr("Decrypt PDF"))) {
         return false;
     }
-    password = str::Dup(pwd);
     AddFilesBlock(MakeUniqueFilePathTemp(srcPath), L"PDF Files\0*.pdf\0All Files\0*.*\0", L"pdf");
     AddFooter(Tr("Decrypt PDF"));
     FinishDialog(destEdit);
@@ -1112,15 +1142,10 @@ void ShowPdfDecryptDialog(MainWindow* win) {
         logf("ShowPdfDecryptDialog: '%s' is not encrypted, skipping\n", tab->filePath);
         return;
     }
-    Str pwd = EngineMupdfGetPassword(engine);
-    if (len(pwd) == 0) {
-        logf("ShowPdfDecryptDialog: '%s' is encrypted but no password available\n", tab->filePath);
-        return;
-    }
-    logf("ShowPdfDecryptDialog: opening for '%s', password len: %d\n", tab->filePath, len(pwd));
+    logf("ShowPdfDecryptDialog: opening for '%s'\n", tab->filePath);
 
     auto* dlg = new PdfDecryptDialog();
-    if (!dlg->Create(win, tab, pwd)) {
+    if (!dlg->Create(win, tab)) {
         delete dlg;
     }
 }
@@ -1142,13 +1167,15 @@ void ConvertToPdfDialog::DoIt(VirtMouseEvent*) {
     }
     DisplayModel* dm = win->AsFixed();
     EngineBase* engine = dm ? dm->GetEngine() : nullptr;
-    if (!engine || !engine->isImageCollection) {
+    bool isOfd = EngineMupdfIsOfd(engine);
+    if (!engine || !(engine->isImageCollection || isOfd)) {
         MessageBoxWarning(hwnd, Tr("Failed to save a file"), Tr("Convert to PDF"));
         return;
     }
 
     logf("ConvertToPdf: converting '%s' to '%s'\n", srcPath, destPath);
-    bool ok = ConvertImageCollectionToPdf(engine, destPath);
+    // OFD keeps its text and vector paths; image collections become one image per page
+    bool ok = isOfd ? EngineMupdfSaveAsPdf(engine, destPath) : ConvertImageCollectionToPdf(engine, destPath);
     if (ok) {
         logf("ConvertToPdf: converted successfully\n");
         MainWindow* w = win;
@@ -1181,7 +1208,7 @@ void ShowConvertToPdfDialog(MainWindow* win) {
         return;
     }
     EngineBase* engine = tab->GetEngine();
-    if (!engine || !engine->isImageCollection) {
+    if (!engine || !(engine->isImageCollection || EngineMupdfIsOfd(engine))) {
         return;
     }
     if (!engine->AllowsPrinting()) {
@@ -1190,6 +1217,174 @@ void ShowConvertToPdfDialog(MainWindow* win) {
     logf("ShowConvertToPdfDialog: opening for '%s'\n", tab->filePath);
 
     auto* dlg = new ConvertToPdfDialog();
+    if (!dlg->Create(win, tab)) {
+        delete dlg;
+    }
+}
+
+// --- Convert EPUB to PDF dialog ---
+
+// the page sizes of kEbookPdfPageSizes, A5 first
+static DropDown* NewPageSizeDropDown(HWND parent, PlatformFont* font) {
+    auto* dd = new DropDown();
+    DropDown::CreateArgs args;
+    args.parent = parent;
+    args.font = font;
+    args.isRtl = IsUIRtl();
+    dd->Create(args);
+    StrVec items;
+    for (const EbookPdfPageSize& ps : kEbookPdfPageSizes) {
+        items.Append(ps.label);
+    }
+    dd->SetItems(items);
+    CbSetCurrentSelection(dd, 0);
+    dd->SetColors(ThemeWindowTextColor(), ThemeWindowControlBackgroundColor());
+    return dd;
+}
+
+// editable combo listing kEbookPdfFontSizes; any other size can be typed in
+static DropDown* NewFontSizeCombo(HWND parent, PlatformFont* font) {
+    DropDown::CreateArgs args;
+    args.parent = parent;
+    args.font = font;
+    args.isRtl = IsUIRtl();
+    args.isEditable = true;
+    auto* dd = new DropDown();
+    dd->Create(args);
+    StrVec items;
+    for (int size : kEbookPdfFontSizes) {
+        items.Append(fmt("%d", size));
+    }
+    dd->SetItems(items);
+    dd->SetText(fmt("%d", kEbookPdfDefaultFontSize));
+    dd->SetColors(ThemeWindowTextColor(), ThemeWindowControlBackgroundColor());
+    return dd;
+}
+
+// lays the book out into pages of the chosen size and writes them as a PDF
+// that keeps the text, then opens it
+struct ConvertEpubToPdfDialog : PdfToolDialog {
+    DropDown* dropPageSize = nullptr;
+    DropDown* dropFontSize = nullptr;
+
+    bool Create(MainWindow* win, WindowTab* tab);
+    void DoIt(VirtMouseEvent* ev = nullptr) override;
+};
+
+void ConvertEpubToPdfDialog::DoIt(VirtMouseEvent*) {
+    TempStr destPath = destEdit->GetTextTemp();
+    if (len(destPath) == 0) {
+        return;
+    }
+    int fontSize = EbookPdfFontSizeFromText(dropFontSize->GetTextTemp());
+    if (fontSize == 0) {
+        MessageBoxWarning(hwnd, Tr("Invalid font size"), Tr("Convert EPUB to PDF"));
+        return;
+    }
+    int idx = CbGetCurrentSelection(dropPageSize);
+    if (idx < 0 || idx >= dimofi(kEbookPdfPageSizes)) {
+        idx = 0;
+    }
+    const EbookPdfPageSize& ps = kEbookPdfPageSizes[idx];
+    logf("ConvertEpubToPdf: '%s' -> '%s', %s, %d pt\n", srcPath, destPath, ps.label, fontSize);
+
+    HCURSOR prev = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    int nPages = EngineMupdfEbookToPdf(srcPath, destPath, ps.dx, ps.dy, (float)fontSize);
+    SetCursor(prev);
+    if (nPages == 0) {
+        MessageBoxWarning(hwnd, Tr("Failed to save a file"), Tr("Convert EPUB to PDF"));
+        return;
+    }
+    logf("ConvertEpubToPdf: wrote %d pages\n", nPages);
+    MainWindow* w = win;
+    TempStr path = str::DupTemp(destPath);
+    Close();
+    LoadArgs args(path, w);
+    StartLoadDocument(&args);
+}
+
+bool ConvertEpubToPdfDialog::Create(MainWindow* w, WindowTab* tab) {
+    if (!CreateToolDialog(w, tab, Tr("Convert EPUB to PDF"))) {
+        return false;
+    }
+    AddLine(Tr("Page size"));
+    dropPageSize = NewPageSizeDropDown(hwnd, fontText);
+    lastLine->AddChild(dropPageSize);
+
+    AddLine(Tr("Font size"));
+    dropFontSize = NewFontSizeCombo(hwnd, fontText);
+    lastLine->AddChild(dropFontSize);
+
+    AddFilesBlock(DefaultPdfDestPathTemp(srcPath), L"PDF Files\0*.pdf\0All Files\0*.*\0", L"pdf");
+    AddFooter(Tr("Convert to PDF"));
+    FinishDialog(destEdit);
+    return true;
+}
+
+void ShowConvertEpubToPdfDialog(MainWindow* win) {
+    if (!win || !win->IsDocLoaded()) {
+        return;
+    }
+    WindowTab* tab = win->CurrentTab();
+    if (!IsEpubDoc(tab)) {
+        return;
+    }
+    logf("ShowConvertEpubToPdfDialog: opening for '%s'\n", tab->filePath);
+
+    auto* dlg = new ConvertEpubToPdfDialog();
+    if (!dlg->Create(win, tab)) {
+        delete dlg;
+    }
+}
+
+// runs caj2pdf on the open CAJ file, then opens the PDF
+struct ConvertCajToPdfDialog : PdfToolDialog {
+    bool Create(MainWindow* win, WindowTab* tab);
+    void DoIt(VirtMouseEvent* ev = nullptr) override;
+};
+
+void ConvertCajToPdfDialog::DoIt(VirtMouseEvent*) {
+    TempStr destPath = destEdit->GetTextTemp();
+    if (len(destPath) == 0) {
+        return;
+    }
+    logf("ConvertCajToPdf: '%s' -> '%s'\n", srcPath, destPath);
+
+    HCURSOR prev = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    bool ok = ConvertCajToPdf(srcPath, destPath);
+    SetCursor(prev);
+    if (!ok) {
+        MessageBoxWarning(hwnd, CajErrorReasonTemp(srcPath), Tr("Convert CAJ to PDF"));
+        return;
+    }
+    MainWindow* w = win;
+    TempStr path = str::DupTemp(destPath);
+    Close();
+    LoadArgs args(path, w);
+    StartLoadDocument(&args);
+}
+
+bool ConvertCajToPdfDialog::Create(MainWindow* w, WindowTab* tab) {
+    if (!CreateToolDialog(w, tab, Tr("Convert CAJ to PDF"))) {
+        return false;
+    }
+    AddFilesBlock(DefaultPdfDestPathTemp(srcPath), L"PDF Files\0*.pdf\0All Files\0*.*\0", L"pdf");
+    AddFooter(Tr("Convert to PDF"));
+    FinishDialog(destEdit);
+    return true;
+}
+
+void ShowConvertCajToPdfDialog(MainWindow* win) {
+    if (!win || !win->IsDocLoaded()) {
+        return;
+    }
+    WindowTab* tab = win->CurrentTab();
+    if (!IsCajDoc(tab)) {
+        return;
+    }
+    logf("ShowConvertCajToPdfDialog: opening for '%s'\n", tab->filePath);
+
+    auto* dlg = new ConvertCajToPdfDialog();
     if (!dlg->Create(win, tab)) {
         delete dlg;
     }
@@ -1242,7 +1437,7 @@ static bool GetImageEncoderForPath(Str path, CLSID* encOut) {
         return false;
     }
     int idx = ConvertImageFormatIdxFromPath(path);
-    CLSID enc = GetGdiPlusEncoderClsid(kConvertImageFormats[idx].mime);
+    CLSID enc = GetGdiPlusEncoderClsid(kConvertImageEncoders[idx].mime);
     if (enc.Data1 == 0 && enc.Data2 == 0 && enc.Data3 == 0) {
         return false;
     }
@@ -1300,6 +1495,9 @@ struct ConvertPdfToImagesDialog : PdfToolDialog {
     void DoIt(VirtMouseEvent* ev = nullptr) override;
     void OnBrowseTemplate(VirtMouseEvent* ev = nullptr);
     void UpdateButton();
+    bool SelectedPages(Vec<int>& pages);
+    void UpdateExisting(bool pagesOk);
+    void OnUseNewNames(VirtMouseEvent* ev = nullptr);
     void OnPagesModeChanged();
     void OnDpiPicked();
     void OnDpiTyped();
@@ -1356,7 +1554,61 @@ void ConvertPdfToImagesDialog::UpdateButton() {
         int n = radioAll && radioAll->IsChecked() ? pageCount : 1;
         SetMeta(PageCountTextTemp(n, pageCount), true);
     }
+    UpdateExisting(destOk && pagesOk);
     SetActionEnabled(destOk && pagesOk && dpi > 0);
+}
+
+// the pages the mode picks; false for a custom range that doesn't parse
+bool ConvertPdfToImagesDialog::SelectedPages(Vec<int>& pages) {
+    VecReset(pages);
+    if (radioCurrent && radioCurrent->IsChecked()) {
+        DisplayModel* dm = win ? win->AsFixed() : nullptr;
+        int cur = dm ? dm->CurrentPageNo() : 0;
+        if (cur < 1 || cur > pageCount) {
+            return false;
+        }
+        VecAppend(pages, cur);
+        return true;
+    }
+    if (radioAll && radioAll->IsChecked()) {
+        CollectAllPages(pageCount, pages);
+        return true;
+    }
+    TempStr custom = pagesEdit ? pagesEdit->GetTextTemp() : TempStr{};
+    return ParseDeletePages(custom, pageCount, pages);
+}
+
+// files the conversion would overwrite: the hint says how many, the action
+// becomes Overwrite and Use New Names picks free names (#6439)
+void ConvertPdfToImagesDialog::UpdateExisting(bool pagesOk) {
+    int nExisting = 0;
+    Vec<int> pages;
+    if (pagesOk && SelectedPages(pages)) {
+        nExisting = CountExistingImages(destEdit->GetTextTemp(), pages);
+    }
+    if (nExisting > 0) {
+        hintText->SetText(ExistingImagesTextTemp(nExisting));
+        hintText->SetColor(kColText, colTxt);
+        actionBtn->SetText(Tr("Overwrite"));
+    } else {
+        hintText->SetText(Tr("Use <N> for the page number"));
+        hintText->SetColor(kColText, colMuted);
+        actionBtn->SetText(Tr("Convert"));
+    }
+    footerBtn->SetIsVisible(nExisting > 0);
+    if (layout) {
+        DoLayout(); // the texts' widths changed
+    }
+    HwndInvalidate(hwnd);
+}
+
+void ConvertPdfToImagesDialog::OnUseNewNames(VirtMouseEvent*) {
+    Vec<int> pages;
+    if (!SelectedPages(pages)) {
+        return;
+    }
+    destEdit->SetText(UniqueImagesTemplateTemp(destEdit->GetTextTemp(), pages));
+    UpdateButton();
 }
 
 void ConvertPdfToImagesDialog::OnBrowseTemplate(VirtMouseEvent*) {
@@ -1375,12 +1627,12 @@ void ConvertPdfToImagesDialog::OnBrowseTemplate(VirtMouseEvent*) {
     ofn.hwndOwner = hwnd;
     ofn.lpstrFile = dstFileName;
     ofn.nMaxFile = dimof(dstFileName);
-    ofn.lpstrFilter = L"PNG\0*.png\0JPEG\0*.jpg;*.jpeg\0BMP\0*.bmp\0All Files\0*.*\0";
+    ofn.lpstrFilter = L"PNG\0*.png\0JPEG\0*.jpg;*.jpeg\0BMP\0*.bmp\0GIF\0*.gif\0All Files\0*.*\0";
     ofn.nFilterIndex = (DWORD)(fmtIdx + 1);
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
-    ofn.lpstrDefExt = kConvertImageFormats[fmtIdx].defExt.s;
+    ofn.lpstrDefExt = kConvertImageEncoders[fmtIdx].defExt.s;
 
-    if (!GetSaveFileNameW(&ofn)) {
+    if (!(TakeTestSaveFileName(&ofn) || GetSaveFileNameW(&ofn))) {
         return;
     }
     TempStr picked = ToUtf8Temp(dstFileName);
@@ -1391,7 +1643,7 @@ void ConvertPdfToImagesDialog::OnBrowseTemplate(VirtMouseEvent*) {
     }
     destEdit->SetText(picked);
     int filterIdx = (int)ofn.nFilterIndex - 1;
-    if (filterIdx >= 0 && filterIdx < ConvertImageFormatCount()) {
+    if (filterIdx >= 0 && filterIdx < kConvertImageFormatCount) {
         syncingFormat = true;
         CbSetCurrentSelection(dropFormat, filterIdx);
         syncingFormat = false;
@@ -1409,24 +1661,13 @@ void ConvertPdfToImagesDialog::DoIt(VirtMouseEvent*) {
     DisplayModel* dm = win ? win->AsFixed() : nullptr;
     EngineBase* engine = dm ? dm->GetEngine() : nullptr;
     if (!engine) {
-        MessageBoxWarning(hwnd, StrL("Failed to convert PDF to images."), Tr("Convert PDF to Images"));
+        MessageBoxWarning(hwnd, StrL("Failed to convert to images."), Tr("Convert to Images"));
         return;
     }
 
     Vec<int> pages;
-    if (radioCurrent && radioCurrent->IsChecked()) {
-        int cur = dm->CurrentPageNo();
-        if (cur < 1 || cur > pageCount) {
-            return;
-        }
-        VecAppend(pages, cur);
-    } else if (radioAll && radioAll->IsChecked()) {
-        CollectAllPages(pageCount, pages);
-    } else {
-        TempStr custom = pagesEdit ? pagesEdit->GetTextTemp() : TempStr{};
-        if (!ParseDeletePages(custom, pageCount, pages)) {
-            return;
-        }
+    if (!SelectedPages(pages)) {
+        return;
     }
 
     // the box may have been filled without a change notification
@@ -1435,7 +1676,7 @@ void ConvertPdfToImagesDialog::DoIt(VirtMouseEvent*) {
         return;
     }
     if (!PagesFitDpi(engine, pages, dpi)) {
-        MessageBoxWarning(hwnd, Tr("Too large for this DPI"), Tr("Convert PDF to Images"));
+        MessageBoxWarning(hwnd, Tr("Too large for this DPI"), Tr("Convert to Images"));
         return;
     }
 
@@ -1448,18 +1689,18 @@ void ConvertPdfToImagesDialog::DoIt(VirtMouseEvent*) {
 
     if (nOk == 0) {
         str::Free(firstPath);
-        MessageBoxWarning(hwnd, StrL("Failed to convert PDF to images."), Tr("Convert PDF to Images"));
+        MessageBoxWarning(hwnd, StrL("Failed to convert to images."), Tr("Convert to Images"));
         return;
     }
     logf("ConvertPdfToImages: wrote %d of %d file(s)\n", nOk, len(pages));
     TempStr openPath = str::DupTemp(firstPath);
     str::Free(firstPath);
     Close();
-    OpenPathInDefaultFileManager(openPath);
+    ShowToolOutput(openPath);
 }
 
 bool ConvertPdfToImagesDialog::Create(MainWindow* w, WindowTab* tab) {
-    if (!CreateToolDialog(w, tab, Tr("Convert PDF to Images"))) {
+    if (!CreateToolDialog(w, tab, Tr("Convert to Images"))) {
         return false;
     }
     pageCount = w->ctrl ? w->ctrl->PageCount() : 1;
@@ -1488,11 +1729,16 @@ bool ConvertPdfToImagesDialog::Create(MainWindow* w, WindowTab* tab) {
 
     TempStr noExt = path::GetPathNoExtTemp(srcPath);
     TempStr pngPath = str::JoinTemp(noExt, StrL("-<N>.png"));
+    Vec<int> allPages;
+    CollectAllPages(pageCount, allPages);
+    pngPath = UniqueImagesTemplateTemp(pngPath, allPages);
     AddFilesBlock(pngPath, {}, {}, true);
     browseBtn->onClick =
         MkMethod1<ConvertPdfToImagesDialog, VirtMouseEvent*, &ConvertPdfToImagesDialog::OnBrowseTemplate>(this);
 
-    AddFooter(Tr("Convert"), Tr("Use <N> for the page number"));
+    AddFooter(Tr("Convert"), Tr("Use <N> for the page number"), Tr("Use New Names"));
+    footerBtn->onClick =
+        MkMethod1<ConvertPdfToImagesDialog, VirtMouseEvent*, &ConvertPdfToImagesDialog::OnUseNewNames>(this);
     FinishDialog(destEdit);
 
     destEdit->onTextChanged = MkMethod0<ConvertPdfToImagesDialog, &ConvertPdfToImagesDialog::UpdateButton>(this);
@@ -1509,7 +1755,7 @@ void ShowConvertPdfToImagesDialog(MainWindow* win) {
     if (!tab || len(tab->filePath) == 0) {
         return;
     }
-    if (!IsPdfDoc(tab)) {
+    if (!tab->AsFixed()) {
         return;
     }
     logf("ShowConvertPdfToImagesDialog: opening for '%s'\n", tab->filePath);
@@ -1603,18 +1849,18 @@ void SaveSelectionAsImageDialog::OnBrowseDest(VirtMouseEvent*) {
     ofn.hwndOwner = hwnd;
     ofn.lpstrFile = dstFileName;
     ofn.nMaxFile = dimof(dstFileName);
-    ofn.lpstrFilter = L"PNG\0*.png\0JPEG\0*.jpg;*.jpeg\0BMP\0*.bmp\0All Files\0*.*\0";
+    ofn.lpstrFilter = L"PNG\0*.png\0JPEG\0*.jpg;*.jpeg\0BMP\0*.bmp\0GIF\0*.gif\0All Files\0*.*\0";
     ofn.nFilterIndex = (DWORD)(fmtIdx + 1);
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
-    ofn.lpstrDefExt = kConvertImageFormats[fmtIdx].defExt.s;
+    ofn.lpstrDefExt = kConvertImageEncoders[fmtIdx].defExt.s;
 
-    if (!GetSaveFileNameW(&ofn)) {
+    if (!(TakeTestSaveFileName(&ofn) || GetSaveFileNameW(&ofn))) {
         return;
     }
     TempStr picked = ToUtf8Temp(dstFileName);
     destEdit->SetText(picked);
     int filterIdx = (int)ofn.nFilterIndex - 1;
-    if (filterIdx >= 0 && filterIdx < ConvertImageFormatCount()) {
+    if (filterIdx >= 0 && filterIdx < kConvertImageFormatCount) {
         syncingFormat = true;
         CbSetCurrentSelection(dropFormat, filterIdx);
         syncingFormat = false;

@@ -5,8 +5,12 @@ void EnsureTestSettings();
 TempStr SynctexResultTemp(Str pdfPath, Str srcPath, int line);
 TempStr InverseSearchResultTemp(Str pdfPath, int pageNo, int x, int y);
 TempStr SearchResultTemp(Str pdfPath, Str needle, Str password = Str());
-TempStr FindPageRangeResultTemp(Str pdfPath, Str needle, int first, int last, Str spec = {},
-                                int* exitCodeOut = nullptr);
+enum class FindDirection {
+    Forward,
+    Backward
+};
+TempStr FindPageRangeResultTemp(Str pdfPath, Str needle, int first, int last, Str spec = {}, int* exitCodeOut = nullptr,
+                                FindDirection dir = FindDirection::Forward);
 TempStr DestResultTemp(Str pdfPath, int destNo);
 TempStr NamedDestResultTemp(Str pdfPath, Str destName);
 TempStr ChmResultTemp(Str chmPath, int* exitCodeOut = nullptr);
@@ -14,12 +18,15 @@ TempStr TripleClickLineSelectResultTemp(Str pdfPath, Str clickWord, Str expected
 TempStr ContextMenuSelectionResultTemp(Str word1, Str word2, Str cursorWord, int* exitCodeOut = nullptr);
 TempStr ClickClearsSelectionResultTemp(Str word, int* exitCodeOut = nullptr);
 TempStr RectSelectionDragResultTemp(Str word, int* exitCodeOut = nullptr);
+TempStr DrawRectSelectionResultTemp(Str word, int* exitCodeOut = nullptr);
 TempStr RotatedTextMouseDragResultTemp(Str word, int* exitCodeOut = nullptr);
+TempStr SelectWordEdgesResultTemp(Str word, int* exitCodeOut = nullptr);
 TempStr GoToFindMatchResultTemp(Str word, Str typed, int* exitCodeOut = nullptr);
 TempStr ScrollToLinkResultTemp(int minViewportDelta, int* exitCodeOut = nullptr);
-TempStr I18nErrorStringResultTemp(int* exitCodeOut = nullptr);
 TempStr GetTocResultTemp(Str path, int* exitCodeOut = nullptr);
-TempStr PageLinksResultTemp(Str path, int pageNo, int* exitCodeOut = nullptr);
+TempStr MigrateTabResultTemp(int srcWin, int tabIdx, int dstWin, int* exitCodeOut);
+TempStr PageLinksResultTemp(Str path, int pageNo, int* exitCodeOut = nullptr, const PointF* hit = nullptr);
+TempStr PageImagesResultTemp(Str path, int pageNo, int* exitCodeOut = nullptr);
 TempStr PageCommentsResultTemp(Str path, int pageNo, int* exitCodeOut = nullptr);
 TempStr TocNavigateResultTemp(int destNo, int* exitCodeOut = nullptr);
 TempStr TocSidebarNavResultTemp(int destNo, int* exitCodeOut = nullptr);
@@ -27,10 +34,12 @@ TempStr RenumberSelResultTemp(int layoutChapter, int* exitCodeOut = nullptr);
 TempStr DestZoomNavResultTemp(int destNo, int startZoomPerc, int* exitCodeOut = nullptr);
 TempStr MarkdownTocNavigateResultTemp(int destNo, int minScrollY, int* exitCodeOut = nullptr);
 TempStr MarkdownFollowLinkResultTemp(Str href, bool follow, int* exitCodeOut = nullptr);
+TempStr MarkdownServedResultTemp(int* exitCodeOut = nullptr);
 TempStr CadEnhanceColorsResultTemp(Str path, int pageNo, int zoomPercent, int* exitCodeOut = nullptr);
 TempStr ImageRenderEdgesResultTemp(Str path, int zoomPercent, int clipKind, int* exitCodeOut = nullptr);
 TempStr ImageInsertResultTemp(Str pdfPath, Str imagePath, int* exitCodeOut = nullptr);
-TempStr PageRenderColorsResultTemp(Str path, int* exitCodeOut = nullptr, int pageNo = 1, int zoomPercent = 100);
+TempStr PageRenderColorsResultTemp(Str path, int* exitCodeOut = nullptr, int pageNo = 1, int zoomPercent = 100,
+                                   RenderTarget target = RenderTarget::Export);
 TempStr PageRenderViewPrintResultTemp(Str path, int* exitCodeOut = nullptr);
 TempStr ListSigningCertsResultTemp(int* exitCodeOut = nullptr);
 TempStr SignDocumentResultTemp(Str pdfPath, Str destPath, Str thumbprint, Str certPath, Str certPassword,
@@ -44,15 +53,18 @@ TempStr HiddenTabGoToPageResultTemp(int* exitCodeOut = nullptr);
 TempStr SeedTextSelectionResultTemp(int pageNo, int* exitCodeOut = nullptr);
 TempStr RenderSelectionsResultTemp(int* exitCodeOut = nullptr);
 TempStr ToggleFormButtonResultTemp(int pageNo, int idx, int* exitCodeOut = nullptr);
+TempStr SetFormChoiceResultTemp(int pageNo, int idx, Str value, int* exitCodeOut = nullptr);
 void DiscardUnsavedChangesInAllTabs();
 TempStr ResolveUnsavedChangesResultTemp(Str action, Str path, int* exitCodeOut = nullptr);
 TempStr RefHoverResultTemp(Str action, int x, int y, int* exitCodeOut = nullptr);
+TempStr TemporaryFileResultTemp(Str action, int* exitCodeOut = nullptr);
 TempStr PageInfoResultTemp(int* exitCodeOut = nullptr);
 TempStr SidebarThumbnailsResultTemp(int* exitCodeOut = nullptr);
 TempStr FrameNcStripsResultTemp(int* exitCodeOut = nullptr);
 TempStr WheelWhileClosingResultTemp(int* exitCodeOut = nullptr);
 
 // helpers shared with each app's test commands
+void ExtractPageTextToStdout(EngineBase* engine, int pageNo);
 IPageDestination* NthDestInToc(TocItem* item, int target, int& counter);
 TocItem* NthTocItemWithDest(TocItem* item, int target, int& counter);
 bool FindWordCenter(EngineBase* engine, int pageNo, Str word, double* xOut, double* yOut);

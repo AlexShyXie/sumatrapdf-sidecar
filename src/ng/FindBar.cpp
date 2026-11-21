@@ -30,6 +30,7 @@
 #include "Translations.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "gui/AppShell.h"
 #include "gui/DialogWidgets.h"
@@ -39,11 +40,9 @@
 #include "FindBar.h"
 #include "FindWindow.h"
 #include "AppHelpersCommon.h"
+#include "FindWindowCommon.h"
 
 #include "SumatraLog.h"
-
-// command ids for the bar's toolbar buttons; must not collide with real commands
-constexpr int kFindBarCloseCmdId = (int)CmdLast + 50;
 
 struct FindBarView;
 
@@ -63,12 +62,7 @@ struct FindBarUI {
 };
 
 FindBar::~FindBar() {
-    str::Free(status);
-    if (ui) {
-        ui->ddHistory.Free();
-        str::Free(ui->historyFirst);
-    }
-    delete ui;
+    FindFreeUi(status, ui);
 }
 
 // --- the find box -----------------------------------------------------------
@@ -205,6 +199,10 @@ void DeleteFindBar(MainWindow* win) {
 
 // the compact overlay half of ShowFindBar
 void ShowCompactBar(MainWindow* win) {
+    // one find UI at a time: SearchUIFloating can change while the window is up
+    if (IsFindWindowVisible(win)) {
+        HideFindWindow(win);
+    }
     TempStr term = CurrentFindTermTemp(win);
     if (!win->findBar) {
         win->findBar = new FindBar();
@@ -249,7 +247,7 @@ void HideFindBar(MainWindow* win) {
     win->findBar->visible = false;
     win->findBar->wantFocus = false;
     if (win->findEdit && win->gpuiWin) {
-        gp::InputBlur(win->findEdit, win->gpuiWin->app, win->gpuiWin);
+        InputBlurWhereFocused(win->findEdit, win->gpuiWin);
     }
     AppShellInvalidate(win);
 }
@@ -416,9 +414,6 @@ void FindBarView::OnGripDrag(FindBarView* self, gp::Ctx* cx, const gp::DragMoveE
     gp::Notify(cx);
 }
 
-// the pop-out button: switches to the floating find window
-constexpr int kFindBarPinCmdId = (int)CmdLast + 51;
-
 void FindBarView::OnInput(FindBarView* self, gp::Ctx* cx, const gp::InputEvent* ev) {
     MainWindow* win = self->win;
     if (!IsMainWindowValidAndNotClosing(win)) {
@@ -482,17 +477,6 @@ void FindBarView::OnCmd(FindBarView* self, gp::Ctx* cx, const gp::ClickEvent*, i
             break;
     }
     gp::Notify(cx);
-}
-
-// width of the "n / m" status slot, wide enough for the largest count it will
-// show, so the text field next to it doesn't move on every count update
-static float FindStatusDx(int totalHits, bool capped) {
-    int digits = DecimalDigits(std::max(totalHits, 0));
-    int nChars = (2 * digits) + 3; // N, " / ", M
-    if (capped) {
-        nChars++; // the trailing '+' in e.g. "999 / 999+"
-    }
-    return (float)nChars * 7.f;
 }
 
 // tooltip text for the bar's buttons: "Find Next (F3)"
@@ -593,6 +577,10 @@ gp::El* FindBarBuild(MainWindow* win, gp::Ctx* cx) {
         str::ReplaceWithCopy(&ui->historyFirst, first);
         ui->ddHistory.SetItems(history, -1);
     }
+    if (win->findHistoryWantOpen) {
+        win->findHistoryWantOpen = false;
+        ui->ddHistory.OpenCombo();
+    }
     // picking an entry out of the open history list is a search request;
     // walking the list with the arrow keys only fills the box, and waits for
     // Enter
@@ -605,7 +593,7 @@ gp::El* FindBarBuild(MainWindow* win, gp::Ctx* cx) {
     card->Child(ui->ddHistory.BuildCombo(cx, StrL("find-edit"), edit, (float)FindBarEditDx(bar), false, (float)rowPx,
                                          (float)ui->editFontPx));
 
-    float statusDx = FindStatusDx(bar->statusTotalHits, bar->statusCapped);
+    float statusDx = FindStatusSlotDx(bar->statusTotalHits, bar->statusCapped);
     card->Child(gp::Div(cx->a)->MinW(statusDx)->Child(
         gp::TextEl(cx->a, GpuiDup(cx->a, bar->status))->Font(12)->Fg(th.mutedFg)));
 
@@ -663,5 +651,17 @@ gp::El* FindBarBuild(MainWindow* win, gp::Ctx* cx) {
 void FindBarSetMatchCaseChecked(MainWindow*, bool) {}
 
 void FindBarSetMatchWholeWordChecked(MainWindow*, bool) {}
+
+void FindEditShowHistory(MainWindow* win) {
+    win->findHistoryWantOpen = true;
+    AppShellInvalidate(win);
+}
+
+bool IsFindHistoryOpen(MainWindow* win) {
+    if (win->findBar && win->findBar->ui && win->findBar->ui->ddHistory.comboOpen) {
+        return true;
+    }
+    return FindWindowHistoryOpen(win);
+}
 
 void FindBarSyncHistory(MainWindow*) {}

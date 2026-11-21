@@ -6,6 +6,7 @@
 #include "base/HtmlTags.h"
 #include "base/Pixmap.h"
 #include "base/CssParser.h"
+#include "base/GuessFileType.h"
 
 #include "GumboHtmlParser.h"
 #include "ImageReader.h"
@@ -548,14 +549,28 @@ void HtmlFormatter::EmitImageOrAlt(HtmlToken* t, Str img) {
     }
 }
 
-bool HtmlFormatter::EmitImage(Str img) {
-    ReportIf(len(img) == 0);
+// the image's size from its header; decoding it just to measure was most of
+// a chapter's layout time
+static Size ImageSizeFromData(Str img) {
+    FileTypeInfo fti = GuessFileInfoFromData(img);
+    Size size(fti.imageDx, fti.imageDy);
+    bool known = fti.hasImageSize;
+    FreeFileTypeInfo(&fti);
+    if (known) {
+        return size;
+    }
     Pixmap* pixmap = PixmapFromData(img);
     if (!pixmap) {
-        return false;
+        return Size();
     }
-    Size imgSize(pixmap->width, pixmap->height);
+    size = Size(pixmap->width, pixmap->height);
     FreePixmap(pixmap);
+    return size;
+}
+
+bool HtmlFormatter::EmitImage(Str img) {
+    ReportIf(len(img) == 0);
+    Size imgSize = ImageSizeFromData(img);
     if (imgSize.IsEmpty()) {
         return false;
     }
@@ -1573,13 +1588,3 @@ void DrawHtmlPage(HtmlDrawContext context, PlatformTextRender* textDraw, Vec<Dra
     }
 }
 #endif
-
-HtmlFormatterArgs* CreateFormatterDefaultArgs(int dx, int dy, Arena* textAllocator) {
-    HtmlFormatterArgs* args = new HtmlFormatterArgs();
-    args->SetFontName(L"Georgia");
-    args->fontSize = 12.5f;
-    args->pageDx = (float)dx;
-    args->pageDy = (float)dy;
-    args->textAllocator = textAllocator;
-    return args;
-}

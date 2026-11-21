@@ -38,6 +38,7 @@ extern "C" {
 #include "Translations.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Canvas.h"
 #include "Commands.h"
@@ -76,7 +77,6 @@ struct AnnotEditChip : VirtCustom {
 static void StartContentsEdit(AnnotEditToolbar*);
 static void EndContentsEdit(AnnotEditToolbar*, bool accept);
 static void DestroyContentsEditor(AnnotEditToolbar*);
-static void PostedStartContentsEdit(MainWindow*);
 static void PostedDeleteSelectedAnnotation(MainWindow*);
 static bool FreeTextInPlaceEditJustEnded();
 
@@ -566,18 +566,6 @@ static void PaintStyleToggle(Gfx* gfx, Rect r, AnnotEditKind kind, Color col, Pl
     }
     PlatformFont* styled = GetPlatformFont(font->name, font->sizePt, style);
     gfx->DrawText(label, r, gfxTextCenter | gfxTextVCenter, styled ? styled : font, col);
-}
-
-static TempStr ChipLabelTemp(const AnnotEditItem& item) {
-    switch (item.kind) {
-        case AnnotEditKind::Opacity:
-            return fmt("%d%%", ((item.number * 100) + 127) / 255);
-        case AnnotEditKind::Border:
-        case AnnotEditKind::TextSize:
-            return fmt("%d", item.number);
-        default:
-            return item.text;
-    }
 }
 
 void AnnotEditChip::Paint(VirtPaintCtx& ctx) {
@@ -1200,7 +1188,7 @@ static bool GetAnnotScreenBounds(MainWindow* win, Annotation* annot, Rect& out) 
 // popup is TOPMOST (issue #6111)
 static HWND ToolbarZ(AnnotEditToolbar* tb) {
     MainWindow* win = tb ? tb->win : nullptr;
-    if (win && (win->isFullScreen || win->presentation)) {
+    if (win && (win->IsFullScreenOrPresentation())) {
         return HWND_TOPMOST;
     }
     return HWND_TOP;
@@ -1332,15 +1320,16 @@ static void EndContentsEdit(AnnotEditToolbar* tb, bool accept) {
     }
 }
 
+// posted tasks outlive the window that posted them: check it's still there
 static void PostedAcceptContents(MainWindow* win) {
-    if (!win || !win->annotEditToolbar) {
+    if (!IsMainWindowValid(win) || !win->annotEditToolbar) {
         return;
     }
     EndContentsEdit(win->annotEditToolbar, true);
 }
 
 static void PostedCancelContents(MainWindow* win) {
-    if (!win || !win->annotEditToolbar) {
+    if (!IsMainWindowValid(win) || !win->annotEditToolbar) {
         return;
     }
     EndContentsEdit(win->annotEditToolbar, false);
@@ -1389,7 +1378,7 @@ static bool KeepContentsEditOnKillFocus(AnnotEditToolbar* tb, HWND next) {
 }
 
 static void PostedRefocusContents(MainWindow* win) {
-    AnnotEditToolbar* tb = win ? win->annotEditToolbar : nullptr;
+    AnnotEditToolbar* tb = IsMainWindowValidAndNotClosing(win) ? win->annotEditToolbar : nullptr;
     if (!tb || tb->contentsEditClosing || !tb->editingContents || !tb->contentsEdit) {
         return;
     }
@@ -1528,7 +1517,10 @@ static void LayoutContentsEditor(AnnotEditToolbar* tb) {
     int wantDx = std::max(tb->lastAnnotBounds.dx, DpiScale(320));
     wantDx = std::min(wantDx, std::max(canvas.dx - DpiScale(24), DpiScale(200)));
 
+    // idealDx only raises a short measurement. Cap it too, or a long note
+    // is measured as one line and becomes the card's width.
     tb->contentsEdit->idealDx = wantDx;
+    tb->contentsEdit->maxDx = wantDx;
     auto* slot = new ContentsEditSlot();
     slot->edit = tb->contentsEdit;
     slot->idealSize = {wantDx, tb->contentsEdit->GetIdealSize().dy};
@@ -1583,12 +1575,8 @@ void StartSelectedAnnotContentsEdit(MainWindow* win) {
     StartContentsEdit(tb);
 }
 
-static void PostedStartContentsEdit(MainWindow* win) {
-    StartSelectedAnnotContentsEdit(win);
-}
-
 static void PostedDeleteSelectedAnnotation(MainWindow* win) {
-    AnnotEditToolbar* tb = win ? win->annotEditToolbar : nullptr;
+    AnnotEditToolbar* tb = IsMainWindowValidAndNotClosing(win) ? win->annotEditToolbar : nullptr;
     Annotation* annot = LiveToolbarAnnot(tb);
     if (annot) {
         DeleteAnnotationAndUpdateUI(tb->tab, annot);
@@ -1670,9 +1658,10 @@ static AnnotEditToolbar* GetOrCreateToolbar(MainWindow* win) {
 //--- in-place free text editing
 
 // A plain edit control sits exactly over the free text annotation while you
-// type: same font and size, on a white background so the text stays readable
-// whatever is underneath. Enter makes a new line; Ctrl+Enter, Esc or clicking
-// away ends it and the rendered annotation comes back.
+// type, in the same font and size. Its background is the annotation's; without
+// one the page shows through, with the annotation itself left out of rendering
+// so its text isn't doubled (#6534). Enter makes a new line; Ctrl+Enter, Esc or
+// clicking away ends it and the rendered annotation comes back.
 struct FreeTextInPlaceEdit {
     HWND hwnd = nullptr;
     HFONT font = nullptr;
@@ -1689,6 +1678,11 @@ struct FreeTextInPlaceEdit {
     float scale = 1.f;
     // the annotation's text color, for the typed text and the box's border
     Color textCol = kColBlack;
+    // the annotation's background; without one, the page under the box
+    bool seeThrough = false;
+    Color bgCol = kColWhite;
+    HBRUSH bgBrush = nullptr;
+    HBITMAP bgBmp = nullptr;
 };
 
 // MuPDF stacks free text lines 1.2 * the font size apart and wraps at the
@@ -1765,13 +1759,45 @@ static bool SetInPlaceEditScale(Annotation* annot, RectF pageRect, Rect rc) {
     return true;
 }
 
-// The box follows what has been typed. It never shrinks below the annotation's
-// own box, so committing can only ever grow the annotation.
-static void SizeInPlaceEditToText() {
-    if (!gInPlace.hwnd || !gInPlace.win) {
+// Copy what the canvas last painted under the box (its back buffer) into the
+// brush the box paints its background with, so the page shows through.
+static void CaptureInPlaceBackground() {
+    MainWindow* win = gInPlace.win;
+    if (!gInPlace.hwnd || !gInPlace.seeThrough || !win || !win->buffer) {
         return;
     }
-    TempStr text = HwndGetTextTemp(gInPlace.hwnd);
+    RECT rc;
+    GetClientRect(gInPlace.hwnd, &rc);
+    if (rc.right <= 0 || rc.bottom <= 0) {
+        return;
+    }
+    POINT org{0, 0};
+    MapWindowPoints(gInPlace.hwnd, win->hwndCanvas, &org, 1);
+    HDC src = win->buffer->GetDC();
+    HBITMAP bmp = CreateCompatibleBitmap(src, rc.right, rc.bottom);
+    HDC mem = CreateCompatibleDC(src);
+    HGDIOBJ prev = SelectObject(mem, bmp);
+    BitBlt(mem, 0, 0, rc.right, rc.bottom, src, org.x, org.y, SRCCOPY);
+    SelectObject(mem, prev);
+    DeleteDC(mem);
+    HBRUSH brush = CreatePatternBrush(bmp);
+    DeleteObject(gInPlace.bgBrush);
+    DeleteObject(gInPlace.bgBmp);
+    gInPlace.bgBmp = bmp;
+    gInPlace.bgBrush = brush;
+    InvalidateRect(gInPlace.hwnd, nullptr, TRUE);
+}
+
+// the canvas painted a frame: the page under the box may have changed
+void FreeTextInPlaceEditCanvasPainted(MainWindow* win) {
+    if (IsEditingFreeTextInPlace(win)) {
+        CaptureInPlaceBackground();
+    }
+}
+
+// The size `text` needs: room for the edit control to show it, and for MuPDF
+// to lay it out the same way once the box is gone. Lines don't wrap.
+static Size InPlaceTextFit(Str text) {
     Size ts = MeasureInPlaceText(text);
     int pad = gInPlace.padding;
     // room for the caret past the last glyph
@@ -1788,12 +1814,24 @@ static void SizeInPlaceEditToText() {
     // annotation wrap a line the box had shown whole.
     float emDx = gInPlace.fontPx > 0 ? ((float)ts.dx / (float)gInPlace.fontPx) : 0.f;
     float padPts = 4.f * (float)gInPlace.borderWidth;
-    int nLines = std::max((int)SendMessageW(gInPlace.hwnd, EM_GETLINECOUNT, 0, 0), 1);
+    int nLines = 1;
+    for (int i = 0; i < len(text); i++) {
+        nLines += text.s[i] == '\n' ? 1 : 0;
+    }
     float dxPts = (emDx * (float)gInPlace.textSize * kInPlaceWidthSlack) + padPts;
     float dyPts = ((float)nLines * kFreeTextLineHeight * (float)gInPlace.textSize) + padPts;
     want.dx = std::max(want.dx, (int)(dxPts * gInPlace.scale) + caret);
     want.dy = std::max(want.dy, (int)(dyPts * gInPlace.scale));
+    return want;
+}
 
+// The box follows what has been typed. It never shrinks below the annotation's
+// own box.
+static void SizeInPlaceEditToText() {
+    if (!gInPlace.hwnd || !gInPlace.win) {
+        return;
+    }
+    Size want = InPlaceTextFit(HwndGetTextTemp(gInPlace.hwnd));
     want.dx = std::max(want.dx, gInPlace.minSize.dx);
     want.dy = std::max(want.dy, gInPlace.minSize.dy);
     Rect canvas = HwndClientRect(gInPlace.win->hwndCanvas);
@@ -1805,6 +1843,7 @@ static void SizeInPlaceEditToText() {
     }
     gInPlace.size = want;
     SetWindowPos(gInPlace.hwnd, nullptr, 0, 0, want.dx, want.dy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    CaptureInPlaceBackground();
 }
 
 // Scrolling and zooming move the annotation out from under the box.
@@ -1832,6 +1871,7 @@ void RepositionFreeTextInPlaceEdit(MainWindow* win) {
         return;
     }
     SetWindowPos(gInPlace.hwnd, nullptr, r.x, r.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    CaptureInPlaceBackground();
 }
 
 void EndFreeTextInPlaceEdit(bool accept) {
@@ -1844,12 +1884,20 @@ void EndFreeTextInPlaceEdit(bool accept) {
     MainWindow* win = gInPlace.win;
     WindowTab* tab = gInPlace.tab;
     Annotation* annot = gInPlace.annot;
-    Rect editRect = ChildPosWithinParent(hwnd);
+    float scale = gInPlace.scale;
     TempStr text{};
+    Size grow{};
     if (accept) {
         text = str::DupTemp(HwndGetTextTemp(hwnd));
         str::NormalizeNewlinesToLFInPlace(text);
+        if (AnnotationIsLive(annot)) {
+            // the annotation still has the old text
+            grow = FreeTextGrowth(gInPlace.minSize, InPlaceTextFit(Contents(annot)), InPlaceTextFit(text));
+        }
     }
+    bool seeThrough = gInPlace.seeThrough;
+    HBRUSH bgBrush = gInPlace.bgBrush;
+    HBITMAP bgBmp = gInPlace.bgBmp;
     // clear the state and unsubclass before destroying, so the destroy-time
     // WM_KILLFOCUS doesn't come back through the commit path
     gInPlace = {};
@@ -1858,27 +1906,29 @@ void EndFreeTextInPlaceEdit(bool accept) {
     if (font) {
         DeleteObject(font);
     }
+    DeleteObject(bgBrush);
+    DeleteObject(bgBmp);
     bool winOk = win && IsMainWindowValidAndNotClosing(win);
+    if (seeThrough) {
+        // the annotation is drawn again
+        EngineMupdfSetEditedAnnot(tab ? tab->GetEngine() : nullptr, nullptr);
+        if (winOk) {
+            MainWindowRerender(win);
+        }
+    }
     if (winOk) {
         HwndSetFocus(win->hwndCanvas);
     }
     if (accept && AnnotationIsLive(annot)) {
         // the box may be enlarged and the text set: one undo step
         ScopedEngineOperation op(annot->engine, "Edit text");
-        DisplayModel* dm = winOk ? win->AsFixed() : nullptr;
-        int pageNo = PageNo(annot);
-        if (dm && dm->ValidPageNo(pageNo)) {
-            // the box was sized to the text while typing; keep that room so
-            // MuPDF doesn't clip what was just written. Compare in screen
-            // pixels: converting the box back to page coordinates biases it
-            // half a pixel up and to the left, so a page-space union always
-            // looks bigger and would grow the annotation on every edit.
-            RectF cur = GetRect(annot);
-            Rect curScreen = dm->CvtToScreen(pageNo, cur);
-            Rect wanted = curScreen.Union(editRect);
-            if (wanted != curScreen) {
-                SetRect(annot, cur.Union(dm->CvtFromScreen(wanted, pageNo)));
-            }
+        // make room so MuPDF doesn't clip what was just written: to the right
+        // and down, in page units, so the top-left corner stays put
+        if ((grow.dx > 0 || grow.dy > 0) && scale > 0) {
+            RectF r = GetRect(annot);
+            r.dx += (float)grow.dx / scale;
+            r.dy += (float)grow.dy / scale;
+            SetRect(annot, r);
         }
         SetContents(annot, text);
         AnnotChanged(tab);
@@ -1912,6 +1962,9 @@ static LRESULT CALLBACK WndProcFreeTextInPlaceEdit(HWND hwnd, UINT msg, WPARAM w
             }
             // Esc was handled on key down; don't also insert it
             if (wp == VK_ESCAPE) {
+                return 0;
+            }
+            if (EditHandleCtrlBack(hwnd, wp)) {
                 return 0;
             }
             break;
@@ -1966,6 +2019,34 @@ static LRESULT CALLBACK WndProcFreeTextInPlaceEdit(HWND hwnd, UINT msg, WPARAM w
         case EM_REPLACESEL:
             SizeInPlaceEditToText();
             break;
+    }
+    // text drawn on a see-through background doesn't erase what was there:
+    // repaint the whole box when the text, selection or scroll changes
+    if (gInPlace.seeThrough && gInPlace.hwnd == hwnd) {
+        switch (msg) {
+            case WM_CHAR:
+            case WM_KEYDOWN:
+            case WM_PASTE:
+            case WM_CUT:
+            case WM_CLEAR:
+            case WM_UNDO:
+            case WM_SETTEXT:
+            case EM_REPLACESEL:
+            case EM_SETSEL:
+            case WM_LBUTTONDOWN:
+            case WM_LBUTTONUP:
+            case WM_LBUTTONDBLCLK:
+            case WM_HSCROLL:
+            case WM_VSCROLL:
+            case WM_MOUSEWHEEL:
+                InvalidateRect(hwnd, nullptr, TRUE);
+                break;
+            case WM_MOUSEMOVE:
+                if (wp & MK_LBUTTON) {
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                }
+                break;
+        }
     }
     return res;
 }
@@ -2030,8 +2111,23 @@ bool StartFreeTextInPlaceEdit(MainWindow* win, Annotation* annot) {
         UnpackPdfColor(pdfTextCol, r, g, b, a);
         gInPlace.textCol = MkRgb(r, g, b);
     }
+    PdfColor pdfBgCol = GetColor(annot);
+    u8 br = 0, bg = 0, bb = 0, ba = 0;
+    if (pdfBgCol != kColorUnset) {
+        UnpackPdfColor(pdfBgCol, br, bg, bb, ba);
+    }
+    gInPlace.seeThrough = pdfBgCol == kColorUnset || ba == 0;
+    if (!gInPlace.seeThrough) {
+        gInPlace.bgCol = MkRgb(br, bg, bb);
+    }
     // the border was painted before we knew the color
     SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    if (gInPlace.seeThrough) {
+        // the page shows through the box: render it without the annotation
+        EngineMupdfSetEditedAnnot(gInPlace.tab ? gInPlace.tab->GetEngine() : nullptr, annot);
+        MainWindowRerender(win);
+        CaptureInPlaceBackground();
+    }
 
     HwndSetFocus(hwnd);
     // caret at the end, nothing selected: this is editing what is there, not
@@ -2043,14 +2139,20 @@ bool StartFreeTextInPlaceEdit(MainWindow* win, Annotation* annot) {
 }
 
 // WM_CTLCOLOREDIT the canvas gets for the in-place box: the annotation's text
-// color on white. nullptr if `edit` isn't the box.
+// color on its background, or on the page under the box. nullptr if `edit`
+// isn't the box.
 HBRUSH FreeTextInPlaceEditCtlColor(HWND edit, HDC hdc) {
     if (!gInPlace.hwnd || edit != gInPlace.hwnd) {
         return nullptr;
     }
     SetTextColor(hdc, gInPlace.textCol);
-    SetBkColor(hdc, kColWhite);
-    return (HBRUSH)GetStockObject(WHITE_BRUSH);
+    if (gInPlace.seeThrough && gInPlace.bgBrush) {
+        SetBkMode(hdc, TRANSPARENT);
+        return gInPlace.bgBrush;
+    }
+    SetBkColor(hdc, gInPlace.bgCol);
+    SetDCBrushColor(hdc, gInPlace.bgCol);
+    return (HBRUSH)GetStockObject(DC_BRUSH);
 }
 
 TempStr FreeTextInPlaceEditStateTemp(MainWindow* win) {
@@ -2303,7 +2405,7 @@ void DrawAnnotationListRow(Gfx* gfx, PlatformFont* font, Rect rc, Annotation* an
                 gfx->PushClip(rcContents);
                 DrawMaybeHighlightedText(gfx, rcContents, oneLine, filterWords, hlScratch, colBg, false, false,
                                          gfxTextEllipsis | gfxTextVCenter | gfxTextLeft, font,
-                                         EnsureContrast(ThemeWindowTextDisabledColor(), colBg));
+                                         EnsureContrast(ThemeWindowDarkerTextColor(), colBg));
                 gfx->PopClip();
             }
         }
@@ -2381,7 +2483,7 @@ static void BuildAnnotationHoverOverlay(AnnotationHoverOverlay* overlay, Annotat
     CollectAnnotationHoverRows(annot, rows);
 
     Color textColor = AnnotationHoverText();
-    Color labelColor = ThemeWindowTextDisabledColor();
+    Color labelColor = ThemeWindowDarkerTextColor();
     auto* title = NewVirtText({
         .s = AnnotationReadableNameTemp(Type(annot)),
         .font = GetBoldPlatformFont(overlay->font),
@@ -2585,38 +2687,6 @@ void SetSelectedAnnotation(WindowTab* tab, Annotation* annot) {
     ScheduleShowSelectedAnnotationView(tab);
     UpdateAnnotEditToolbar(win);
     UpdateAnnotFilterToolbar(win);
-}
-
-// Load annot wrappers for one page (page + annot dicts, not stext).
-static void LoadAnnotsForPage(EngineMupdf* e, int pageNo) {
-    if (!e || pageNo < 1 || pageNo > e->pageCount) {
-        return;
-    }
-    FzPageInfo* pi = e->GetFzPageInfo(pageNo, true);
-    if (!pi) {
-        logf("LoadAnnotsForPage: page %d GetFzPageInfo failed\n", pageNo);
-        return;
-    }
-}
-
-void StartLoadingAnnotationsForUi(WindowTab* tab) {
-    if (!tab) {
-        return;
-    }
-    DisplayModel* dm = tab->AsFixed();
-    if (!dm) {
-        return;
-    }
-    EngineMupdf* engine = AsEngineMupdf(dm->GetEngine());
-    if (!engine) {
-        return;
-    }
-    Vec<int> firstPages;
-    CollectPriorityAnnotPages(tab, tab->selectedAnnotation, firstPages);
-    for (int pageNo : firstPages) {
-        LoadAnnotsForPage(engine, pageNo);
-    }
-    EngineMupdfStartLoadAllAnnotations(engine, firstPages, MkFunc0(OnAnnotsProgress, tab));
 }
 
 // orig reports canvas pixels as they are

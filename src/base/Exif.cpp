@@ -663,9 +663,10 @@ void ParseMakerNote(ExifParser& parser, int dataOff, u32 count, int depth) {
     int mnBase = dataOff;
     int mnOff = 8;
     int makerNoteEndian = 0;
-    if (count > 10 && (r.UInt8(dataOff) == 'I' || r.UInt8(dataOff) == 'M')) {
+    int firstByte = count > 10 ? r.UInt8(dataOff) : 0;
+    if (firstByte == 'I' || firstByte == 'M') {
         mnOff = 0;
-        makerNoteEndian = r.UInt8(dataOff);
+        makerNoteEndian = firstByte;
     } else if (count > 10 && r.UInt8(dataOff + 6) == 'I' && r.UInt8(dataOff + 7) == 'I') {
         mnOff = 8;
         makerNoteEndian = 'I';
@@ -1052,31 +1053,4 @@ TempStr ExifParser::GetFormattedPropTemp(ExifProp prop) const {
         return {};
     }
     return FormatValuesTemp(*this, (IfdGroup)entry->group, entry->tag, entry->type, entry->count, entry->dataOff);
-}
-
-bool ExifParser::HasProp(ExifProp prop) const {
-    return FindEntry(*this, prop) != nullptr;
-}
-
-ExifValueKind ExifParser::GetPropKind(ExifProp prop) const {
-    const ExifEntry* entry = FindEntry(*this, prop);
-    if (!entry) {
-        return ExifValueKind::Unknown;
-    }
-    if (entry->type == TiffAscii || IsXpProp(prop) || IsAsciiUndefinedProp(prop) || prop == ExifProp::UserComment) {
-        return ExifValueKind::String;
-    }
-    if (entry->type == TiffShort || entry->type == TiffLong || entry->type == TiffSShort || entry->type == TiffSLong) {
-        return ExifValueKind::Int;
-    }
-    if (entry->type == TiffRational || entry->type == TiffSRational) {
-        return ExifValueKind::Rational;
-    }
-    return ExifValueKind::Bytes;
-}
-
-void ExifParser::GetDumpLines(StrVec& linesOut) const {
-    for (Str line : dumpLines) {
-        linesOut.Append(line);
-    }
 }

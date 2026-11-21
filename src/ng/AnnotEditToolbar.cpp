@@ -34,6 +34,7 @@
 #include "Commands.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Toolbar.h"
 #include "SvgIcons.h"
@@ -41,7 +42,6 @@
 #include "SumatraDialogs.h"
 #include "gui/AppShell.h"
 #include "gui/DocCanvas.h"
-#include "gui/ToolWindowPlat.h"
 #include "gui/WasmBridge.h"
 #include "AnnotFilterToolbar.h"
 #include "AnnotTextPopup.h"
@@ -582,13 +582,14 @@ void EndFreeTextInPlaceEdit(bool accept) {
     MainWindow* win = gInPlace.win;
     WindowTab* tab = gInPlace.tab;
     Annotation* annot = gInPlace.annot;
-    gp::Bounds box = gInPlace.box;
     TempStr text = str::DupTemp(FromGpui(gp::InputValue(gInPlace.edit)));
     gInPlace.win = nullptr;
     gInPlace.tab = nullptr;
     gInPlace.annot = nullptr;
     gInPlace.box = {};
     gContentsEditJustEnded = true;
+    // the annotation is drawn again
+    EngineMupdfSetEditedAnnot(tab ? tab->GetEngine() : nullptr, nullptr);
 
     bool winOk = win && IsMainWindowValidAndNotClosing(win);
     if (accept && AnnotationIsLive(annot)) {
@@ -601,28 +602,19 @@ void EndFreeTextInPlaceEdit(bool accept) {
         DisplayModel* dm = winOk ? win->AsFixed() : nullptr;
         int pageNo = PageNo(annot);
         if (dm && dm->ValidPageNo(pageNo)) {
-            // the box grew with the text while typing; keep that room so
-            // MuPDF doesn't clip or wrap what was just written. Compare in
-            // screen pixels: converting the box back to page coordinates
-            // biases it half a pixel up and to the left, so a page-space
-            // union always looks bigger and would grow the annotation on
-            // every edit.
+            // make room so MuPDF doesn't clip or wrap what was just written:
+            // to the right and down, in page units, so the top-left corner
+            // stays put. The annotation still has the old text.
             RectF cur = GetRect(annot);
             Rect curScreen = dm->CvtToScreen(pageNo, cur);
             float scale = cur.dy > 0 ? ((float)curScreen.dy / cur.dy) : 1.f;
-            Size fit = MeasureInPlaceText(annot, text, scale);
-            Rect editRect{curScreen.x, curScreen.y, std::max(curScreen.dx, fit.dx), std::max(curScreen.dy, fit.dy)};
-            if (box.h > 0) {
-                float k = CanvasScale(win);
-                if (k <= 0.f) {
-                    k = 1.f;
-                }
-                Rect painted{curScreen.x, curScreen.y, (int)lroundf(box.w / k), (int)lroundf(box.h / k)};
-                editRect = editRect.Union(painted);
-            }
-            Rect wanted = curScreen.Union(editRect);
-            if (wanted != curScreen) {
-                SetRect(annot, cur.Union(dm->CvtFromScreen(wanted, pageNo)));
+            Size fitOld = MeasureInPlaceText(annot, Contents(annot), scale);
+            Size fitNew = MeasureInPlaceText(annot, text, scale);
+            Size grow = FreeTextGrowth(curScreen.Size(), fitOld, fitNew);
+            if ((grow.dx > 0 || grow.dy > 0) && scale > 0) {
+                cur.dx += (float)grow.dx / scale;
+                cur.dy += (float)grow.dy / scale;
+                SetRect(annot, cur);
             }
         }
         SetContents(annot, text);
@@ -675,6 +667,9 @@ bool StartFreeTextInPlaceEdit(MainWindow* win, Annotation* annot) {
     gInPlace.annot = annot;
     gInPlace.box = {};
     gInPlace.wantFocus = true;
+    // the page shows through the box: render it without the annotation
+    EngineMupdfSetEditedAnnot(tab->GetEngine(), annot);
+    MainWindowRerender(win);
     AppShellInvalidate(win);
     return true;
 }
@@ -972,7 +967,7 @@ static void OnChipClick(AnnotEditToolbar* tb, int chipIdx) {
             break;
         }
         case AnnotEditKind::Contents:
-            uitask::Post(MkFunc0(StartSelectedAnnotContentsEdit, tb->win), "StartAnnotContentsEdit");
+            uitask::Post(MkFunc0(PostedStartContentsEdit, tb->win), "StartAnnotContentsEdit");
             break;
         case AnnotEditKind::Delete:
             // deleting takes the whole row (and this chip) down with it
@@ -1461,13 +1456,11 @@ void AnnotEditView::OnPopupSlider(AnnotEditView* self, gp::Ctx* cx, const gp::Sl
     } else {
         tb->sliderValue = v;
     }
-    // orig rewrites the annotation when the slider is let go
-    if (ev->kind == gp::SliderEventKind::Release) {
-        if (thickness) {
-            ChipThicknessPicked(tb, v);
-        } else {
-            SliderValuePicked(tb, v);
-        }
+    // the annotation follows the drag; the handlers skip unchanged values
+    if (thickness) {
+        ChipThicknessPicked(tb, v);
+    } else {
+        SliderValuePicked(tb, v);
     }
     gp::Notify(cx);
 }
@@ -1520,26 +1513,6 @@ void AnnotEditView::OnContentsOk(AnnotEditView*, gp::Ctx* cx, const gp::ClickEve
 void AnnotEditView::OnContentsCancel(AnnotEditView*, gp::Ctx* cx, const gp::ClickEvent*) {
     EndAnnotContentsEdit(false);
     gp::Notify(cx);
-}
-
-static TempStr ChipLabelTemp(const AnnotEditItem& item) {
-    switch (item.kind) {
-        case AnnotEditKind::Opacity:
-            return fmt("%d%%", ((item.number * 100) + 127) / 255);
-        case AnnotEditKind::Border:
-        case AnnotEditKind::TextSize:
-            return fmt("%d", item.number);
-        case AnnotEditKind::Bold:
-            return str::DupTemp(StrL("B"));
-        case AnnotEditKind::Italic:
-            return str::DupTemp(StrL("I"));
-        case AnnotEditKind::Underline:
-            return str::DupTemp(StrL("U"));
-        case AnnotEditKind::Icon:
-            return str::DupTemp(item.iconName);
-        default:
-            return str::DupTemp(item.text);
-    }
 }
 
 static const char* ChipSvgIcon(AnnotEditKind kind) {
@@ -1910,7 +1883,18 @@ gp::El* FreeTextInPlaceEditBuild(MainWindow* win, gp::Ctx* cx) {
     }
     float fontPx = std::max(6.f, roundf((float)textSize * scale)) * k;
     float pad = kFreeTextPadPerBorder * (float)std::max(BorderWidth(annot), 0) * scale * k;
-    // the annotation's text color on white, as orig's FreeTextInPlaceEditCtlColor
+    // the annotation's text color on its background, or on the page under the
+    // box (the annotation is left out of rendering while edited), as orig's
+    // FreeTextInPlaceEditCtlColor (#6534)
+    gp::Rgba bg = gp::RgbaTransparent();
+    PdfColor pdfBgCol = GetColor(annot);
+    if (pdfBgCol != kColorUnset) {
+        u8 r, g, b, a;
+        UnpackPdfColor(pdfBgCol, r, g, b, a);
+        if (a != 0) {
+            bg = ToGpui(MkRgb(r, g, b));
+        }
+    }
     Color textCol = kColBlack;
     PdfColor pdfTextCol = DefaultAppearanceTextColor(annot);
     if (pdfTextCol != kColorUnset) {
@@ -1922,7 +1906,7 @@ gp::El* FreeTextInPlaceEditBuild(MainWindow* win, gp::Ctx* cx) {
     style.fontSize = fontPx;
     style.foreground = ToGpui(textCol);
     style.caret = ToGpui(textCol);
-    style.background = ToGpui(kColWhite);
+    style.background = bg;
 
     gp::El* box = gp::Div(cx->a)
                       ->Absolute()
@@ -1933,7 +1917,7 @@ gp::El* FreeTextInPlaceEditBuild(MainWindow* win, gp::Ctx* cx) {
                       ->MaxH((float)rc.dy * k)
                       ->ClipY()
                       ->Pad(pad)
-                      ->Bg(ToGpui(kColWhite))
+                      ->Bg(bg)
                       // a frame in the annotation's text color
                       ->Border(1, ToGpui(textCol))
                       ->BoundsOut(&gInPlace.box)
@@ -2153,23 +2137,6 @@ void SetSelectedAnnotation(WindowTab* tab, Annotation* annot) {
     }
 }
 
-void StartLoadingAnnotationsForUi(WindowTab* tab) {
-    DisplayModel* dm = tab ? tab->AsFixed() : nullptr;
-    if (!dm) {
-        return;
-    }
-    EngineBase* engine = dm->GetEngine();
-    if (!EngineSupportsAnnotations(engine)) {
-        return;
-    }
-    Vec<int> firstPages;
-    CollectPriorityAnnotPages(tab, tab->selectedAnnotation, firstPages);
-    for (int pageNo : firstPages) {
-        EngineMupdfLoadAnnotsForPage(engine, pageNo);
-    }
-    EngineMupdfStartLoadAllAnnotations(engine, firstPages, MkFunc0(OnAnnotsProgress, tab));
-}
-
 // tests click the frame; the document model is canvas pixels
 Rect CanvasToFramePx(MainWindow* win, Rect r) {
     float s = CanvasScale(win);
@@ -2183,7 +2150,7 @@ Rect CanvasToFramePx(MainWindow* win, Rect r) {
 
 // selected annotation and loaded-annot count (issue-5933, issue-6023)
 bool AnnotResizeRerenderPending(MainWindow* win) {
-    return win->annotationResizeRerenderLeftMs != 0;
+    return win->annotationResizeRerender.IsArmed();
 }
 
 // --- the hover card of the annotation under the cursor (Edit PDF) -----------
@@ -2324,7 +2291,7 @@ TempStr AnnotationHoverOverlayStateTemp(MainWindow* win) {
     ox = origin.x;
     oy = origin.y;
 #else
-    Rect content = win->gpuiWin ? ToolWinNativeContentRect(win->gpuiWin) : Rect{};
+    Rect content = win->gpuiWin ? FromGpui(gp::WindowContentBounds(win->gpuiWin)) : Rect{};
     if (content.IsEmpty()) {
         content = AppShellWindowScreenRect(win);
     }

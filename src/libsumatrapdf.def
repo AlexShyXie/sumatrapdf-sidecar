@@ -13,6 +13,13 @@ EXPORTS
 	fz_last_uncaught_error
 
 	fz_open_document
+	fz_register_ofd_handler
+	ofd_count_signatures
+	ofd_check_signatures
+	ofd_drop_signature_infos
+	ofd_cert_issued_by
+	ofd_load_attachments
+	ofd_load_attachment
 
 	fz_write_byte
 
@@ -175,6 +182,7 @@ EXPORTS
 	fz_new_image_from_compressed_buffer
 
 	pdf_save_document
+	pdf_set_page_box
 
 	pdf_redact_page
 
@@ -198,6 +206,9 @@ EXPORTS
 	fz_outline_iterator_next
 	fz_outline_iterator_down
 	fz_outline_iterator_up
+	fz_outline_iterator_prev
+	fz_outline_iterator_insert
+	fz_is_external_link
 
 	fz_load_page
 
@@ -209,6 +220,12 @@ EXPORTS
 
 	fz_new_pdf_writer_with_output
 
+	fz_new_pdf_writer
+
+	fz_close_document_writer
+
+	fz_drop_document_writer
+
 	pdf_obj_num_is_stream
 
 	pdf_dict_get_inheritable
@@ -216,6 +233,10 @@ EXPORTS
 	pdf_dict_put_int
 	pdf_dict_put_dict
 	pdf_dict_put_array
+	pdf_dict_put_rect
+	pdf_array_get_real
+	pdf_annot_push_local_xref
+	pdf_annot_pop_local_xref
 	pdf_signature_byte_range
 
 	pdf_new_utf8_from_pdf_string_obj
@@ -233,6 +254,8 @@ EXPORTS
 	fz_set_builtin_font_loader
 
 	sumatra_lookup_font_url
+	sumatra_font_count
+	sumatra_font_at
 
 	pdf_page_transform
 
@@ -243,14 +266,13 @@ EXPORTS
 	fz_drop_page
 
 	fz_colorspace_is_rgb
+	fz_colorspace_type
 
 	fz_colorspace_is_cmyk
 
-	fz_colorspace_is_gray
-
 	fz_new_buffer_from_pixmap_as_jpeg
 
-	fz_new_buffer_from_pixmap_as_png
+	fz_new_buffer_from_image_as_png
 
 	fz_new_stext_page
 
@@ -1317,6 +1339,10 @@ EXPORTS
 	pdf_delete_page_range
 
 	pdf_page_write
+	pdf_create_link
+	pdf_new_outline_iterator
+	pdf_new_uri_from_explicit_dest
+	pdf_parse_write_options
 
 
 
@@ -1527,6 +1553,20 @@ EXPORTS
 	pdf_new_pdf_device
 
 	pdf_write_document
+
+	pdf_count_layers
+
+	pdf_layer_name
+
+	pdf_layer_is_enabled
+
+	pdf_enable_layer
+
+	pdf_count_layer_config_ui
+
+	pdf_layer_config_ui_info
+
+	pdf_toggle_layer_config_ui
 
 	pdf_lookup_page_number
 
@@ -2012,6 +2052,15 @@ EXPORTS
 	pkcs7_windows_check_digest
 	pkcs7_windows_distinguished_name
 	pkcs7_windows_inspect
+	pkcs7_windows_check_chain
+	pkcs7_windows_verify_ts
+	pkcs7_windows_rev_new
+	pkcs7_windows_rev_free
+	pkcs7_windows_rev_add_crl
+	pkcs7_windows_rev_add_ocsp
+	pkcs7_windows_fetch_revocation
+	pdf_signature_hash_bytes
+	pdf_to_int64
 	pkcs7_windows_sig_info_clear
 	pkcs7_windows_sig_info_free
 
@@ -2031,6 +2080,7 @@ EXPORTS
 ; Keep the cmark-gfm static-lib project; link it only into mupdf/libsumatrapdf.dll
 ; and re-export these so SumatraPDF.exe does not carry a second copy.
 
+	cmark_consolidate_text_nodes
 	cmark_find_syntax_extension
 	cmark_get_default_mem_allocator
 	cmark_gfm_core_extensions_ensure_registered
@@ -2038,14 +2088,18 @@ EXPORTS
 	cmark_iter_get_node
 	cmark_iter_new
 	cmark_iter_next
+	cmark_node_append_child
 	cmark_node_first_child
 	cmark_node_free
 	cmark_node_get_heading_level
+	cmark_node_get_literal
 	cmark_node_get_type
 	cmark_node_get_url
 	cmark_node_insert_before
 	cmark_node_new
 	cmark_node_next
+	cmark_node_parent
+	cmark_node_set_literal
 	cmark_node_set_on_enter
 	cmark_node_set_url
 	cmark_node_unlink
@@ -2114,28 +2168,56 @@ EXPORTS
 
 	deskey
 	des
-; mupdf API used by Sidecar.cpp (annotation JSON sidecar)
+
+; sidecar (Sidecar.cpp): JSON parsing, scratch pools, pixmap-to-png
+; and annotation metadata helpers
+
+	fz_colorspace_is_gray
+
+	fz_new_buffer_from_pixmap_as_png
 
 	fz_new_pool
+
 	fz_drop_pool
+
 	fz_parse_json
+
 	fz_json_is_boolean
+
 	fz_json_is_number
+
 	fz_json_is_string
+
 	fz_json_is_array
+
 	fz_json_is_object
+
 	fz_json_to_boolean
+
 	fz_json_to_number
+
 	fz_json_to_string
+
 	fz_json_array_length
+
 	fz_json_array_get
+
 	fz_json_object_get
+
 	pdf_lookup_metadata
+
 	pdf_annot_has_subject
+
 	pdf_annot_is_open
+
 	pdf_set_annot_is_open
+
 	pdf_annot_name
+
 	pdf_set_annot_name
+
 	pdf_annot_subject
+
 	pdf_set_annot_subject
+
 	pdf_set_annot_creation_date

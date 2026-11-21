@@ -13,6 +13,7 @@
 #include "base/GuessFileType.h"
 #include "EngineAll.h"
 #include "Flags.h"
+#include "SumatraTest.h"
 #include "Tests.h"
 
 void TestRenderPage(const Flags& i) {
@@ -56,24 +57,6 @@ void TestRenderPage(const Flags& i) {
     }
 }
 
-static void extractPageText(EngineBase* engine, int pageNo) {
-    PageText pageText = engine->ExtractPageText(pageNo);
-    if (len(pageText.text) == 0) {
-        return;
-    }
-    TempStr s = str::ReplaceTemp(Str(pageText.text.s), StrL("\n"), StrL("_"));
-    printf("text on page %d: '", pageNo);
-    // print characters as hex because I don't know what kind of locale-specific mangling
-    // printf() might do
-    int idx = 0;
-    while (s.s[idx] != 0) {
-        char c = s.s[idx++];
-        printf("%02x ", (u8)c);
-    }
-    printf("'\n");
-    FreePageText(&pageText);
-}
-
 void TestExtractPage(const Flags& ci) {
     if (ci.showConsole) {
         RedirectIOToConsole();
@@ -95,10 +78,10 @@ void TestExtractPage(const Flags& ci) {
         if (pageNo < 0) {
             int nPages = engine->PageCount();
             for (int i = 1; i <= nPages; i++) {
-                extractPageText(engine, i);
+                ExtractPageTextToStdout(engine, i);
             }
         } else {
-            extractPageText(engine, pageNo);
+            ExtractPageTextToStdout(engine, pageNo);
         }
 
         SafeEngineRelease(&engine);

@@ -30,6 +30,7 @@
 #include "Commands.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Toolbar.h"
 #include "gui/AppShell.h"
@@ -135,7 +136,7 @@ void CommitFormFieldEdit(bool save) {
         }
     }
     if (gEdit.edit && win && win->gpuiWin) {
-        gp::InputBlur(gEdit.edit, win->gpuiWin->app, win->gpuiWin);
+        InputBlurWhereFocused(gEdit.edit, win->gpuiWin);
     }
     // ng: the commit runs from the field's own gpui listener, so gpui still
     // holds the InputState for the rest of the event; free it on the next
@@ -390,17 +391,4 @@ gp::El* FormFieldEditBuild(MainWindow* win, gp::Ctx* cx) {
         list->Child(row);
     }
     return list;
-}
-
-TempStr FormFieldEditStateTemp() {
-    if (!gEdit.widget) {
-        return str::DupTemp(StrL("formEdit active=0 choice=0 value=\n"));
-    }
-    Str value;
-    if (gEdit.isChoice) {
-        value = (gEdit.sel >= 0 && gEdit.sel < len(gEdit.options)) ? gEdit.options[gEdit.sel] : Str{};
-    } else if (gEdit.edit) {
-        value = FromGpui(gp::InputValue(gEdit.edit));
-    }
-    return fmt("formEdit active=1 choice=%d page=%d value=%s\n", gEdit.isChoice ? 1 : 0, gEdit.widget->pageNo, value);
 }

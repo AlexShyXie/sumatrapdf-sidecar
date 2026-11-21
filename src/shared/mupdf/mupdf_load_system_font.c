@@ -3,6 +3,7 @@
 // It implements loading of Fonts included in windows
 #include "mupdf/fitz.h"
 #include "mupdf/ucdn.h"
+#include "font_common.h"
 #include "mupdf/pdf.h"
 
 #ifdef _WIN32
@@ -172,6 +173,9 @@ static struct {
     {"Kaiti_GB2312", "KaiTi"},
     {"Kaiti SC", "KaiTi"},
     {"Kaiti TC", "KaiTi"},
+    // "zw" (正文, body text): Chinese EPUB tools point it at e-reader font paths (#6500)
+    {"zw", "MicrosoftYaHei"},
+    {"zw-Bold", "MicrosoftYaHei-Bold"},
 };
 
 static win_font_info* g_win_fonts = NULL;
@@ -636,10 +640,11 @@ static void extend_system_font_list(fz_context* ctx, const WCHAR* path) {
     hList = FindFirstFile(szPath, &FileData);
     if (hList == INVALID_HANDLE_VALUE) {
         // Don't complain about missing directories
-        if (GetLastError() == ERROR_FILE_NOT_FOUND) {
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
             return;
         }
-        fz_throw(ctx, FZ_ERROR_GENERIC, "extend_system_font_list: unknown error %d", GetLastError());
+        fz_throw(ctx, FZ_ERROR_GENERIC, "extend_system_font_list: unknown error %d", err);
     }
     do {
         if (!(FileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -668,10 +673,6 @@ static void extend_system_font_list(fz_context* ctx, const WCHAR* path) {
     FindClose(hList);
 }
 
-// cf. https://blogs.msdn.com/b/oldnewthing/archive/2004/10/25/247180.aspx
-EXTERN_C IMAGE_DOS_HEADER __ImageBase;
-#define CURRENT_HMODULE ((HMODULE) & __ImageBase)
-
 static void create_system_font_list(fz_context* ctx) {
     WCHAR szFontDir[MAX_PATH];
     UINT cch;
@@ -682,23 +683,18 @@ static void create_system_font_list(fz_context* ctx) {
         extend_system_font_list(ctx, szFontDir);
     }
 
+    // fonts installed for the current user only (the default since Windows 10 1809)
+    const WCHAR* userFontsPattern = L"\\Microsoft\\Windows\\Fonts\\*.?t?";
+    size_t patternLen = wcslen(userFontsPattern);
+    cch = GetEnvironmentVariable(L"LOCALAPPDATA", szFontDir, nelem(szFontDir));
+    if (0 < cch && cch + patternLen < nelem(szFontDir)) {
+        wcscat_s(szFontDir, MAX_PATH, userFontsPattern);
+        extend_system_font_list(ctx, szFontDir);
+    }
+
     if (!g_win_fonts) {
         fz_warn(ctx, "couldn't find any usable system fonts");
     }
-
-#ifdef NOCJKFONT
-    {
-        // If no CJK fallback font is builtin but one has been shipped separately (in the same
-        // directory as the main executable), add it to the list of loadable system fonts
-        WCHAR szFile[MAX_PATH], *lpFileName;
-        szFile[0] = '\0';
-        GetModuleFileName(CURRENT_HMODULE, szFontDir, MAX_PATH);
-        szFontDir[nelem(szFontDir) - 1] = '\0';
-        GetFullPathNameW(szFontDir, MAX_PATH, szFile, &lpFileName);
-        lstrcpyn(lpFileName, L"DroidSansFallback.ttf", szFile + MAX_PATH - lpFileName);
-        extend_system_font_list(ctx, szFile);
-    }
-#endif
 
 #ifdef DEBUG
     // allow to overwrite system fonts for debugging purposes
@@ -812,6 +808,14 @@ static fz_font* load_windows_font_by_name(fz_context* ctx, const char* orig_name
         found = find_font_name(fontname, use_clean_name);
         if (found) {
             goto Exit;
+        }
+        for (int i = 0; i < nelem(baseSubstitutes); i++) {
+            if (streq(fontname, baseSubstitutes[i].name)) {
+                found = find_font_name(baseSubstitutes[i].pattern, use_clean_name);
+                if (found) {
+                    goto Exit;
+                }
+            }
         }
         *comma = ',';
     } else {
@@ -946,6 +950,20 @@ static fz_font* load_windows_font(fz_context* ctx, const char* fontname, int bol
     return font;
 }
 
+// the CJK UI font Windows 10+ always has, for an Adobe CJK ordering
+static const char* WindowsCjkUiFont(int ros) {
+    switch (ros) {
+        case FZ_ADOBE_CNS:
+            return "MicrosoftJhengHeiRegular";
+        case FZ_ADOBE_JAPAN:
+            return "YuGothic-Regular";
+        case FZ_ADOBE_KOREA:
+            return "MalgunGothic";
+        default:
+            return "MicrosoftYaHei";
+    }
+}
+
 static fz_font* load_windows_cjk_font(fz_context* ctx, const char* fontname, int ros, int serif) {
     fz_font* font = NULL;
 
@@ -993,14 +1011,15 @@ static fz_font* load_windows_cjk_font(fz_context* ctx, const char* fontname, int
                     fz_throw(ctx, FZ_ERROR_GENERIC, "invalid sans-serif ros");
             }
         }
+        // the fonts above are optional on Windows 10+ outside their locale; the
+        // UI fonts below ship with every install. Without either mupdf falls
+        // back to Droid Sans Fallback, which is downloaded on first use
+        if (!font) {
+            font = load_windows_font_by_name(ctx, WindowsCjkUiFont(ros), 0);
+        }
     }
     fz_catch(ctx) {
-#ifdef NOCJKFONT
-        /* If no CJK fallback font is builtin, maybe one has been shipped separately */
-        font = load_windows_font_by_name(ctx, "DroidSansFallback", 0);
-#else
         fz_rethrow(ctx);
-#endif
     }
 
     return font;
@@ -1178,8 +1197,16 @@ void install_load_windows_font_funcs(fz_context* ctx) {
 
 #include <fontconfig/fontconfig.h>
 
+static int linux_match_has_rune(FcPattern* match, unsigned int rune) {
+    FcCharSet* charset = NULL;
+    return FcPatternGetCharSet(match, FC_CHARSET, 0, &charset) == FcResultMatch && FcCharSetHasChar(charset, rune);
+}
+
+// lang: a fontconfig language ("zh-cn") or NULL. A CJK font has a face per
+// language, which draws shared characters differently (Chinese quotes are full
+// width, Japanese ones aren't)
 static fz_font* load_linux_font_match(fz_context* ctx, const char* name, int bold, int italic, int exact,
-                                      unsigned int rune) {
+                                      unsigned int rune, const char* lang) {
     FcPattern* pattern = FcPatternCreate();
     FcPattern* match = NULL;
     fz_font* font = NULL;
@@ -1191,6 +1218,9 @@ static fz_font* load_linux_font_match(fz_context* ctx, const char* name, int bol
     }
     FcPatternAddInteger(pattern, FC_WEIGHT, bold ? FC_WEIGHT_BOLD : FC_WEIGHT_REGULAR);
     FcPatternAddInteger(pattern, FC_SLANT, italic ? FC_SLANT_ITALIC : FC_SLANT_ROMAN);
+    if (lang) {
+        FcPatternAddString(pattern, FC_LANG, (const FcChar8*)lang);
+    }
     if (rune) {
         FcCharSet* charset = FcCharSetCreate();
         if (charset) {
@@ -1206,6 +1236,13 @@ static fz_font* load_linux_font_match(fz_context* ctx, const char* name, int bol
     match = FcFontMatch(NULL, pattern, &result);
     FcPatternDestroy(pattern);
     if (!match) {
+        return NULL;
+    }
+    // fontconfig's best match needn't have the character (DejaVu Sans for
+    // Hangul on a system without a Korean font). Using it would draw boxes
+    // instead of falling back to mupdf's own font
+    if (rune && !linux_match_has_rune(match, rune)) {
+        FcPatternDestroy(match);
         return NULL;
     }
 
@@ -1237,83 +1274,62 @@ static fz_font* load_linux_font_match(fz_context* ctx, const char* name, int bol
 }
 
 static fz_font* load_linux_font(fz_context* ctx, const char* name, int bold, int italic, int exact) {
-    return load_linux_font_match(ctx, name, bold, italic, exact, 0);
+    if (is_cjk_body_font_alias(name, &bold)) {
+        return load_linux_font_match(ctx, "sans-serif", bold, italic, 0, 0x4e00, "zh-cn");
+    }
+    return load_linux_font_match(ctx, name, bold, italic, exact, 0, NULL);
 }
 
 static fz_font* load_linux_cjk_font(fz_context* ctx, const char* name, int ordering, int serif) {
     unsigned int rune = 0x4e00;
+    const char* lang = "zh-cn";
     if (ordering == FZ_ADOBE_JAPAN) {
         rune = 0x3042;
+        lang = "ja";
     } else if (ordering == FZ_ADOBE_KOREA) {
         rune = 0xac00;
+        lang = "ko";
+    } else if (ordering == FZ_ADOBE_CNS) {
+        lang = "zh-tw";
     }
-    return load_linux_font_match(ctx, name && *name ? name : (serif ? "serif" : "sans-serif"), 0, 0, 0, rune);
+    return load_linux_font_match(ctx, name && *name ? name : (serif ? "serif" : "sans-serif"), 0, 0, 0, rune, lang);
 }
 
-static unsigned int fallback_rune(int script) {
+// The fontconfig language for CJK text, or NULL. Untagged text gets the
+// script's usual language, as Windows picks Microsoft YaHei for Han, Yu Gothic
+// for kana and Malgun Gothic for Hangul
+static const char* fc_cjk_lang(int script, int language) {
+    switch (language) {
+        case FZ_LANG_zh_Hans:
+            return "zh-cn";
+        case FZ_LANG_zh_Hant:
+            return "zh-tw";
+        case FZ_LANG_ja:
+            return "ja";
+        case FZ_LANG_ko:
+            return "ko";
+    }
     switch (script) {
-        case UCDN_SCRIPT_ARABIC:
-            return 0x0627;
-        case UCDN_SCRIPT_ARMENIAN:
-            return 0x0531;
-        case UCDN_SCRIPT_BENGALI:
-            return 0x0985;
-        case UCDN_SCRIPT_CYRILLIC:
-            return 0x0410;
-        case UCDN_SCRIPT_DEVANAGARI:
-            return 0x0905;
-        case UCDN_SCRIPT_ETHIOPIC:
-            return 0x1200;
-        case UCDN_SCRIPT_GEORGIAN:
-            return 0x10d0;
-        case UCDN_SCRIPT_GREEK:
-            return 0x0391;
-        case UCDN_SCRIPT_GUJARATI:
-            return 0x0a85;
-        case UCDN_SCRIPT_GURMUKHI:
-            return 0x0a05;
-        case UCDN_SCRIPT_HANGUL:
-            return 0xac00;
-        case UCDN_SCRIPT_HEBREW:
-            return 0x05d0;
-        case UCDN_SCRIPT_HIRAGANA:
-        case UCDN_SCRIPT_KATAKANA:
-            return 0x3042;
-        case UCDN_SCRIPT_KANNADA:
-            return 0x0c85;
-        case UCDN_SCRIPT_KHMER:
-            return 0x1780;
-        case UCDN_SCRIPT_LAO:
-            return 0x0e81;
-        case UCDN_SCRIPT_MALAYALAM:
-            return 0x0d05;
-        case UCDN_SCRIPT_MYANMAR:
-            return 0x1000;
-        case UCDN_SCRIPT_ORIYA:
-            return 0x0b05;
-        case UCDN_SCRIPT_SINHALA:
-            return 0x0d85;
-        case UCDN_SCRIPT_TAMIL:
-            return 0x0b85;
-        case UCDN_SCRIPT_TELUGU:
-            return 0x0c05;
-        case UCDN_SCRIPT_THAI:
-            return 0x0e01;
-        case UCDN_SCRIPT_TIBETAN:
-            return 0x0f40;
-        case UCDN_SCRIPT_YI:
-            return 0xa000;
         case UCDN_SCRIPT_HAN:
         case UCDN_SCRIPT_BOPOMOFO:
-            return 0x4e00;
+            return "zh-cn";
+        case UCDN_SCRIPT_HIRAGANA:
+        case UCDN_SCRIPT_KATAKANA:
+            return "ja";
+        case UCDN_SCRIPT_HANGUL:
+            return "ko";
         default:
-            return 0x0041;
+            return NULL;
     }
 }
 
 static fz_font* load_linux_fallback_font(fz_context* ctx, int script, int language, int serif, int bold, int italic) {
-    (void)language;
-    return load_linux_font_match(ctx, serif ? "serif" : "sans-serif", bold, italic, 0, fallback_rune(script));
+    unsigned int rune = fallback_rune(script);
+    if (!rune) {
+        return NULL;
+    }
+    return load_linux_font_match(ctx, serif ? "serif" : "sans-serif", bold, italic, 0, rune,
+                                 fc_cjk_lang(script, language));
 }
 
 void install_load_linux_font_funcs(fz_context* ctx) {
@@ -1321,6 +1337,58 @@ void install_load_linux_font_funcs(fz_context* ctx) {
         return;
     }
     fz_install_load_system_font_funcs(ctx, load_linux_font, load_linux_cjk_font, load_linux_fallback_font);
+}
+
+// The bytes of a system font that has rune, malloc'ed, or NULL. For the
+// built-in font loader (EmbeddedResources.cpp), which hands mupdf the data
+// alone, so only a font that is the file's first face will do.
+unsigned char* sumatra_system_font_data_for_rune(unsigned int rune, int* size) {
+    *size = 0;
+    if (!FcInit()) {
+        return NULL;
+    }
+    FcPattern* pattern = FcPatternCreate();
+    if (!pattern) {
+        return NULL;
+    }
+    FcCharSet* charset = FcCharSetCreate();
+    if (charset) {
+        FcCharSetAddChar(charset, rune);
+        FcPatternAddCharSet(pattern, FC_CHARSET, charset);
+        FcCharSetDestroy(charset);
+    }
+    FcConfigSubstitute(NULL, pattern, FcMatchPattern);
+    FcDefaultSubstitute(pattern);
+    FcResult result;
+    FcPattern* match = FcFontMatch(NULL, pattern, &result);
+    FcPatternDestroy(pattern);
+    if (!match) {
+        return NULL;
+    }
+
+    unsigned char* data = NULL;
+    FcChar8* path = NULL;
+    int index = 0;
+    FcPatternGetInteger(match, FC_INDEX, 0, &index);
+    if (linux_match_has_rune(match, rune) && index == 0 &&
+        FcPatternGetString(match, FC_FILE, 0, &path) == FcResultMatch) {
+        FILE* f = fopen((const char*)path, "rb");
+        if (f) {
+            long n = (fseek(f, 0, SEEK_END) == 0) ? ftell(f) : -1;
+            if (n > 0 && fseek(f, 0, SEEK_SET) == 0) {
+                data = (unsigned char*)malloc((size_t)n);
+                if (data && fread(data, 1, (size_t)n, f) == (size_t)n) {
+                    *size = (int)n;
+                } else {
+                    free(data);
+                    data = NULL;
+                }
+            }
+            fclose(f);
+        }
+    }
+    FcPatternDestroy(match);
+    return data;
 }
 
 #endif /* __linux__ */

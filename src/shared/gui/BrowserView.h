@@ -54,7 +54,6 @@ void BrowserViewSetWindow(BrowserView*, MainWindow*);
 
 // show / hide without destroying the browser (a tab switch)
 void BrowserViewSetVisible(BrowserView*, bool visible);
-bool BrowserViewIsVisible(BrowserView*);
 void BrowserViewRefreshSurface(BrowserView*);
 
 void BrowserViewNavigate(BrowserView*, Str url);
@@ -75,6 +74,7 @@ void BrowserViewEval(BrowserView*, Str js);
 
 void BrowserViewSelectAll(BrowserView*);
 void BrowserViewCopySelection(BrowserView*);
+bool BrowserViewCapturePng(BrowserView*, const Func1<Str>& done);
 void BrowserViewPrint(BrowserView*, bool showUI = true);
 // the browser's own find bar (orig's FindInCurrentPage)
 void BrowserViewFindInPageUI(BrowserView*);
@@ -85,17 +85,20 @@ void BrowserViewFindAllPages(BrowserView*, const StrVec& pageUrls, Str term, boo
 void BrowserViewFindGoto(BrowserView*, int idx);
 void BrowserViewFindClear(BrowserView*);
 LRESULT BrowserViewPassUIMsg(BrowserView*, UINT msg, WPARAM wp, LPARAM lp);
+// scroll the page as a navigation key (VK_DOWN, VK_NEXT, …) does in a browser
+void BrowserViewScrollKey(BrowserView*, int vk);
 
 bool BrowserViewCreateInProgress();
 
 // the element the webview is positioned over; asked once a frame by the shell
-gpui::El* BrowserViewBuild(BrowserView*, gpui::Ctx* cx);
+gpui::El* BrowserViewBuild(BrowserView*, gpui::Ctx* cx, int clipTop = 0);
 // the shell's tick: makes the views BrowserViewBuild() asked for
 void BrowserViewCreatePending(MainWindow* win, gpui::Ctx* cx);
 // ng: for a view shown in a tool window (the F1 manual): the frame's tick
 // leaves it alone and that window's own tick makes it, with that window's Ctx
 void BrowserViewSetOwnHost(BrowserView*);
 void BrowserViewCreatePendingIn(BrowserView*, gpui::Ctx* cx);
+void BrowserViewSetBackground(BrowserView*, Color);
 
 // is there an embedded browser at all (WebView2 runtime installed)
 bool BrowserViewAvailable();

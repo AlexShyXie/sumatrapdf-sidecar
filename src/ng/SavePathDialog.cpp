@@ -1,11 +1,11 @@
 /* Copyright 2026 the SumatraPDF project authors (see AUTHORS file).
    License: GPLv3 */
 
-// ng: gpui has no save-file prompt (PathPrompt opens only), so this is the
-// port's stand-in for win32's GetSaveFileNameW: a dialog with the directory it
-// is in, the sub-directories and matching files in it, and a file-name field.
-// Every save-as in the port goes through ShowSavePathDialog(), which on
-// Windows shows orig's dialog instead (gui/NativeFileDlg_win.cpp).
+// ng: the port's stand-in for win32's GetSaveFileNameW: a dialog with the
+// directory it is in, the sub-directories and matching files in it, and a
+// file-name field. Every save-as in the port goes through ShowSavePathDialog(),
+// which on Windows shows gpui's native save prompt instead
+// (gui/NativeFileDlg.cpp).
 
 #include "gui/GpuiBridge.h"
 
@@ -145,7 +145,7 @@ static void FinishSavePathDialog(Str path) {
     gSave.confirmingOverwrite = false;
     MainWindow* win = args ? args->win : nullptr;
     if (win && win->gpuiWin && gSave.nameEdit) {
-        gp::InputBlur(gSave.nameEdit, win->gpuiWin->app, win->gpuiWin);
+        InputBlurWhereFocused(gSave.nameEdit, win->gpuiWin);
     }
     delete gSave.nameEdit;
     gSave.nameEdit = nullptr;
@@ -180,14 +180,19 @@ void CloseSavePathDialog() {
     }
 }
 
-// ng: the automation channel's stand-in for typing a name and pressing Save.
-// An empty path is Cancel. Returns false when no dialog is up.
-bool TestFinishSavePathDialog(Str path) {
-    if (!gSave.visible) {
-        return false;
+// cancel it while its window, about to close, is still valid
+void CloseSavePathDialogFor(MainWindow* win) {
+    if (gSave.args && gSave.args->win == win) {
+        CloseSavePathDialog();
     }
-    FinishSavePathDialog(str::DupTemp(path));
-    return true;
+}
+
+// what TestSaveFileName set: every save prompt answers with it, as Windows'
+// GetSaveFileName does for orig's tests
+static Str gTestSavePath;
+
+void SetTestSavePath(Str path) {
+    str::ReplaceWithCopy(&gTestSavePath, path);
 }
 
 void ShowSavePathDialog(SavePathArgs* args) {
@@ -209,12 +214,23 @@ void ShowSavePathDialog(SavePathArgs* args) {
         return;
     }
 #endif
+    if (len(gTestSavePath) > 0 && !args->openExisting) {
+        gSave.args = args;
+        FinishSavePathDialog(str::DupTemp(gTestSavePath));
+        return;
+    }
     // the port's dialog does not report a filter
     args->filterIndex = 0;
     gSave.args = args;
     TempStr dir = path::GetDirTemp(args->initialPath);
     if (len(dir) == 0 || !dir::Exists(dir)) {
+#if OS_WASM
+        // the settings directory isn't where documents go
+        dir = str::DupTemp(Str((char*)kWasmUploadDir));
+        dir::CreateAll(dir);
+#else
         dir = GetAppDataDirTemp();
+#endif
     }
     str::ReplaceWithCopy(&gSave.dir, dir);
     ReadDir(gSave.dir);
@@ -321,17 +337,8 @@ void SavePathView::OnName(SavePathView*, gp::Ctx* cx, const gp::InputEvent* ev) 
     gp::Notify(cx);
 }
 
-gp::El* SavePathDialogBuild(MainWindow* win, gp::Ctx* cx) {
-    if (!gSave.visible || !gSave.args || gSave.args->win != win) {
-        return nullptr;
-    }
-    if (!gSavePathView.IsValid()) {
-        gSavePathView = gp::EntityNewState<SavePathView>(cx->app);
-    }
-    const gp::Theme& th = gp::ThemeNow(cx->app);
-    gSave.nameEdit->onChange = gp::ListenTo(gSavePathView, &SavePathView::OnName);
-
-    gp::El* body = gp::Div(cx->a)->FlexCol()->Gap(6)->W(gp::kFill);
+// the directory line, the directories and matching files in it, and paging
+static void AddDirBrowser(gp::Ctx* cx, const gp::Theme& th, gp::El* body) {
     gp::El* dirRow = gp::Div(cx->a)->FlexRow()->ItemsCenter()->Gap(6)->W(gp::kFill);
     dirRow->Child(gpc::Button::New(cx, GStrL("save-up"))
                       ->Label(GStrL(".."))
@@ -383,6 +390,24 @@ gp::El* SavePathDialogBuild(MainWindow* win, gp::Ctx* cx) {
                          ->OnClick(gp::ListenTo(gSavePathView, &SavePathView::OnPage, (intptr_t)1))
                          ->IntoEl());
         body->Child(pager);
+    }
+}
+
+gp::El* SavePathDialogBuild(MainWindow* win, gp::Ctx* cx) {
+    if (!gSave.visible || !gSave.args || gSave.args->win != win) {
+        return nullptr;
+    }
+    if (!gSavePathView.IsValid()) {
+        gSavePathView = gp::EntityNewState<SavePathView>(cx->app);
+    }
+    const gp::Theme& th = gp::ThemeNow(cx->app);
+    gSave.nameEdit->onChange = gp::ListenTo(gSavePathView, &SavePathView::OnName);
+
+    gp::El* body = gp::Div(cx->a)->FlexCol()->Gap(6)->W(gp::kFill);
+    // ng: in a browser tab the directories are the page's own (/uploads) and
+    // the file goes to the user as a download, so only the name is asked for
+    if (!OS_WASM) {
+        AddDirBrowser(cx, th, body);
     }
     body->Child(
         gpc::Input::New(cx, GStrL("save-name"), gSave.nameEdit)->WithSize(gp::UiSize::Small)->W(gp::kFill)->IntoEl());

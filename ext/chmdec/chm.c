@@ -1,3 +1,16 @@
+/* chmdec -- plain-C CHM reader. https://github.com/kjk/chmdec
+ *
+ * Derived from CHMLib by Jed Wing <jedwin@ugcs.caltech.edu>. The LZX
+ * decompressor derives from cabextract by Stuart Caie, who granted permission
+ * to re-license it under the LGPL for CHMLib.
+ * Changes Copyright (c) 2026 Krzysztof Kowalczyk.
+ *
+ * This library is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation; either version 2.1 of the License, or (at
+ * your option) any later version. See LICENSE.md.
+ */
+
 #ifndef CHM_H
 #define CHM_H
 
@@ -127,6 +140,7 @@ struct LZXstate {
     uint16_t block_type;
     uint32_t block_length;
     uint32_t block_remaining;
+    uint32_t overrun;
     uint32_t frames_read;
     int32_t intel_filesize;
     int32_t intel_curpos;
@@ -340,6 +354,7 @@ struct LZXstate* LZXinit(int window) {
     pState->header_read = 0;
     pState->frames_read = 0;
     pState->block_remaining = 0;
+    pState->overrun = 0;
     pState->block_type = LZX_BLOCKTYPE_INVALID;
     pState->intel_curpos = 0;
     pState->intel_started = 0;
@@ -363,6 +378,7 @@ int LZXreset(struct LZXstate* pState) {
     pState->header_read = 0;
     pState->frames_read = 0;
     pState->block_remaining = 0;
+    pState->overrun = 0;
     pState->block_type = LZX_BLOCKTYPE_INVALID;
     pState->intel_curpos = 0;
     pState->intel_started = 0;
@@ -591,9 +607,13 @@ static int make_decode_table(uint32_t nsyms, uint32_t nbits, uint8_t* length, ui
                         table[leaf] = LZX_HUFF_NODE | next_symbol++;
                     }
 
+                    if (!(table[leaf] & LZX_HUFF_NODE)) return 1;
+
                     leaf = (table[leaf] & LZX_HUFF_NODE_MASK) << 1;
                     if ((pos >> (15 - fill)) & 1) leaf++;
+                    if (leaf >= table_elems) return 1;
                 }
+                if (leaf >= table_elems) return 1;
                 table[leaf] = LZX_HUFF_ENTRY(sym, length[sym]);
 
                 if ((pos += bit_mask) > table_mask) return 1;
@@ -706,7 +726,7 @@ int LZXdecompress(struct LZXstate* pState, uint8_t* inpos, uint8_t* outpos, int 
     uint32_t match_offset, i, j, k;
     struct lzx_bits lb;
 
-    int togo = outlen, this_run, main_element, aligned_bits;
+    int togo = outlen - (int)pState->overrun, this_run, main_element, aligned_bits;
     int match_length, length_footer, extra, verbatim_bits;
 
     INIT_BITSTREAM;
@@ -950,14 +970,22 @@ int LZXdecompress(struct LZXstate* pState, uint8_t* inpos, uint8_t* outpos, int 
                 default:
                     return DECR_ILLEGALDATA;
             }
+
+            if (this_run < 0) {
+                uint32_t over = (uint32_t)-this_run;
+                togo -= (int)over;
+                pState->block_remaining -= over < pState->block_remaining ? over : pState->block_remaining;
+            }
         }
     }
 
-    if (togo != 0) return DECR_ILLEGALDATA;
+    if (togo > 0) return DECR_ILLEGALDATA;
+    pState->overrun = (uint32_t)-togo;
 
     if (outlen < 0 || (uint32_t)outlen > window_size || window_posn > window_size) return DECR_ILLEGALDATA;
     {
-        uint32_t end = window_posn ? window_posn : window_size;
+        uint32_t end = (window_posn + window_size - pState->overrun) & (window_size - 1);
+        if (!end) end = window_size;
         if ((uint32_t)outlen <= end) {
             memcpy(outpos, window + (end - (uint32_t)outlen), (size_t)outlen);
         } else {
@@ -1881,7 +1909,10 @@ static int64_t decompress_block(chm_ctx *ctx, uint64_t block, uint8_t** ubuffer)
     cbuffer = lzx_cbuffer_ensure(ctx, cbufferLen);
     if (!cbuffer) return -1;
 
-    if (block - blockAlign <= ctx->lzx_last_block && block >= ctx->lzx_last_block) blockAlign = (block - ctx->lzx_last_block);
+    if (ctx->lzx_last_block >= 0) {
+        uint64_t last = (uint64_t)ctx->lzx_last_block;
+        if (block - blockAlign <= last && block >= last) blockAlign = (uint32_t)(block - last);
+    }
 
     if (blockAlign != 0) {
 
@@ -2245,7 +2276,7 @@ void chm_close(chm_ctx *ctx)
     ctx->window_size = 0;
     ctx->reset_interval = 0;
     ctx->reset_blkcount = 0;
-    ctx->lzx_last_block = 0;
+
     ctx->dir_page_count = 0;
     ctx->dir_pages_seen = 0;
     memset(ctx->dir_seen_bitmap, 0, sizeof(ctx->dir_seen_bitmap));

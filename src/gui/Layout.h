@@ -16,33 +16,24 @@ struct Constraints {
     Size max;
 
     Size Constrain(Size) const;
-    Size ConstrainAndAttemptToPreserveAspectRatio(Size) const;
-    int ConstrainHeight(int height) const;
-    int ConstrainWidth(int width) const;
     bool HasBoundedHeight() const;
     bool HasBoundedWidth() const;
     bool HasTightWidth() const;
     bool HasTightHeight() const;
     Constraints Inset(int width, int height) const;
-    bool IsBounded() const;
-    bool IsNormalized() const;
     bool IsTight() const;
-    bool IsSatisfiedBy(Size) const;
     bool IsZero() const;
     Constraints Loosen() const;
     Constraints LoosenHeight() const;
     Constraints LoosenWidth() const;
-    Constraints Tighten(Size) const;
     Constraints TightenHeight(int height) const;
     Constraints TightenWidth(int width) const;
 };
 
 Constraints ExpandInf();
 Constraints ExpandHeight(int width);
-Constraints ExpandWidth(int height);
 Constraints Loose(Size size);
 Constraints Tight(Size size);
-Constraints TightHeight(int height);
 
 using NeedLayout = Func0;
 
@@ -90,8 +81,6 @@ struct ILayout {
 
 bool IsCollapsed(ILayout*);
 
-bool IsLayoutOfKind(ILayout*, Kind);
-
 // padding.go
 
 struct Insets {
@@ -122,9 +111,6 @@ struct Padding : ILayout {
     int LayoutChildCount() override;
     ILayout* LayoutChildAt(int) override;
 };
-
-bool IsPadding(Kind);
-bool IsPadding(ILayout*);
 
 // vbox.go
 
@@ -196,6 +182,8 @@ struct HBox : ILayout {
     MainAxisAlign alignMain = MainAxisAlign::MainStart;
     CrossAxisAlign alignCross = CrossAxisAlign::CrossStart;
     int gap = 0;
+    // at least this tall, the children centered in it per alignCross
+    int minDy = 0;
     // when true, children are placed right-to-left (MainStart packs to the right)
     bool rtl = false;
     int totalWidth = 0;
@@ -422,6 +410,22 @@ struct HwndSlot : ILayout {
     int MinIntrinsicHeight(int width) override;
     int MinIntrinsicWidth(int height) override;
     void SetBounds(Rect) override;
+};
+
+// at least `dx` wide, wider if the child needs more
+struct MinDxBox : ILayout {
+    ILayout* child = nullptr;
+    int dx = 0;
+
+    MinDxBox(ILayout* c, int dxIn);
+    ~MinDxBox() override;
+
+    Size Layout(Constraints bc) override;
+    int MinIntrinsicHeight(int width) override;
+    int MinIntrinsicWidth(int height) override;
+    void SetBounds(Rect) override;
+    int LayoutChildCount() override;
+    ILayout* LayoutChildAt(int) override;
 };
 
 void LayoutAndSizeToContent(ILayout* layout, int minDx, int minDy, HWND hwnd);

@@ -117,12 +117,6 @@ Constraints ExpandHeight(int width) {
     return Constraints{min, max};
 }
 
-Constraints ExpandWidth(int height) {
-    Size min{0, height};
-    Size max{Inf, height};
-    return Constraints{min, max};
-}
-
 Constraints Loose(const Size size) {
     return Constraints{Size{}, size};
 }
@@ -131,55 +125,10 @@ Constraints Tight(const Size size) {
     return Constraints{size, size};
 }
 
-Constraints TightHeight(int height) {
-    Size min{0, height};
-    Size max{Inf, height};
-    return Constraints{min, max};
-}
-
 Size Constraints::Constrain(Size size) const {
     int w = ClampI(size.dx, min.dx, max.dx);
     int h = ClampI(size.dy, min.dy, max.dy);
     return Size{w, h};
-}
-
-Size Constraints::ConstrainAndAttemptToPreserveAspectRatio(const Size size) const {
-    if (IsTight()) {
-        return min;
-    }
-
-    int width = size.dx;
-    int height = size.dy;
-
-    if (width > max.dx) {
-        width = max.dx;
-        height = Scale(width, size.dy, size.dx);
-    }
-    if (height > max.dy) {
-        height = max.dy;
-        width = Scale(height, size.dx, size.dy);
-    }
-
-    if (width < min.dx) {
-        width = min.dx;
-        height = Scale(width, size.dy, size.dx);
-    }
-
-    if (height < min.dy) {
-        height = min.dy;
-        width = Scale(height, size.dx, size.dy);
-    }
-
-    Size c{width, height};
-    return Constrain(c);
-}
-
-int Constraints::ConstrainHeight(int height) const {
-    return ClampI(height, min.dy, max.dy);
-}
-
-int Constraints::ConstrainWidth(int width) const {
-    return ClampI(width, min.dx, max.dx);
 }
 
 bool Constraints::HasBoundedHeight() const {
@@ -213,19 +162,6 @@ Constraints Constraints::Inset(int width, int height) const {
     return Constraints{min2, max2};
 }
 
-bool Constraints::IsBounded() const {
-    return HasBoundedWidth() && HasBoundedHeight();
-}
-
-bool Constraints::IsNormalized() const {
-    return min.dx >= 0.0 && min.dx <= max.dx && min.dy >= 0.0 && min.dy <= max.dy;
-}
-
-bool Constraints::IsSatisfiedBy(Size size) const {
-    return min.dx <= size.dx && size.dx <= max.dx && min.dy <= size.dy && size.dy <= max.dy && size.dx != Inf &&
-           size.dy != Inf;
-}
-
 bool Constraints::IsTight() const {
     return HasTightWidth() && HasTightHeight();
 }
@@ -244,15 +180,6 @@ Constraints Constraints::LoosenHeight() const {
 
 Constraints Constraints::LoosenWidth() const {
     return Constraints{Size{0, min.dy}, max};
-}
-
-Constraints Constraints::Tighten(Size size) const {
-    Constraints bc = *this;
-    bc.min.dx = ClampI(size.dx, bc.min.dx, bc.max.dx);
-    bc.max.dx = bc.min.dx;
-    bc.min.dy = ClampI(size.dy, bc.min.dy, bc.max.dy);
-    bc.max.dy = bc.min.dy;
-    return bc;
 }
 
 Constraints Constraints::TightenHeight(int height) const {
@@ -282,22 +209,9 @@ void ILayout::SetBounds(Rect bounds) {
     lastBounds = bounds;
 }
 
-bool IsLayoutOfKind(ILayout* l, Kind kind) {
-    if (l == nullptr) {
-        return false;
-    }
-    return l->GetKind() == kind;
-}
-
 // padding.go
 
 static Kind paddingKind = "padding";
-bool IsPadding(Kind kind) {
-    return kind == paddingKind;
-}
-bool IsPadding(ILayout* l) {
-    return IsLayoutOfKind(l, paddingKind);
-}
 
 int Padding::LayoutChildCount() {
     return child ? 1 : 0;
@@ -352,6 +266,12 @@ void Padding::SetBounds(Rect bounds) {
     child->SetBounds(bounds);
 }
 
+static void DeleteChildLayouts(Vec<boxElementInfo>& children) {
+    for (auto& c : children) {
+        delete c.layout;
+    }
+}
+
 // vbox.go
 
 static Kind kindVBox = "vbox";
@@ -361,9 +281,7 @@ VBox::VBox() {
 }
 
 VBox::~VBox() {
-    for (auto& c : children) {
-        delete c.layout;
-    }
+    DeleteChildLayouts(children);
 }
 
 int VBox::LayoutChildCount() {
@@ -378,7 +296,20 @@ int VBox::ChildrenCount() const {
     return len(children);
 }
 
-int VBox::NonCollapsedChildrenCount() {
+static boxElementInfo& AddBoxChild(ILayout* self, Vec<boxElementInfo>& children, ILayout* child, int flex) {
+    if (LayoutTreeContains(child, self)) {
+        ReportIf(true);
+        return gRefusedBoxElement;
+    }
+    boxElementInfo v{};
+    v.layout = child;
+    v.flex = flex;
+    VecAppend(children, v);
+    auto n = len(children);
+    return children[n - 1];
+}
+
+static int CountNonCollapsed(const Vec<boxElementInfo>& children) {
     int n = 0;
     for (const auto& c : children) {
         if (!IsCollapsed(c.layout)) {
@@ -386,6 +317,10 @@ int VBox::NonCollapsedChildrenCount() {
         }
     }
     return n;
+}
+
+int VBox::NonCollapsedChildrenCount() {
+    return CountNonCollapsed(children);
 }
 
 static int updateFlex(Vec<boxElementInfo>& children, MainAxisAlign alignMain) {
@@ -694,16 +629,7 @@ void VBox::SetBoundsForChild(int i, ILayout* v, int posX, int posY, int posX2, i
 }
 
 boxElementInfo& VBox::AddChild(ILayout* child, int flex) {
-    if (LayoutTreeContains(child, this)) {
-        ReportIf(true);
-        return gRefusedBoxElement;
-    }
-    boxElementInfo v{};
-    v.layout = child;
-    v.flex = flex;
-    VecAppend(children, v);
-    auto n = len(children);
-    return children[n - 1];
+    return AddBoxChild(this, children, child, flex);
 }
 
 boxElementInfo& VBox::AddChild(ILayout* child) {
@@ -726,9 +652,7 @@ ILayout* HBox::LayoutChildAt(int idx) {
 }
 
 HBox::~HBox() {
-    for (auto& c : children) {
-        delete c.layout;
-    }
+    DeleteChildLayouts(children);
 }
 
 int HBox::ChildrenCount() const {
@@ -736,13 +660,7 @@ int HBox::ChildrenCount() const {
 }
 
 int HBox::NonCollapsedChildrenCount() {
-    int n = 0;
-    for (const auto& c : children) {
-        if (!IsCollapsed(c.layout)) {
-            n++;
-        }
-    }
-    return n;
+    return CountNonCollapsed(children);
 }
 
 Size HBox::Layout(const Constraints bc) {
@@ -847,9 +765,9 @@ Size HBox::Layout(const Constraints bc) {
     }
 
     if (alignCross == CrossAxisAlign::Stretch) {
-        return bc.Constrain(Size{width, cbc.min.dy});
+        return bc.Constrain(Size{width, std::max(cbc.min.dy, minDy)});
     }
-    return bc.Constrain(Size{width, height});
+    return bc.Constrain(Size{width, std::max(height, minDy)});
 }
 
 int HBox::MinIntrinsicHeight(int width) {
@@ -864,7 +782,7 @@ int HBox::MinIntrinsicHeight(int width) {
     } else {
         width = Inf;
     }
-    int size = 0;
+    int size = minDy;
     for (auto& v : children) {
         if (!IsCollapsed(v.layout)) {
             size = std::max(size, v.layout->MinIntrinsicHeight(width));
@@ -1025,16 +943,7 @@ void HBox::SetBoundsForChild(int i, ILayout* v, int posX, int posY, int posX2, i
 }
 
 boxElementInfo& HBox::AddChild(ILayout* child, int flex) {
-    if (LayoutTreeContains(child, this)) {
-        ReportIf(true);
-        return gRefusedBoxElement;
-    }
-    boxElementInfo v{};
-    v.layout = child;
-    v.flex = flex;
-    VecAppend(children, v);
-    auto n = len(children);
-    return children[n - 1];
+    return AddBoxChild(this, children, child, flex);
 }
 
 boxElementInfo& HBox::AddChild(ILayout* child) {
@@ -1586,9 +1495,7 @@ Wrap::Wrap() {
 }
 
 Wrap::~Wrap() {
-    for (auto& c : children) {
-        delete c.layout;
-    }
+    DeleteChildLayouts(children);
 }
 
 int Wrap::LayoutChildCount() {
@@ -1818,7 +1725,7 @@ void LayoutAndSizeToContent(ILayout* layout, int minDx, int minDy, HWND hwnd) {
     Point max{size.dx, size.dy};
     Rect bounds{min, max};
     layout->SetBounds(bounds);
-    ResizeHwndToClientArea(hwnd, size.dx, size.dy, false);
+    HwndResizeClientSize(hwnd, size.dx, size.dy);
     HwndScheduleRepaint(hwnd);
 }
 
@@ -1869,4 +1776,48 @@ void HwndSlot::SetBounds(Rect bounds) {
         return;
     }
     HwndMoveWindow(hwnd, &bounds);
+}
+
+MinDxBox::MinDxBox(ILayout* c, int dxIn) {
+    child = c;
+    dx = dxIn;
+}
+
+MinDxBox::~MinDxBox() {
+    delete child;
+}
+
+int MinDxBox::LayoutChildCount() {
+    return child ? 1 : 0;
+}
+
+ILayout* MinDxBox::LayoutChildAt(int) {
+    return child;
+}
+
+int MinDxBox::MinIntrinsicWidth(int) {
+    return dx;
+}
+
+int MinDxBox::MinIntrinsicHeight(int width) {
+    return child ? child->MinIntrinsicHeight(width) : 0;
+}
+
+Size MinDxBox::Layout(const Constraints bc) {
+    int w = MinIntrinsicWidth(0);
+    if (bc.min.dx > w) {
+        w = bc.min.dx;
+    }
+    if (bc.HasBoundedWidth() && bc.max.dx < w) {
+        w = bc.max.dx;
+    }
+    Size s = child ? child->Layout(bc.TightenWidth(w)) : Size{};
+    return {w, s.dy};
+}
+
+void MinDxBox::SetBounds(Rect r) {
+    lastBounds = r;
+    if (child) {
+        child->SetBounds(r);
+    }
 }

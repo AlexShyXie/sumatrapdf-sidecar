@@ -9,13 +9,13 @@
 //
 // Run: bun tests/ad-hoc-chapters.ts [--no-build]
 
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { ControlClient, ControlCommand } from "./control.ts";
-import { cmdId, runStandalone, tmpPath } from "./util.ts";
+import { cmdId, copyFromOneDrive, runStandalone, tmpPath } from "./util.ts";
 import { killAndWait, killProcessesNamed, launchControlled, sendCommandSync } from "./win-automation.ts";
 
-const MOBI = String.raw`C:\Users\kjk\OneDrive\!sumatra\1000.mobi`;
-const EPUB = String.raw`C:\Users\kjk\OneDrive\!sumatra\Dune - Frank Herbert.epub`;
+const MOBI = tmpPath("1000.mobi");
+const EPUB = tmpPath("Dune - Frank Herbert.epub");
 
 // whole-section hard timeout: kill the running SumatraPDF and fail loudly
 // rather than hang the session (see project memory gui-test-scripts-need-watchdog)
@@ -91,8 +91,7 @@ function assertEq(label: string, got: unknown, want: unknown): void {
 }
 
 async function testMobi(): Promise<void> {
-  if (!existsSync(MOBI)) {
-    console.log(`ad-hoc-chapters: skip MOBI section, missing ${MOBI}`);
+  if (!copyFromOneDrive("!sumatra/1000.mobi", MOBI)) {
     return;
   }
 
@@ -108,8 +107,14 @@ async function testMobi(): Promise<void> {
       if (openMs >= 3000) {
         throw new Error(`mobi: LoadDocument took ${openMs} ms, want < 3000 ms (debug build)`);
       }
+      // open lays out the first chapter; the background thread may have done
+      // a few more by now, but not the book
       const layoutsAtOpen = countMatches(logText, "LayOutChapter:");
-      assertEq("mobi: LayOutChapter calls at open", layoutsAtOpen, 1);
+      if (layoutsAtOpen < 1 || layoutsAtOpen > 100) {
+        throw new Error(`mobi: LayOutChapter calls at open: got ${layoutsAtOpen}, want 1..100`);
+      }
+      const firstLayout = /LayOutChapter: chapter (\d+) ->/.exec(logText);
+      assertEq("mobi: first chapter laid out", firstLayout?.[1], "1");
 
       const info0 = await client.chapterInfo();
       if (!info0.hasChapters) {
@@ -194,7 +199,13 @@ async function testMobi(): Promise<void> {
       await client.waitForRenderIdle();
       const afterFirst = await client.chapterInfo();
       assertEq("mobi: CmdGoToFirstPage chapter", afterFirst.chapter, 1);
-      const gotoFavRes = await client.request(ControlCommand.TestFavoriteNav, ["goto-fav", favPage]);
+      // the favorite's flat pageNo moves as chapters lay out; look it up
+      const listRes = await client.request(ControlCommand.TestFavoriteNav, ["list", 0]);
+      const favNow = /-@(\d+)/.exec(String(listRes[1] ?? ""));
+      if (!favNow) {
+        throw new Error(`mobi: favorite not listed: ${String(listRes[1] ?? "")}`);
+      }
+      const gotoFavRes = await client.request(ControlCommand.TestFavoriteNav, ["goto-fav", Number(favNow[1])]);
       assertEq("mobi: favorite goto exit code", gotoFavRes[0], 0);
       await client.waitForRenderIdle();
       const afterFav = await client.chapterInfo();
@@ -234,8 +245,7 @@ async function testMobi(): Promise<void> {
 }
 
 async function testEpub(): Promise<void> {
-  if (!existsSync(EPUB)) {
-    console.log(`ad-hoc-chapters: skip EPUB section, missing ${EPUB}`);
+  if (!copyFromOneDrive("!sumatra/Dune - Frank Herbert.epub", EPUB)) {
     return;
   }
 

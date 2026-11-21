@@ -69,9 +69,22 @@ void FindEditSetText(MainWindow* win, Str s);
 bool FindEditIsModified(MainWindow* win);
 void FindEditSetModified(MainWindow* win, bool modified);
 bool IsFindEditFocused(MainWindow* win);
+void FindEditShowHistory(MainWindow* win);
+bool IsFindHistoryOpen(MainWindow* win);
 #if defined(SUMATRA_NG)
 TempStr FindEditTestTemp(MainWindow* win, Str action, Str arg, int* exitCodeOut = nullptr);
 void FindBarApplyDpi(MainWindow* win);
+float FindStatusSlotDx(int totalHits, bool capped);
+
+template <class UI>
+void FindFreeUi(Str& status, UI*& ui) {
+    str::Free(status);
+    if (ui) {
+        ui->ddHistory.Free();
+        str::Free(ui->historyFirst);
+    }
+    delete ui;
+}
 #endif
 
 #if OS_WIN

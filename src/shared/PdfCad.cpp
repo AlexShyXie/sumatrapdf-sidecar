@@ -166,6 +166,8 @@ struct CadPageStats {
     int grayStrokes = 0;
     int thinStrokes = 0;
     float maxImageCoverage = 0.f;
+    // how much of the page-size image is near-white paper, 0..1
+    float bigImageWhite = 1.f;
     float pageArea = 0.f;
 };
 
@@ -234,14 +236,65 @@ static void cad_analysis_stroke_text(fz_context* ctx, fz_device* dev, const fz_t
     cad_analysis_fill_text(ctx, dev, text, ctm, colorspace, color, alpha, color_params);
 }
 
-static void cad_analysis_fill_image(fz_context* /*ctx*/, fz_device* dev, fz_image* /*image*/, fz_matrix ctm,
-                                    float /*alpha*/, fz_color_params /*color_params*/) {
+// Image coverage of a page that makes it a raster CAD candidate.
+constexpr float kRasterCadCoverage = 0.80f;
+
+// Fraction of the image's pixels that are near-white, from a small decode.
+// Raster CAD is line work on white paper; a scan or photo is not (#6361).
+static float CadImageWhiteFraction(fz_context* ctx, fz_image* image) {
+    constexpr int kSampleDx = 128;
+    constexpr int kWhite = 230;
+    fz_pixmap* pix = nullptr;
+    fz_var(pix);
+    float res = 1.f;
+    fz_try(ctx) {
+        int w = kSampleDx;
+        int h = kSampleDx;
+        pix = fz_get_pixmap_from_image(ctx, image, nullptr, nullptr, &w, &h);
+        // gray and RGB are read as they are, anything else as RGB
+        bool isGray = pix->colorspace && fz_colorspace_n(ctx, pix->colorspace) == 1;
+        if (pix->colorspace && !isGray && !fz_colorspace_is_rgb(ctx, pix->colorspace)) {
+            fz_pixmap* rgb =
+                fz_convert_pixmap(ctx, pix, fz_device_rgb(ctx), nullptr, nullptr, fz_default_color_params, 1);
+            fz_drop_pixmap(ctx, pix);
+            pix = rgb;
+        }
+        int nColors = pix->n - pix->alpha;
+        int white = 0;
+        for (int y = 0; y < pix->h; y++) {
+            const u8* p = pix->samples + ((size_t)y * pix->stride);
+            for (int x = 0; x < pix->w; x++, p += pix->n) {
+                bool isWhite = true;
+                for (int c = 0; c < nColors; c++) {
+                    isWhite = isWhite && p[c] >= kWhite;
+                }
+                white += isWhite ? 1 : 0;
+            }
+        }
+        int total = pix->w * pix->h;
+        res = total > 0 ? (float)white / (float)total : 1.f;
+    }
+    fz_always(ctx) {
+        fz_drop_pixmap(ctx, pix);
+    }
+    fz_catch(ctx) {
+        fz_report_error(ctx);
+    }
+    return res;
+}
+
+static void cad_analysis_fill_image(fz_context* ctx, fz_device* dev, fz_image* image, fz_matrix ctm, float /*alpha*/,
+                                    fz_color_params /*color_params*/) {
     cad_analysis_device* d = (cad_analysis_device*)dev;
     fz_rect bbox = fz_transform_rect(fz_unit_rect, ctm);
-    if (d->stats->pageArea > 0.f) {
-        float coverage = CadRectArea(bbox) / d->stats->pageArea;
-        d->stats->maxImageCoverage = std::max(coverage, d->stats->maxImageCoverage);
+    if (d->stats->pageArea <= 0.f) {
+        return;
     }
+    float coverage = CadRectArea(bbox) / d->stats->pageArea;
+    if (coverage >= kRasterCadCoverage && coverage > d->stats->maxImageCoverage) {
+        d->stats->bigImageWhite = CadImageWhiteFraction(ctx, image);
+    }
+    d->stats->maxImageCoverage = std::max(coverage, d->stats->maxImageCoverage);
 }
 
 static fz_device* NewCadAnalysisDevice(fz_context* ctx, CadPageStats* stats) {
@@ -376,8 +429,10 @@ static int ScoreHeuristic(fz_context* ctx, pdf_document* doc, int pageCount, flo
         }
     }
 
-    // Screenshot / raster CAD: one large image per page, almost no vector content.
-    bool rasterCad = stats.maxImageCoverage >= 0.80f && stats.strokes + stats.fills < 50 && stats.textOps < 200;
+    // Screenshot / raster CAD: one large image per page, almost no vector content,
+    // mostly white paper (the enhancement grays everything that isn't white).
+    bool rasterCad = stats.maxImageCoverage >= kRasterCadCoverage && stats.strokes + stats.fills < 50 &&
+                     stats.textOps < 200 && stats.bigImageWhite >= 0.50f;
     if (rasterCad) {
         if (pageCount > 30) {
             // Full-bleed cover art in multi-page books mimics raster CAD; do not
@@ -601,6 +656,44 @@ fz_device* PdfCadEnhanceWrapDevice(fz_context* ctx, fz_device* inner) {
     return dev;
 }
 
+// ShowLineWeights; false draws every stroke one pixel wide (on screen only)
+static bool gShowLineWeights = true;
+
+void SetShowLineWeights(bool show) {
+    gShowLineWeights = show;
+}
+
+bool GetShowLineWeights() {
+    return gShowLineWeights;
+}
+
+// one device pixel wide: a width of 0 draws thinner, too faint with anti-aliasing
+static void hairline_stroke_path(fz_context* ctx, fz_device* dev, const fz_path* path, const fz_stroke_state* stroke,
+                                 fz_matrix ctm, fz_colorspace* colorspace, const float* color, float alpha,
+                                 fz_color_params color_params) {
+    fz_stroke_state* thin = fz_clone_stroke_state(ctx, stroke);
+    float expansion = fz_matrix_expansion(ctm);
+    thin->linewidth = expansion > 0 ? 1.f / expansion : 0;
+    fz_try(ctx) {
+        fz_stroke_path(ctx, dev->passthrough, path, thin, ctm, colorspace, color, alpha, color_params);
+    }
+    fz_always(ctx) {
+        fz_drop_stroke_state(ctx, thin);
+    }
+    fz_catch(ctx) {
+        fz_rethrow(ctx);
+    }
+}
+
+// Wrap <inner> so that strokes ignore their width, like Acrobat's Line Weights
+// turned off. Takes ownership of <inner>: dropping the wrapper drops it.
+fz_device* PdfHairlineWrapDevice(fz_context* ctx, fz_device* inner) {
+    fz_device* dev = fz_new_passthrough_device_of_size(ctx, inner, sizeof(fz_device));
+    fz_drop_device(ctx, inner);
+    dev->stroke_path = hairline_stroke_path;
+    return dev;
+}
+
 static unsigned char CadClampByte(float v) {
     if (v <= 0.f) {
         return 0;
@@ -619,9 +712,14 @@ void PdfCadEnhancePixmap(fz_context* ctx, fz_pixmap* pix, float zoom, bool raste
     if (!pix || !rasterDominant) {
         return;
     }
-    // we read s[0], s[1], s[2] as R, G, B, so anything else (e.g. CMYK, which
-    // also passes an n >= 3 test) would be misinterpreted
-    if (!fz_colorspace_is_rgb(ctx, pix->colorspace)) {
+    // the channels are read by position, so anything but RGB or BGR (e.g.
+    // CMYK, which also passes an n >= 3 test) would be misinterpreted
+    int ir = 0;
+    int ib = 2;
+    if (fz_colorspace_type(ctx, pix->colorspace) == FZ_COLORSPACE_BGR) {
+        ir = 2;
+        ib = 0;
+    } else if (!fz_colorspace_is_rgb(ctx, pix->colorspace)) {
         return;
     }
 
@@ -633,9 +731,9 @@ void PdfCadEnhancePixmap(fz_context* ctx, fz_pixmap* pix, float zoom, bool raste
     int n = pix->n;
     for (int y = 0; y < pix->h; y++) {
         for (int x = 0; x < pix->w; x++) {
-            float fr = (float)s[0] / 255.f;
+            float fr = (float)s[ir] / 255.f;
             float fg = (float)s[1] / 255.f;
-            float fb = (float)s[2] / 255.f;
+            float fb = (float)s[ib] / 255.f;
             if (fr > 0.96f && fg > 0.96f && fb > 0.96f) {
                 s += n;
                 continue;
@@ -655,9 +753,9 @@ void PdfCadEnhancePixmap(fz_context* ctx, fz_pixmap* pix, float zoom, bool raste
                 outB *= factor;
             }
 
-            s[0] = CadClampByte(outR * 255.f);
+            s[ir] = CadClampByte(outR * 255.f);
             s[1] = CadClampByte(outG * 255.f);
-            s[2] = CadClampByte(outB * 255.f);
+            s[ib] = CadClampByte(outB * 255.f);
             s += n;
         }
         s += pix->stride - ((size_t)pix->w * n);

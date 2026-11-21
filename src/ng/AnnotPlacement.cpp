@@ -5,9 +5,7 @@
 // when it has no point to place the annotation at: the cursor becomes a cross,
 // a hint notification says what to do, and the next click (or drag, or set of
 // strokes) says where. Same kinds, same keys, same previews. What differs is
-// the cursor off Windows (gpui has no cursor from an image, so every mode uses
-// Crosshair where orig draws the annotation's SVG icon into one) and that the
-// preview is painted by the gpui canvas instead of into the canvas HDC.
+// that the preview is painted by the gpui canvas instead of into the canvas HDC.
 
 #include "gui/GpuiBridge.h"
 #include "VirtKeys.h"
@@ -31,6 +29,7 @@
 #include "Notifications.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Toolbar.h"
 #include "Selection.h"
@@ -69,20 +68,14 @@ SizeF FreeTextPlacementPageSize(const AnnotCreateArgs& args) {
 
 // orig's SetPlacementCursor: the note and the ink tool have a cursor made from
 // their SVG icon, every other mode a cross
-// ng: the icon cursors exist on Windows only (see "gpui gaps": no cursor from
-// an image); elsewhere all modes use the cross
 void SetPlacementCursor(MainWindow* win) {
     switch (KindOf(win)) {
         case AnnotPlacementKind::Text:
-            if (CanvasSetNativeCursor(win, NativeCursor::TextAnnotationPlacement)) {
-                return;
-            }
-            break;
+            CanvasSetNativeCursor(win, NativeCursor::TextAnnotationPlacement);
+            return;
         case AnnotPlacementKind::Ink:
-            if (CanvasSetNativeCursor(win, NativeCursor::InkAnnotationPlacement)) {
-                return;
-            }
-            break;
+            CanvasSetNativeCursor(win, NativeCursor::InkAnnotationPlacement);
+            return;
         default:
             break;
     }
@@ -93,6 +86,8 @@ void SetPlacementCursor(MainWindow* win) {
 // path takes the same two flags as arguments
 // what placement asks of the window system; gpui tracks focus and the pressed
 // button itself, so only the command and the cursor do anything here
+void PlacementHideHover(MainWindow*) {}
+
 void PlacementFocusFrame(MainWindow*) {}
 
 void PlacementCaptureMouse(MainWindow*) {}
@@ -124,6 +119,10 @@ void StartAnnotationPlacement(MainWindow* win, int cmdId) {
     }
     if (IsEditingAnnotContents(win)) {
         EndAnnotContentsEdit(true);
+    }
+    // a drag or selection still under way would finish into the placement
+    if (win->mouseAction != MouseAction::None || win->annotationBeingDragged || win->annotationBeingResized) {
+        CanvasCancelDrag(win);
     }
 
     EndCurrentPlacement(win);
@@ -170,84 +169,6 @@ void StartAnnotationPlacement(MainWindow* win, int cmdId) {
     SetPlacementCursor(win);
     logf("StartAnnotationPlacement: kind %d, cmd %d\n", (int)kind, cmdId);
     win->RedrawAll(true);
-}
-
-bool AnnotationPlacementOnMouseMove(MainWindow* win, Point pt, bool isShift, bool lButtonDown) {
-    if (!IsPlacingAnnotation(win) || KindOf(win) == AnnotPlacementKind::Highlighter) {
-        return false;
-    }
-    DisplayModel* dm = win->AsFixed();
-    if (!dm) {
-        return true;
-    }
-    if (win->annotationUnderCursor) {
-        win->annotationUnderCursor = nullptr;
-        if (IsPlacingPointAnnotation(win)) {
-            win->RedrawAll(true);
-        }
-    }
-    SetPlacementCursor(win);
-
-    AnnotPlacement& p = win->annotPlacement;
-    switch (p.kind) {
-        case AnnotPlacementKind::Ink:
-            if (p.mouseDown && lButtonDown) {
-                AppendInkPoint(win, dm, pt);
-            }
-            break;
-        case AnnotPlacementKind::Shape:
-            if (p.pageNo > 0) {
-                if (p.mouseDown) {
-                    Point start = dm->CvtToScreen(p.pageNo, p.start);
-                    if (IsDragDistance(pt.x, start.x, pt.y, start.y)) {
-                        p.didDrag = true;
-                    }
-                }
-                if (pt != p.end || isShift != p.constrain) {
-                    p.end = pt;
-                    p.constrain = isShift;
-                    win->RedrawAll(true);
-                }
-            }
-            break;
-        case AnnotPlacementKind::Line:
-            if (p.pageNo > 0) {
-                Point start = dm->CvtToScreen(p.pageNo, p.start);
-                Point end = isShift ? SnapLineEndpoint(start, pt) : pt;
-                // Compare the snapped point: toggling Shift without moving the
-                // pointer must still update the preview.
-                if (end != p.end) {
-                    p.end = end;
-                    win->RedrawAll(true);
-                }
-            }
-            break;
-        case AnnotPlacementKind::PolyLine:
-            if (len(p.points) > 0) {
-                Point last = dm->CvtToScreen(p.pageNo, p.points[len(p.points) - 1]);
-                Point end = isShift ? SnapLineEndpoint(last, pt) : pt;
-                if (end != p.end) {
-                    p.end = end;
-                    win->RedrawAll(true);
-                }
-            }
-            break;
-        case AnnotPlacementKind::Text:
-        case AnnotPlacementKind::FreeText:
-        case AnnotPlacementKind::Stamp:
-        case AnnotPlacementKind::Caret:
-        case AnnotPlacementKind::FileAttachment: {
-            bool previewMoved = HasPreview(p.kind) && pt != p.pos;
-            p.pos = pt;
-            if (previewMoved) {
-                win->RedrawAll(true);
-            }
-            break;
-        }
-        default:
-            break;
-    }
-    return true;
 }
 
 bool AnnotationPlacementOnKeyDown(MainWindow* win, int vkey) {
@@ -463,8 +384,8 @@ void PaintAnnotationPlacement(MainWindow* win, gp::PaintCtx* ctx, DisplayModel* 
 }
 
 // orig compares GetCursor() to IDC_CROSS or the SVG cursor. ng records the
-// cursor it asked for: the note and the ink tool are native cursors on
-// Windows, everything else is the cross.
+// cursor it asked for: the note and the ink tool are cursor images, everything
+// else is the cross.
 bool PlacementDumpCursor(MainWindow* win, AnnotPlacementKind kind, bool active) {
     if (!win || !active) {
         return false;

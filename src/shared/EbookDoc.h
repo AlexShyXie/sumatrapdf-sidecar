@@ -133,3 +133,5 @@ struct EpubReadingDirection {
     bool rtl = false;
 };
 EpubReadingDirection EpubGetReadingDirection(Str path);
+void EpubGetMetadata(Str path, Props& props);
+void EpubGetSidecarMetadata(Str epubPath, Props& props);

@@ -113,18 +113,6 @@ static bool PostUrl(Str url, Str headers, Str body, HttpRsp* rspOut) {
     return ok && IsHttpRspOk(rspOut);
 }
 
-static TempStr BuildPostUrlTemp(Str server, int port, Str url) {
-    Str scheme = port == 443 ? StrL("https://") : StrL("http://");
-    TempStr host = str::JoinTemp(scheme, server);
-    if (port != 443 && port != 80) {
-        host = fmt("%s:%d", host, port);
-    }
-    if (url && url.s[0] == '/') {
-        return str::JoinTemp(host, url);
-    }
-    return str::JoinTemp(host, StrL("/"), url);
-}
-
 bool HttpGet(Str urlA, HttpRsp* rspOut) {
     logf("HttpGet: url: '%s'\n", urlA);
     rspOut->data.Reset();
@@ -167,13 +155,6 @@ bool HttpGetToFile(Str urlA, Str destFilePath, const Func1<HttpProgress*>& cbPro
         file::Delete(destFilePath);
     }
     return ok;
-}
-
-bool HttpPost(Str serverA, int port, Str urlA, str::Builder* headers, str::Builder* data) {
-    HttpRsp rsp;
-    Str headerData = headers ? ToStr(*headers) : Str();
-    Str body = data ? ToStr(*data) : Str();
-    return PostUrl(BuildPostUrlTemp(serverA, port, urlA), headerData, body, &rsp) && rsp.httpStatusCode == 200;
 }
 
 bool HttpPostUrl(Str url, Str contentType, Str extraHeaders, Str body, HttpRsp* rspOut) {
@@ -267,18 +248,6 @@ static void AppendHeaders(str::Builder* cmd, str::Builder* headers) {
     }
 }
 
-static TempStr BuildPostUrlTemp(Str server, int port, Str url) {
-    Str scheme = port == 443 ? StrL("https://") : StrL("http://");
-    TempStr host = str::JoinTemp(scheme, server);
-    if (!((port == 443) || (port == 80))) {
-        host = fmt("%s:%d", host, port);
-    }
-    if (url && url.s[0] == '/') {
-        return str::JoinTemp(host, url);
-    }
-    return str::JoinTemp(host, StrL("/"), url);
-}
-
 bool HttpGet(Str urlA, HttpRsp* rspOut) {
     logf("HttpGet: url: '%s'\n", urlA);
     rspOut->data.Reset();
@@ -342,48 +311,6 @@ bool HttpGetToFile(Str urlA, Str destFilePath, const Func1<HttpProgress*>& cbPro
     return ok;
 }
 
-bool HttpPost(Str serverA, int port, Str urlA, str::Builder* headers, str::Builder* data) {
-    TempStr bodyPath = NewTempFilePathTemp(StrL("sumatra-http-post-body-"));
-    TempStr outPath = NewTempFilePathTemp(StrL("sumatra-http-post-out-"));
-    TempStr statusPath = NewTempFilePathTemp(StrL("sumatra-http-status-"));
-    if (len(bodyPath) == 0 || len(outPath) == 0 || len(statusPath) == 0) {
-        return false;
-    }
-
-    bool ok = true;
-    if (data && len(*data) > 0) {
-        ok = file::WriteFile(bodyPath, ToStr(*data));
-    } else {
-        ok = file::WriteFile(bodyPath, Str());
-    }
-    if (!ok) {
-        goto Exit;
-    }
-
-    {
-        TempStr url = BuildPostUrlTemp(serverA, port, urlA);
-        str::Builder cmd;
-        str::BuilderReserve(cmd, 1024);
-        ok = AppendCurlBase(&cmd, outPath, statusPath);
-        cmd.Append(StrL(" --request POST "));
-        AppendHeaders(&cmd, headers);
-        cmd.Append(StrL(" --data-binary @"));
-        AppendShellQuoted(&cmd, bodyPath);
-        cmd.Append(StrL(" "));
-        AppendShellQuoted(&cmd, url);
-        AppendStatusRedirect(&cmd, statusPath);
-        ok = ok && RunShellCommand(ToStr(cmd));
-    }
-
-    ok = ok && ReadHttpStatusCode(statusPath) == 200;
-
-Exit:
-    file::Delete(bodyPath);
-    file::Delete(outPath);
-    file::Delete(statusPath);
-    return ok;
-}
-
 // POST body to url with an explicit Content-Type and optional extra headers.
 // Blocking; rspOut carries the status code and the response body.
 bool HttpPostUrl(Str url, Str contentType, Str extraHeaders, Str body, HttpRsp* rspOut) {
@@ -435,4 +362,64 @@ bool HttpPostUrl(Str url, Str contentType, Str extraHeaders, Str body, HttpRsp* 
     return IsHttpRspOk(rspOut);
 }
 
+#endif
+
+#if defined(GPUI_HAVE_CURL) && GPUI_HAVE_CURL
+struct HttpStreamState {
+    CURL* curl;
+    HttpStreamSink* sink;
+    bool gotStatus = false;
+};
+
+static size_t WriteStream(char* bytes, size_t size, size_t count, void* context) {
+    auto* state = (HttpStreamState*)context;
+    size_t n = size * count;
+    if (n > INT_MAX || state->sink->IsCanceled()) return 0;
+    if (!state->gotStatus) {
+        long status = 0;
+        curl_easy_getinfo(state->curl, CURLINFO_RESPONSE_CODE, &status);
+        state->sink->OnStatus((int)status);
+        state->gotStatus = true;
+    }
+    return state->sink->OnData(Str(bytes, (int)n)) ? n : 0;
+}
+
+static int CancelStream(void* context, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    return ((HttpStreamSink*)context)->IsCanceled() ? 1 : 0;
+}
+
+bool HttpPostStream(Str url, Str headers, Str body, HttpStreamSink* sink, HttpStreamCancel*) {
+    if (sink->IsCanceled()) return false;
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+    SetCurlDefaults(curl, url);
+    constexpr long kStreamTimeoutSecs = 180;
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, kStreamTimeoutSecs);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kHttpTimeoutSecs);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_slist* list = AppendHeaders(nullptr, headers);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.s);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)len(body));
+    HttpStreamState state{curl, sink};
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteStream);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, CancelStream);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, sink);
+    CURLcode code = curl_easy_perform(curl);
+    if (!state.gotStatus) {
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        sink->OnStatus((int)status);
+    }
+    curl_slist_free_all(list);
+    curl_easy_cleanup(curl);
+    return code == CURLE_OK && !sink->IsCanceled();
+}
+#else
+bool HttpPostStream(Str, Str, Str, HttpStreamSink*, HttpStreamCancel*) {
+    return false;
+}
 #endif

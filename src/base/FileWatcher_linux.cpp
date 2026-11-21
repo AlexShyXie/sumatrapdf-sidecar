@@ -178,8 +178,7 @@ static bool StartFileWatcher() {
 
 void FileWatcherSetSkipPath(Str path) {
     ScopedMutex lock(&gWatcherMutex);
-    str::Free(gSkipPath);
-    gSkipPath = str::Dup(path);
+    str::ReplacePtr(&gSkipPath, str::Dup(path));
 }
 
 void FileWatcherInit(void) {
@@ -240,11 +239,7 @@ void FileWatcherUnsubscribe(WatchedFile* file) {
 }
 
 void WatchedFileSetIgnore(WatchedFile* file, bool ignore) {
-    if (!file) {
-        return;
-    }
-    ScopedMutex lock(&gWatcherMutex);
-    file->ignore = ignore;
+    SetIgnoreLocked(file, &gWatcherMutex, ignore);
 }
 
 void FileWatcherWaitForShutdown(void) {

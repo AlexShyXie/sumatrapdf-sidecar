@@ -123,6 +123,7 @@ extern "C" {
 #include "Translations.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Notifications.h"
 #include "Commands.h"
@@ -329,11 +330,24 @@ static bool SidecarAnnotOwnsRect(AnnotationType tp) {
 static const char* kLineEndingNames[] = {"None",        "Square", "Circle",     "Diamond",      "OpenArrow",
                                          "ClosedArrow", "Butt",   "ROpenArrow", "RClosedArrow", "Slash"};
 
+// defensive caps when reading external files (also bound the arrays we pass
+// to mupdf; annotation data from the wild is untrusted)
+static constexpr int kMaxQuads = 256;
+static constexpr int kMaxVertices = 512;
+static constexpr int kMaxInkPoints = 2048;
+static constexpr int kMaxInkStrokes = 64;
+
 struct SidecarAnnot {
     AnnotationType type = AnnotationType::Unknown;
     int pageNo = 0; // 1-based, 0 = invalid
     RectF bounds;
-    Vec<fz_quad> quads;         // text markups, MuPDF native ul/ur/ll/lr corners
+    // geometry lives in heap arrays, not Vec members: SidecarAnnot is stored
+    // by value in Vec<SidecarAnnot> and Vec<T> needs a trivially copyable T.
+    // Exactly one SidecarAnnot owns each array; a move is a memcpy and the
+    // source is never freed afterwards (same discipline as the Str fields)
+    // text markups, MuPDF native ul/ur/ll/lr corners (capped at kMaxQuads)
+    fz_quad* quads = nullptr;
+    int nQuads = 0;
     float opacity = 1.0f;       // 0..1
     float color[3] = {0, 0, 0}; // 0..1 per channel
     bool hasColor = false;
@@ -374,20 +388,39 @@ struct SidecarAnnot {
     PointF lineB;
     int lineStart = 0; // pdf_line_ending
     int lineEnd = 0;
-    // polygon / polyline
-    Vec<PointF> vertices;
-    // ink
-    Vec<Vec<PointF>> inkStrokes;
+    // polygon / polyline vertices (capped at kMaxVertices)
+    PointF* vertices = nullptr;
+    int nVertices = 0;
+    // ink: inkCounts[i] points at inkPts[i], both heap-owned; capped at
+    // kMaxInkStrokes strokes and kMaxInkPoints total points
+    PointF** inkPts = nullptr;
+    int* inkCounts = nullptr;
+    int nInkStrokes = 0;
     // excerpt of the text under the markup quads (display only)
     Str text;
 };
 
-// defensive caps when reading external files (also bound the arrays we pass
-// to mupdf; annotation data from the wild is untrusted)
-static constexpr int kMaxQuads = 256;
-static constexpr int kMaxVertices = 512;
-static constexpr int kMaxInkPoints = 2048;
-static constexpr int kMaxInkStrokes = 64;
+static void FreeSidecarAnnotStrings(fz_context* ctx, SidecarAnnot& sa);
+
+// release everything a SidecarAnnot owns: strings, the fz_buffer payload and
+// the geometry arrays
+static void FreeSidecarAnnot(fz_context* ctx, SidecarAnnot& sa) {
+    FreeSidecarAnnotStrings(ctx, sa);
+    free(sa.quads);
+    sa.quads = nullptr;
+    sa.nQuads = 0;
+    free(sa.vertices);
+    sa.vertices = nullptr;
+    sa.nVertices = 0;
+    for (int i = 0; i < sa.nInkStrokes; i++) {
+        free(sa.inkPts[i]);
+    }
+    free(sa.inkPts);
+    sa.inkPts = nullptr;
+    free(sa.inkCounts);
+    sa.inkCounts = nullptr;
+    sa.nInkStrokes = 0;
+}
 
 // true while a sidecar is being imported; suppresses the auto-save arming
 // that MarkNotificationAsModified would trigger for every created annot
@@ -1104,9 +1137,9 @@ static bool PointInQuadBBox(float x, float y, fz_quad q) {
     return x >= x0 && x <= x1 && y >= y0 && y <= y1;
 }
 
-static bool PointInAnyQuad(float x, float y, const Vec<fz_quad>& quads) {
-    for (const fz_quad& q : quads) {
-        if (PointInQuadBBox(x, y, q)) {
+static bool PointInAnyQuad(float x, float y, const fz_quad* quads, int nQuads) {
+    for (int i = 0; i < nQuads; i++) {
+        if (PointInQuadBBox(x, y, quads[i])) {
             return true;
         }
     }
@@ -1163,8 +1196,8 @@ static fz_stext_page* StextCacheGet(StextCache& c, int pageNo) {
 // the characters whose quad center falls inside one of the annotation
 // quads; lines are joined with '\n'. Empty when the page has no text
 // layer (scanned PDFs without OCR).
-static Str ExtractTextUnderQuads(StextCache& cache, int pageNo, const Vec<fz_quad>& quads) {
-    if (len(quads) == 0) {
+static Str ExtractTextUnderQuads(StextCache& cache, int pageNo, const fz_quad* quads, int nQuads) {
+    if (nQuads == 0) {
         return {};
     }
     fz_stext_page* tp = StextCacheGet(cache, pageNo);
@@ -1184,7 +1217,7 @@ static Str ExtractTextUnderQuads(StextCache& cache, int pageNo, const Vec<fz_qua
                 const fz_quad& cq = ch->quad;
                 float cx = (cq.ul.x + cq.ur.x + cq.ll.x + cq.lr.x) / 4.0f;
                 float cy = (cq.ul.y + cq.ur.y + cq.ll.y + cq.lr.y) / 4.0f;
-                if (PointInAnyQuad(cx, cy, quads)) {
+                if (PointInAnyQuad(cx, cy, quads, nQuads)) {
                     AppendUtf8CodePoint(line, ch->c);
                     anyChar = true;
                 }
@@ -1320,9 +1353,14 @@ static void CollectSidecarAnnot(Annotation* a, SidecarAnnot& sa, StextCache& cac
             fz_context* ctx = e->Ctx();
             fz_try(ctx) {
                 int n = pdf_annot_quad_point_count(ctx, a->pdfannot);
-                for (int i = 0; i < n && i < kMaxQuads; i++) {
-                    VecAppend(sa.quads, pdf_annot_quad_point(ctx, a->pdfannot, i));
+                if (n > kMaxQuads) {
+                    n = kMaxQuads;
                 }
+                sa.quads = AllocArray<fz_quad>(n);
+                for (int i = 0; i < n; i++) {
+                    sa.quads[i] = pdf_annot_quad_point(ctx, a->pdfannot, i);
+                }
+                sa.nQuads = n;
             }
             fz_catch(ctx) {
                 fz_report_error(ctx);
@@ -1330,26 +1368,41 @@ static void CollectSidecarAnnot(Annotation* a, SidecarAnnot& sa, StextCache& cac
         }
     } else if (a->type == AnnotationType::Polygon || a->type == AnnotationType::PolyLine) {
         Vec<PointF> v = GetVertices(a);
-        for (int i = 0; i < len(v) && i < kMaxVertices; i++) {
-            VecAppend(sa.vertices, v[i]);
+        int n = len(v) < kMaxVertices ? len(v) : kMaxVertices;
+        sa.vertices = AllocArray<PointF>(n);
+        for (int i = 0; i < n; i++) {
+            sa.vertices[i] = v[i];
         }
+        sa.nVertices = n;
     } else if (a->type == AnnotationType::Ink) {
         Vec<int> counts;
         Vec<PointF> pts;
         GetInkList(a, counts, pts);
         int off = 0;
         int total = 0; // cap across strokes, mirrors the reader
-        for (int sIdx = 0; sIdx < len(counts); sIdx++) {
-            Vec<PointF> stroke;
+        int maxStrokes = len(counts) < kMaxInkStrokes ? (int)len(counts) : kMaxInkStrokes;
+        sa.inkPts = AllocArray<PointF*>(maxStrokes);
+        sa.inkCounts = AllocArray<int>(maxStrokes);
+        for (int sIdx = 0; sIdx < len(counts) && sa.nInkStrokes < kMaxInkStrokes; sIdx++) {
             int n = counts[sIdx];
-            for (int i = 0; i < n; i++, off++) {
-                if (total < kMaxInkPoints && off < len(pts)) {
-                    VecAppend(stroke, pts[off]);
-                    total++;
-                }
+            if (n > kMaxInkPoints - total) {
+                n = kMaxInkPoints - total;
             }
-            if (len(stroke) > 0) {
-                VecAppend(sa.inkStrokes, std::move(stroke));
+            if (n <= 0) {
+                break;
+            }
+            PointF* sp = AllocArray<PointF>(n);
+            int kept = 0;
+            for (int i = 0; i < n && off < len(pts); i++, off++) {
+                sp[kept++] = pts[off];
+                total++;
+            }
+            if (kept > 0) {
+                sa.inkPts[sa.nInkStrokes] = sp;
+                sa.inkCounts[sa.nInkStrokes] = kept;
+                sa.nInkStrokes++;
+            } else {
+                free(sp);
             }
         }
     }
@@ -1357,7 +1410,7 @@ static void CollectSidecarAnnot(Annotation* a, SidecarAnnot& sa, StextCache& cac
     CollectAnnotExtras(a, sa);
 
     if (AnnotationIsTextMarkup(a->type)) {
-        sa.text = ExtractTextUnderQuads(cache, sa.pageNo, sa.quads);
+        sa.text = ExtractTextUnderQuads(cache, sa.pageNo, sa.quads, sa.nQuads);
     }
 }
 
@@ -1415,9 +1468,9 @@ static void SerializeAnnotJson(str::Builder& b, const SidecarAnnot& sa) {
     AppendFloat2(b, sa.bounds.y + sa.bounds.dy);
     b.Append(StrL("]"));
 
-    if ((AnnotationIsTextMarkup(sa.type) || sa.type == AnnotationType::Redact) && len(sa.quads) > 0) {
+    if ((AnnotationIsTextMarkup(sa.type) || sa.type == AnnotationType::Redact) && sa.nQuads > 0) {
         b.Append(StrL(",\n      \"quads\": ["));
-        for (int i = 0; i < len(sa.quads); i++) {
+        for (int i = 0; i < sa.nQuads; i++) {
             if (i > 0) {
                 b.AppendChar(',');
             }
@@ -1456,9 +1509,9 @@ static void SerializeAnnotJson(str::Builder& b, const SidecarAnnot& sa) {
         b.Append(StrL("]"));
     }
 
-    if ((sa.type == AnnotationType::Polygon || sa.type == AnnotationType::PolyLine) && len(sa.vertices) > 0) {
+    if ((sa.type == AnnotationType::Polygon || sa.type == AnnotationType::PolyLine) && sa.nVertices > 0) {
         b.Append(StrL(",\n      \"vertices\": ["));
-        for (int i = 0; i < len(sa.vertices); i++) {
+        for (int i = 0; i < sa.nVertices; i++) {
             if (i > 0) {
                 b.AppendChar(',');
             }
@@ -1471,15 +1524,15 @@ static void SerializeAnnotJson(str::Builder& b, const SidecarAnnot& sa) {
         b.AppendChar(']');
     }
 
-    if (sa.type == AnnotationType::Ink && len(sa.inkStrokes) > 0) {
+    if (sa.type == AnnotationType::Ink && sa.nInkStrokes > 0) {
         b.Append(StrL(",\n      \"inkList\": ["));
-        for (int sIdx = 0; sIdx < len(sa.inkStrokes); sIdx++) {
+        for (int sIdx = 0; sIdx < sa.nInkStrokes; sIdx++) {
             if (sIdx > 0) {
                 b.AppendChar(',');
             }
-            const Vec<PointF>& stroke = sa.inkStrokes[sIdx];
+            const PointF* stroke = sa.inkPts[sIdx];
             b.AppendChar('[');
-            for (int i = 0; i < len(stroke); i++) {
+            for (int i = 0; i < sa.inkCounts[sIdx]; i++) {
                 if (i > 0) {
                     b.AppendChar(',');
                 }
@@ -1677,7 +1730,7 @@ static void CollectSidecarEntries(EngineMupdf* e, const Vec<Annotation*>& annots
             if (!sa.assetOk) {
                 nSkippedUnsupported++;
             }
-            FreeSidecarAnnotStrings(e->Ctx(), sa);
+            FreeSidecarAnnot(e->Ctx(), sa);
             continue;
         }
         VecAppend(entries, std::move(sa));
@@ -1784,15 +1837,16 @@ static bool JsonToSidecarAnnot(fz_context* ctx, fz_json* o, SidecarAnnot& sa) {
         if (n > kMaxQuads) {
             n = kMaxQuads;
         }
+        sa.quads = AllocArray<fz_quad>(n);
         for (int i = 0; i < n; i++) {
             fz_json* q = fz_json_array_get(ctx, qc, i);
             if (!q || !fz_json_is_array(ctx, q) || fz_json_array_length(ctx, q) < 8) {
                 continue;
             }
-            fz_quad fq = fz_make_quad((float)ArrNum(ctx, q, 0), (float)ArrNum(ctx, q, 1), (float)ArrNum(ctx, q, 2),
-                                      (float)ArrNum(ctx, q, 3), (float)ArrNum(ctx, q, 4), (float)ArrNum(ctx, q, 5),
-                                      (float)ArrNum(ctx, q, 6), (float)ArrNum(ctx, q, 7));
-            VecAppend(sa.quads, fq);
+            sa.quads[sa.nQuads++] =
+                fz_make_quad((float)ArrNum(ctx, q, 0), (float)ArrNum(ctx, q, 1), (float)ArrNum(ctx, q, 2),
+                             (float)ArrNum(ctx, q, 3), (float)ArrNum(ctx, q, 4), (float)ArrNum(ctx, q, 5),
+                             (float)ArrNum(ctx, q, 6), (float)ArrNum(ctx, q, 7));
         }
     }
 
@@ -1802,12 +1856,13 @@ static bool JsonToSidecarAnnot(fz_context* ctx, fz_json* o, SidecarAnnot& sa) {
         if (n > kMaxVertices) {
             n = kMaxVertices;
         }
+        sa.vertices = AllocArray<PointF>(n);
         for (int i = 0; i < n; i++) {
             fz_json* v = fz_json_array_get(ctx, vs, i);
             if (!v || !fz_json_is_array(ctx, v) || fz_json_array_length(ctx, v) < 2) {
                 continue;
             }
-            VecAppend(sa.vertices, PointF{(float)ArrNum(ctx, v, 0), (float)ArrNum(ctx, v, 1)});
+            sa.vertices[sa.nVertices++] = PointF{(float)ArrNum(ctx, v, 0), (float)ArrNum(ctx, v, 1)};
         }
     }
 
@@ -1822,23 +1877,36 @@ static bool JsonToSidecarAnnot(fz_context* ctx, fz_json* o, SidecarAnnot& sa) {
     fz_json* ink = JsonArr(ctx, o, "inkList");
     if (ink) {
         int nStrokes = fz_json_array_length(ctx, ink);
+        if (nStrokes > kMaxInkStrokes) {
+            nStrokes = kMaxInkStrokes;
+        }
+        sa.inkPts = AllocArray<PointF*>(nStrokes);
+        sa.inkCounts = AllocArray<int>(nStrokes);
         int total = 0;
         for (int sIdx = 0; sIdx < nStrokes; sIdx++) {
             fz_json* stroke = fz_json_array_get(ctx, ink, sIdx);
             if (!stroke || !fz_json_is_array(ctx, stroke)) {
                 continue;
             }
-            Vec<PointF> pts;
             int n = fz_json_array_length(ctx, stroke);
+            if (n > kMaxInkPoints - total) {
+                n = kMaxInkPoints - total;
+            }
+            PointF* sp = AllocArray<PointF>(n);
+            int kept = 0;
             for (int i = 0; i < n && total < kMaxInkPoints; i++, total++) {
                 fz_json* p = fz_json_array_get(ctx, stroke, i);
                 if (!p || !fz_json_is_array(ctx, p) || fz_json_array_length(ctx, p) < 2) {
                     continue;
                 }
-                VecAppend(pts, PointF{(float)ArrNum(ctx, p, 0), (float)ArrNum(ctx, p, 1)});
+                sp[kept++] = PointF{(float)ArrNum(ctx, p, 0), (float)ArrNum(ctx, p, 1)};
             }
-            if (len(pts) > 0) {
-                VecAppend(sa.inkStrokes, std::move(pts));
+            if (kept > 0) {
+                sa.inkPts[sa.nInkStrokes] = sp;
+                sa.inkCounts[sa.nInkStrokes] = kept;
+                sa.nInkStrokes++;
+            } else {
+                free(sp);
             }
         }
     }
@@ -1981,16 +2049,16 @@ static bool JsonToSidecarAnnot(fz_context* ctx, fz_json* o, SidecarAnnot& sa) {
 
     // sanity per type: a markup without quads, a line without points, a
     // polygon without vertices and an ink without strokes are useless
-    if (AnnotationIsTextMarkup(sa.type) && len(sa.quads) == 0) {
+    if (AnnotationIsTextMarkup(sa.type) && sa.nQuads == 0) {
         return false;
     }
     if (sa.type == AnnotationType::Line && !sa.hasLine) {
         return false;
     }
-    if ((sa.type == AnnotationType::Polygon || sa.type == AnnotationType::PolyLine) && len(sa.vertices) == 0) {
+    if ((sa.type == AnnotationType::Polygon || sa.type == AnnotationType::PolyLine) && sa.nVertices == 0) {
         return false;
     }
-    if (sa.type == AnnotationType::Ink && len(sa.inkStrokes) == 0) {
+    if (sa.type == AnnotationType::Ink && sa.nInkStrokes == 0) {
         return false;
     }
     return true;
@@ -2024,7 +2092,7 @@ static bool ParseSidecarJson(fz_context* ctx, char* data, Vec<SidecarAnnot>& out
                 } else {
                     // strings may already have been dup'ed before the
                     // per-type sanity check rejected the entry
-                    FreeSidecarAnnotStrings(ctx, sa);
+                    FreeSidecarAnnot(ctx, sa);
                 }
             }
         }
@@ -2038,7 +2106,7 @@ static bool ParseSidecarJson(fz_context* ctx, char* data, Vec<SidecarAnnot>& out
         // a mid-parse failure leaves entries already appended in out; free
         // them, or a bad file being polled every 2s leaks them each tick
         for (SidecarAnnot& sa : out) {
-            FreeSidecarAnnotStrings(ctx, sa);
+            FreeSidecarAnnot(ctx, sa);
         }
         VecClear(out);
     }
@@ -2384,26 +2452,30 @@ struct MdSeg {
 struct MdDoc {
     bool hasFm = false;
     Str fm; // owned, verbatim including both --- lines
-    Vec<MdSeg> segs;
+    // heap-allocated: MdSeg owns a Vec<MdBodyLine> and Vec<T> needs a
+    // trivially copyable T
+    Vec<MdSeg*> segs;
     bool crlf = false;
 };
 
 static void MdFreeDoc(fz_context* ctx, MdDoc& doc) {
     str::Free(doc.fm);
-    for (MdSeg& seg : doc.segs) {
-        str::Free(seg.text);
-        str::Free(seg.header);
-        for (MdBodyLine& bl : seg.body) {
+    for (MdSeg* seg : doc.segs) {
+        str::Free(seg->text);
+        str::Free(seg->header);
+        for (MdBodyLine& bl : seg->body) {
             str::Free(bl.line);
             if (bl.kv) {
                 str::Free(bl.key);
                 str::Free(bl.val);
             }
         }
-        if (seg.isAnnot) {
-            FreeSidecarAnnotStrings(ctx, seg.annot);
+        if (seg->isAnnot) {
+            FreeSidecarAnnot(ctx, seg->annot);
         }
+        delete seg;
     }
+    VecReset(doc.segs);
 }
 
 static Str MdDupLineNoEol(const char* start, const char* endp) {
@@ -2547,14 +2619,14 @@ static void MdParseDoc(fz_context* ctx, const char* data, MdDoc& doc) {
         bool calloutStart = (le - ls >= 4) && ls[0] == '>' && ls[1] == ' ' && ls[2] == '[' && ls[3] == '!';
         if (calloutStart) {
             if (textStart && textStart < ls) {
-                MdSeg seg;
-                seg.text = str::Dup(Str(textStart, (int)(ls - textStart)));
-                VecAppend(doc.segs, std::move(seg));
+                auto* seg = new MdSeg;
+                seg->text = str::Dup(Str(textStart, (int)(ls - textStart)));
+                VecAppend(doc.segs, seg);
             }
             textStart = nullptr;
-            MdSeg seg;
-            seg.isCallout = true;
-            seg.header = MdDupLineNoEol(ls, le);
+            auto* seg = new MdSeg;
+            seg->isCallout = true;
+            seg->header = MdDupLineNoEol(ls, le);
             ls = ne;
             while (ls < end) {
                 const char* bls = ls;
@@ -2575,10 +2647,10 @@ static void MdParseDoc(fz_context* ctx, const char* data, MdDoc& doc) {
                 if (MdParseKvLine(Str(is, (int)(ble - is)), bl.key, bl.val)) {
                     bl.kv = true;
                 }
-                VecAppend(seg.body, std::move(bl));
+                VecAppend(seg->body, std::move(bl));
                 ls = bne;
             }
-            VecAppend(doc.segs, std::move(seg));
+            VecAppend(doc.segs, seg);
             textStart = (ls < end) ? ls : nullptr;
         } else {
             if (!textStart) {
@@ -2588,22 +2660,22 @@ static void MdParseDoc(fz_context* ctx, const char* data, MdDoc& doc) {
         }
     }
     if (textStart && textStart < end) {
-        MdSeg seg;
-        seg.text = str::Dup(Str(textStart, (int)(end - textStart)));
-        VecAppend(doc.segs, std::move(seg));
+        auto* seg = new MdSeg;
+        seg->text = str::Dup(Str(textStart, (int)(end - textStart)));
+        VecAppend(doc.segs, seg);
     }
 
     // parse valid callouts into annotations through the JSON importer
     // (synthesizing a JSON object from the kv lines reuses
     // JsonToSidecarAnnot's field semantics verbatim)
-    for (MdSeg& seg : doc.segs) {
-        if (!seg.isCallout) {
+    for (MdSeg* seg : doc.segs) {
+        if (!seg->isCallout) {
             continue;
         }
         bool anyKv = false;
         str::Builder jb;
         jb.AppendChar('{');
-        for (MdBodyLine& bl : seg.body) {
+        for (MdBodyLine& bl : seg->body) {
             if (!bl.kv) {
                 continue;
             }
@@ -2625,11 +2697,11 @@ static void MdParseDoc(fz_context* ctx, const char* data, MdDoc& doc) {
             fz_json* o = fz_parse_json(ctx, pool, CStrTemp(js));
             SidecarAnnot sa;
             if (o && fz_json_is_object(ctx, o) && JsonToSidecarAnnot(ctx, o, sa)) {
-                seg.isAnnot = true;
-                seg.annot = std::move(sa);
+                seg->isAnnot = true;
+                seg->annot = sa;
             } else {
                 // may have dup'ed strings before the sanity check failed
-                FreeSidecarAnnotStrings(ctx, sa);
+                FreeSidecarAnnot(ctx, sa);
             }
         }
         fz_always(ctx) {
@@ -2663,13 +2735,13 @@ static bool ParseSidecarMd(fz_context* ctx, char* data, Vec<SidecarAnnot>& out) 
     MdDoc doc;
     MdParseDoc(ctx, data, doc);
     int nMalformed = 0;
-    for (MdSeg& seg : doc.segs) {
-        if (seg.isCallout && seg.isAnnot) {
-            VecAppend(out, std::move(seg.annot));
-            // the strings moved with the struct; keep MdFreeDoc away from
-            // the moved-from copy
-            seg.isAnnot = false;
-        } else if (seg.isCallout && !seg.isAnnot) {
+    for (MdSeg* seg : doc.segs) {
+        if (seg->isCallout && seg->isAnnot) {
+            // the annotation is copied into out by value (memcpy); keep
+            // MdFreeDoc away from the copied-out copy
+            VecAppend(out, seg->annot);
+            seg->isAnnot = false;
+        } else if (seg->isCallout && !seg->isAnnot) {
             // a callout carrying machine ("key: value") lines that failed
             // the annotation sanity check: half-written data (crashed save)
             // or a hand-editing artifact (callout deleted halfway in the
@@ -2678,7 +2750,7 @@ static bool ParseSidecarMd(fz_context* ctx, char* data, Vec<SidecarAnnot>& out) 
             // window (nothing can be saved, the window cannot be closed).
             // The remaining entries still import; the malformed callout
             // survives as user content until deleted by hand
-            for (MdBodyLine& bl : seg.body) {
+            for (MdBodyLine& bl : seg->body) {
                 if (bl.kv) {
                     nMalformed++;
                     break;
@@ -2728,10 +2800,10 @@ static void MdMatchEntries(const Vec<SidecarAnnot>& entries, const MdDoc& doc, V
             continue;
         }
         for (int si = 0; si < len(doc.segs); si++) {
-            if (used[si] || !doc.segs[si].isAnnot) {
+            if (used[si] || !doc.segs[si]->isAnnot) {
                 continue;
             }
-            if (str::Eq(doc.segs[si].annot.name, entries[ei].name)) {
+            if (str::Eq(doc.segs[si]->annot.name, entries[ei].name)) {
                 res[ei] = si;
                 used[si] = true;
                 break;
@@ -2744,10 +2816,10 @@ static void MdMatchEntries(const Vec<SidecarAnnot>& entries, const MdDoc& doc, V
             continue;
         }
         for (int si = 0; si < len(doc.segs); si++) {
-            if (used[si] || !doc.segs[si].isAnnot) {
+            if (used[si] || !doc.segs[si]->isAnnot) {
                 continue;
             }
-            if (MdNearAnnot(entries[ei], doc.segs[si].annot)) {
+            if (MdNearAnnot(entries[ei], doc.segs[si]->annot)) {
                 res[ei] = si;
                 used[si] = true;
                 break;
@@ -2890,9 +2962,9 @@ static Str BuildSidecarMd(EngineMupdf* e, Str pdfPath, const Vec<SidecarAnnot>& 
     }
 
     for (int si = 0; si < len(doc.segs); si++) {
-        MdSeg& seg = doc.segs[si];
-        if (!seg.isCallout) {
-            out.Append(seg.text);
+        MdSeg* seg = doc.segs[si];
+        if (!seg->isCallout) {
+            out.Append(seg->text);
             continue;
         }
         int ei = segToEntry[si];
@@ -2900,25 +2972,25 @@ static Str BuildSidecarMd(EngineMupdf* e, Str pdfPath, const Vec<SidecarAnnot>& 
             // rewrite this callout in place from the live entry; the
             // header line and user body lines survive untouched
             MdEnsureBlankBefore(out, crlf);
-            out.Append(seg.header);
+            out.Append(seg->header);
             out.Append(eol);
             str::Builder kb;
             AppendAnnotMdLines(kb, ctx, entries[ei], crlf);
             out.Append(kb.TakeStr());
-            for (MdBodyLine& bl : seg.body) {
+            for (MdBodyLine& bl : seg->body) {
                 if (!bl.kv) {
                     out.Append(bl.line);
                     out.Append(eol);
                 }
             }
-        } else if (seg.isAnnot) {
+        } else if (seg->isAnnot) {
             // the annotation is gone: drop the callout
         } else {
             // user-content callout: preserved verbatim
             MdEnsureBlankBefore(out, crlf);
-            out.Append(seg.header);
+            out.Append(seg->header);
             out.Append(eol);
-            for (MdBodyLine& bl : seg.body) {
+            for (MdBodyLine& bl : seg->body) {
                 out.Append(bl.line);
                 out.Append(eol);
             }
@@ -3021,16 +3093,8 @@ static pdf_annot* CreateAnnotFromEntry(fz_context* ctx, pdf_page* page, const Si
         if (!a.bounds.IsEmpty() && SidecarAnnotOwnsRect(a.type)) {
             pdf_set_annot_rect(ctx, pa, ToFzRect(a.bounds));
         }
-        if (len(a.quads) > 0 && (AnnotationIsTextMarkup(a.type) || a.type == AnnotationType::Redact)) {
-            int n = (int)len(a.quads);
-            if (n > kMaxQuads) {
-                n = kMaxQuads;
-            }
-            fz_quad quads[kMaxQuads];
-            for (int i = 0; i < n; i++) {
-                quads[i] = a.quads[i];
-            }
-            pdf_set_annot_quad_points(ctx, pa, n, quads);
+        if (a.nQuads > 0 && (AnnotationIsTextMarkup(a.type) || a.type == AnnotationType::Redact)) {
+            pdf_set_annot_quad_points(ctx, pa, a.nQuads, a.quads);
         }
         if (a.type == AnnotationType::Line) {
             if (a.hasLine) {
@@ -3040,38 +3104,30 @@ static pdf_annot* CreateAnnotFromEntry(fz_context* ctx, pdf_page* page, const Si
                 pdf_set_annot_line_ending_styles(ctx, pa, (pdf_line_ending)a.lineStart, (pdf_line_ending)a.lineEnd);
             }
         }
-        if ((a.type == AnnotationType::Polygon || a.type == AnnotationType::PolyLine) && len(a.vertices) > 0) {
-            int n = (int)len(a.vertices);
-            if (n > kMaxVertices) {
-                n = kMaxVertices;
-            }
+        if ((a.type == AnnotationType::Polygon || a.type == AnnotationType::PolyLine) && a.nVertices > 0) {
             fz_point verts[kMaxVertices];
-            for (int i = 0; i < n; i++) {
+            for (int i = 0; i < a.nVertices; i++) {
                 verts[i] = fz_make_point(a.vertices[i].x, a.vertices[i].y);
             }
-            pdf_set_annot_vertices(ctx, pa, n, verts);
+            pdf_set_annot_vertices(ctx, pa, a.nVertices, verts);
         }
-        if (a.type == AnnotationType::Ink && len(a.inkStrokes) > 0) {
+        if (a.type == AnnotationType::Ink && a.nInkStrokes > 0) {
             // counts must match the points actually emitted: when the caps
             // truncate, mupdf must not read past the array (this fixes a
             // latent bug that existed in the XFDF version of this code)
-            int counts[kMaxInkStrokes];
             fz_point pts[kMaxInkPoints];
-            int nStrokes = (int)len(a.inkStrokes);
-            if (nStrokes > kMaxInkStrokes) {
-                nStrokes = kMaxInkStrokes;
-            }
             int nPts = 0;
-            for (int i = 0; i < nStrokes; i++) {
-                const Vec<PointF>& stroke = a.inkStrokes[i];
+            for (int i = 0; i < a.nInkStrokes; i++) {
+                const PointF* stroke = a.inkPts[i];
                 int kept = 0;
-                for (int j = 0; j < len(stroke) && nPts < kMaxInkPoints; j++) {
+                for (int j = 0; j < a.inkCounts[i] && nPts < kMaxInkPoints; j++) {
                     pts[nPts++] = fz_make_point(stroke[j].x, stroke[j].y);
                     kept++;
                 }
-                counts[i] = kept;
+                // the strokes were capped at collect time, kept == the stored count
+                ReportIf(kept != a.inkCounts[i]);
             }
-            pdf_set_annot_ink_list(ctx, pa, nStrokes, counts, pts);
+            pdf_set_annot_ink_list(ctx, pa, a.nInkStrokes, a.inkCounts, pts);
         }
         if (a.hasColor && AnnotationSupportsColor(a.type)) {
             pdf_set_annot_color(ctx, pa, 3, a.color);
@@ -3352,28 +3408,28 @@ struct SidecarSyncState {
     Vec<SidecarSyncEntry> base;
 };
 
-static Vec<SidecarSyncState> gSidecarSync; // few entries, linear scan
+// few entries, linear scan. Heap-allocated: Vec<T> requires a trivially
+// copyable T and SidecarSyncState owns a Vec member
+static Vec<SidecarSyncState*> gSidecarSync;
 
 static SidecarSyncState* FindSidecarSyncState(Str path) {
-    for (SidecarSyncState& st : gSidecarSync) {
-        if (str::Eq(st.path, path)) {
-            return &st;
+    for (SidecarSyncState* st : gSidecarSync) {
+        if (str::Eq(st->path, path)) {
+            return st;
         }
     }
     return nullptr;
 }
 
-// note: the returned pointer is invalidated by a later GetSidecarSyncState
-// (vector growth); callers use it within a single function scope
 static SidecarSyncState* GetSidecarSyncState(Str path) {
     SidecarSyncState* st = FindSidecarSyncState(path);
     if (st) {
         return st;
     }
-    SidecarSyncState ns;
-    ns.path = str::Dup(path);
-    VecAppend(gSidecarSync, std::move(ns));
-    return &gSidecarSync[len(gSidecarSync) - 1];
+    st = new SidecarSyncState;
+    st->path = str::Dup(path);
+    VecAppend(gSidecarSync, st);
+    return st;
 }
 
 static void SidecarSyncSetBase(SidecarSyncState* st, Vec<SidecarSyncEntry>&& newBase) {
@@ -3521,7 +3577,7 @@ static bool SidecarReloadFromDisk(WindowTab* tab, EngineMupdf* e, const SidecarT
     }
 
     Vec<Annotation*> annots;
-    EngineMupdfGetAnnotations((EngineBase*)e, annots);
+    EngineGetAnnotations((EngineBase*)e, annots);
     Vec<Annotation*> toDelete;
     int nKept = 0;
     for (Annotation* a : annots) {
@@ -3574,7 +3630,7 @@ static bool SidecarReloadFromDisk(WindowTab* tab, EngineMupdf* e, const SidecarT
         e->modifiedAnnotations = true;
     }
     for (SidecarAnnot& sa : entries) {
-        FreeSidecarAnnotStrings(ctx, sa);
+        FreeSidecarAnnot(ctx, sa);
     }
 
     // record the new sync point: base = file content, fingerprint = file now
@@ -3820,7 +3876,7 @@ void SidecarMaybeImport(EngineBase* engine) {
     gSidecarImporting = false;
     SidecarRecordImportedSync(engine, use, entries);
     for (SidecarAnnot& sa : entries) {
-        FreeSidecarAnnotStrings(ctx, sa);
+        FreeSidecarAnnot(ctx, sa);
     }
     if (n > 0) {
         logf("sidecar: imported %d annotations from '%s' (%s)\n", n, use.path,
@@ -3900,7 +3956,7 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate, bool forceOverwri
     }
 
     Vec<Annotation*> annots;
-    EngineMupdfGetAnnotations(engine, annots);
+    EngineGetAnnotations(engine, annots);
     int nSkippedUnsupported = 0;
     Vec<SidecarAnnot> entries;
     CollectSidecarEntries(e, annots, nSkippedUnsupported, entries);
@@ -3915,7 +3971,7 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate, bool forceOverwri
         ShowWarningNotification(win->hwndCanvas, StrL("Failed to build sidecar"), 5000);
         fz_context* ctx = e->Ctx();
         for (SidecarAnnot& sa : entries) {
-            FreeSidecarAnnotStrings(ctx, sa);
+            FreeSidecarAnnot(ctx, sa);
         }
         return SidecarResult::Failed;
     }
@@ -3935,7 +3991,7 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate, bool forceOverwri
         str::Free(data);
         fz_context* ctx = e->Ctx();
         for (SidecarAnnot& sa : entries) {
-            FreeSidecarAnnotStrings(ctx, sa);
+            FreeSidecarAnnot(ctx, sa);
         }
         return SidecarResult::Failed;
     }
@@ -3949,7 +4005,7 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate, bool forceOverwri
         int nAssetFailed = WriteSidecarAssets(tgt.path, entries);
         SidecarRecordSavedSync(engine, tgt, entries);
         for (SidecarAnnot& sa : entries) {
-            FreeSidecarAnnotStrings(ctx, sa);
+            FreeSidecarAnnot(ctx, sa);
         }
         if (nAssetFailed > 0) {
             // the sidecar references the missing files; the annotations stay

@@ -22,6 +22,8 @@
 #include "AppSettings.h"
 #include "Canvas.h"
 
+int gHomePagePaintCount = 0;
+
 static void OnPaintAbout(MainWindow* win) {
     auto t = TimeGet();
     PAINTSTRUCT ps;
@@ -49,6 +51,10 @@ static void OnPaintAbout(MainWindow* win) {
     DrawCanvasKeyboardFocusIfNeeded(win, hdc);
 
     EndPaint(win->hwndCanvas, &ps);
+    if (drawHome) {
+        gHomePagePaintCount++;
+        HomePageRepaintWinScrollbar(win);
+    }
     win->ShowFrameRateDur(TimeSinceInMs(t));
 }
 
@@ -195,6 +201,11 @@ LRESULT WndProcCanvasAbout(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, LPAR
             HomePageOnMouseWheel(win, delta);
             return 0;
         }
+
+        // nothing scrolls sideways; DefWindowProc hands it to the frame, which
+        // sends it back here until the stack overflows
+        case WM_MOUSEHWHEEL:
+            return 0;
 
         default:
             return DefWindowProc(hwnd, msg, wp, lp);

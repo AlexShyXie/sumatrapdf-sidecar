@@ -30,6 +30,7 @@
 #include "SumatraConfig.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Commands.h"
 #include "Toolbar.h"
@@ -58,6 +59,7 @@ void HideAnnotFilterWindow(MainWindow*);
 static bool FilterHomeEndMovesList(AnnotFilterToolbar*, int vkey, bool isCtrl);
 static void KillSelectionTimer(AnnotFilterToolbar*);
 static void UpdateFloatButtons(AnnotFilterToolbar*);
+static void OnListContextMenu(AnnotFilterToolbar*, VirtMouseEvent*);
 
 struct AnnotFilterWindow : WindowBase {
     MainWindow* win = nullptr;
@@ -338,6 +340,7 @@ static void WireListBox(AnnotFilterToolbar* f, VirtListBox* lb, int dpi) {
     lb->onSelectionChanged = MkFunc0(OnListSelectionChanged, f);
     lb->onDoubleClick = MkFunc0(OnListDoubleClick, f);
     lb->onDrawItem = MkFunc1(OnListDrawItem, f);
+    lb->onContextMenu = MkFunc1(OnListContextMenu, f);
     lb->SetFlag(vwfFocusable, false);
     ApplyListColorsTo(lb);
 }
@@ -481,19 +484,15 @@ static AnnotFilterToolbar* GetOrCreate(MainWindow* win) {
     return f;
 }
 
-static int FilterEditPadL() {
-    return UiEdgeDx();
-}
-
 static int FilterEditPadR() {
-    return FilterEditPadL() + DpiScale(4);
+    return UiEdgeDx() + DpiScale(4);
 }
 
 static bool FrameIsMaxOrFullscreen(MainWindow* win) {
     if (!win || !win->hwndFrame) {
         return false;
     }
-    return win->isFullScreen || win->presentation || IsZoomed(win->hwndFrame);
+    return win->IsFullScreenOrPresentation() || IsZoomed(win->hwndFrame);
 }
 
 static Rect AnnotFilterDefaultRect(MainWindow* win, int dx, int dy) {
@@ -501,7 +500,7 @@ static Rect AnnotFilterDefaultRect(MainWindow* win, int dx, int dy) {
     Rect fr = HwndWindowRect(hwnd);
     int dpi = DpiGetForHwnd(hwnd);
     int gap = DpiScaleByDpi(dpi, kFloatWinGap);
-    Rect area = (win->isFullScreen || win->presentation) ? HwndGetFullscreenRect(hwnd) : GetWorkAreaRect(fr, nullptr);
+    Rect area = (win->IsFullScreenOrPresentation()) ? HwndGetFullscreenRect(hwnd) : GetWorkAreaRect(fr, nullptr);
     dx = std::min(dx, std::max(area.dx, 1));
     dy = std::min(dy, std::max(area.dy, 1));
 
@@ -596,6 +595,54 @@ static void DeleteFloatSelected(AnnotFilterWindow* w) {
 
 static void OnFloatDelete(AnnotFilterWindow* w, VirtMouseEvent*) {
     DeleteFloatSelected(w);
+}
+
+// right-click on a row: copy / edit / delete (#6365)
+static void OnListContextMenu(AnnotFilterToolbar* f, VirtMouseEvent* ev) {
+    AnnotFilterWindow* w = f ? f->floatWnd : nullptr;
+    VirtListBox* lb = ActiveList(f);
+    WindowTab* tab = FilterTab(f);
+    if (!w || !lb || !tab) {
+        return;
+    }
+    int idx = lb->ItemFromPoint(ev->pt);
+    Annotation* annot = VisibleAnnotAt(f, idx);
+    if (!annot) {
+        return;
+    }
+    ev->didHandle = true;
+
+    // like Explorer: right-click outside the selection selects that row
+    if (!lb->IsSelected(idx)) {
+        lb->SetCurrentSelection(idx);
+        ApplySelectionNow(f);
+    }
+    int nSel = std::max(lb->SelectedCount(), 1);
+
+    Vec<AnnotListMenuItem> items;
+    AnnotListMenuItems(f->win, annot, nSel, items);
+    HMENU menu = CreatePopupMenu();
+    for (const AnnotListMenuItem& it : items) {
+        UINT flags = MF_STRING | (it.disabled ? MF_GRAYED : 0);
+        AppendMenuW(menu, flags, (UINT)it.id, ToWStrTemp(it.title).s);
+    }
+
+    Point pt = HwndClientToScreen(w->hwnd, ev->ptWindow);
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, w->hwnd, nullptr);
+    DestroyMenu(menu);
+
+    switch ((AnnotListMenu)cmd) {
+        case AnnotListMenu::CopyComment:
+            CopyTextToClipboard(Contents(annot));
+            break;
+        case AnnotListMenu::Edit:
+            SetSelectedAnnotation(tab, annot);
+            uitask::Post(MkFunc0(StartSelectedAnnotContentsEdit, f->win), "StartAnnotContentsEdit");
+            break;
+        case AnnotListMenu::Delete:
+            DeleteFloatSelected(w);
+            break;
+    }
 }
 
 static void OnFloatDiscard(AnnotFilterWindow* w, VirtMouseEvent*) {
@@ -795,7 +842,7 @@ bool AnnotFilterWindow::Create(MainWindow* mainWin) {
         args.noTheme = true;
         args.selectAllOnFocus = true;
         args.centerTextVert = true;
-        args.marginLeft = FilterEditPadL();
+        args.marginLeft = UiEdgeDx();
         args.marginRight = FilterEditPadR();
         edit = new Edit();
         edit->SetColors(colTxt, colBg);
@@ -934,17 +981,7 @@ void AnnotFilterWindow::OnTimer(WindowBase::TimerEvent* ev) {
 }
 
 void AnnotFilterWindow::OnDpiChanged(WindowBase::DpiChangedEvent* ev) {
-    if (!layout) {
-        ev->didHandle = true;
-        return;
-    }
-    RECT* r = ev->suggested;
-    if (r) {
-        SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-    UpdateDpi((int)ev->dpiX);
-    ev->didHandle = true;
+    HandleDpiChanged(this, ev);
 }
 
 void AnnotFilterWindow::OnGetMinMaxInfo(WindowBase::GetMinMaxInfoEvent* ev) {
@@ -1109,7 +1146,7 @@ void ClearAnnotFilterAnnotations(MainWindow* win) {
     }
     UpdateCue(f);
     UpdateFloatButtons(f);
-    uitask::Post(MkFunc0(PostedRefreshAnnots, win), "RefreshAnnotFilterAnnots");
+    PostForWindow(win, PostedRefreshAnnots, "RefreshAnnotFilterAnnots");
 }
 
 void RefreshAnnotFilterAnnotations(MainWindow* win) {
@@ -1186,7 +1223,8 @@ TempStr AnnotFilterToolbarStateTemp(MainWindow* win) {
     if (f && f->floatWnd && f->floatWnd->notePreview) {
         VirtFixedLinesText* np = f->floatWnd->notePreview;
         bool shown = np->GetVisibility() == Visibility::Visible;
-        out.Append(fmt("note=%d noteText=%s\n", shown ? 1 : 0, np->PlainTextTemp()));
+        out.Append(fmt("note=%d noteWrapDx=%d noteDx=%d noteText=%s\n", shown ? 1 : 0, np->layoutDx,
+                       np->ContentRectInWindow().dx, np->PlainTextTemp()));
     }
     int deleteOn = 0;
     int discardOn = 0;

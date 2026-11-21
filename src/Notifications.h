@@ -90,8 +90,7 @@ void SetNotifWindow(NotificationCreateArgs&, MainWindow*);
 void NotificationUpdateMessage(NotificationWnd* wnd, Str msg, int timeoutInMS = 0, bool highlight = false);
 TempStr NotificationGetMessageTemp(NotificationWnd* wnd);
 void RemoveNotification(NotificationWnd*);
-void CloseNotification(NotificationWnd*);
-bool AreNotificationsEnabled();
+void CloseNotification(NotificationWnd*, NotifCloseReason reason = NotifCloseReason::Program);
 void SetNotificationsEnabled(bool);
 bool RemoveNotificationsForGroup(HWND, Kind);
 void RemoveNotificationsForHwnd(HWND);
@@ -121,5 +120,6 @@ NotificationWnd* ShowPlainWarningNotification(MainWindow* win, Str msg, int time
 void MaybeDelayedWarningNotification(Str msg);
 void ShowMaybeDelayedNotifications(HWND hwndParent);
 void InstallLayoutNotifHooks();
+void InstallFontDownloadNotifHook();
 
 int CalcPerc(int current, int total);

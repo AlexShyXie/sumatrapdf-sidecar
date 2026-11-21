@@ -43,6 +43,7 @@ bool ShowTransparencyGrid();
 
 struct RenderThreadData;
 static void RenderCacheThread(RenderThreadData* data);
+static bool IsTileVisible(DisplayModel* dm, int pageNo, TilePosition tile, float fuzz);
 
 static bool gShowTileLayout = false;
 int gMaxRenderThreads = 8;
@@ -99,6 +100,66 @@ static Pixmap* GrayscalePagePixmap(Pixmap* bmp) {
     return bmp;
 }
 
+// Brightness and contrast, -100..100 each, of the page bitmap (#4788).
+// Contrast scales around mid gray (up to 4x, down to flat gray), then
+// brightness shifts by up to half the range.
+static Pixmap* AdjustPagePixmap(Pixmap* bmp, int brightness, int contrast) {
+    if (!bmp || (brightness == 0 && contrast == 0)) {
+        return bmp;
+    }
+    if (bmp->format == PixmapFormat::Native) {
+#if OS_WIN
+        Pixmap* converted = PixmapCopyAs32bppDIB(bmp);
+        if (!converted) {
+            return bmp;
+        }
+        FreePixmap(bmp);
+        bmp = converted;
+#else
+        return bmp;
+#endif
+    }
+    if (!bmp->data) {
+        return bmp;
+    }
+    if (bmp->format != PixmapFormat::BGRA8 && bmp->format != PixmapFormat::BGR8 && bmp->format != PixmapFormat::RGBA8) {
+        return bmp;
+    }
+
+    float c = (float)contrast / 100.f;
+    float factor = c >= 0 ? 1.f + 3.f * c : 1.f + c;
+    float offset = (float)brightness * 127.5f / 100.f;
+    u8 lut[256];
+    for (int v = 0; v < 256; v++) {
+        float r = ((float)v - 127.5f) * factor + 127.5f + offset;
+        lut[v] = (u8)limitValue((int)(r + 0.5f), 0, 255);
+    }
+
+    // premultiplied pixels with partial alpha are adjusted unpremultiplied
+    int bpp = PixmapBytesPerPixel(bmp->format);
+    bool premul = bmp->premultiplied && bmp->hasAlpha && bpp == 4;
+    for (int y = 0; y < bmp->height; y++) {
+        u8* p = bmp->data + ((size_t)y * bmp->stride);
+        for (int x = 0; x < bmp->width; x++, p += bpp) {
+            u32 a = premul ? p[3] : 255;
+            if (a == 255) {
+                p[0] = lut[p[0]];
+                p[1] = lut[p[1]];
+                p[2] = lut[p[2]];
+                continue;
+            }
+            if (a == 0) {
+                continue;
+            }
+            for (int i = 0; i < 3; i++) {
+                u32 v = std::min(255u, (p[i] * 255 + a / 2) / a);
+                p[i] = (u8)((lut[v] * a + 127) / 255);
+            }
+        }
+    }
+    return bmp;
+}
+
 // RenderCache's verbose per-operation logging (FreePage / Paint / DropCacheEntry
 // / ...) is noisy, so it's disabled by default. Set gLogRenderCache = true to
 // re-enable it when debugging the cache.
@@ -121,7 +182,7 @@ struct RenderThreadData {
 // running between pages. Slot 0 of curReqs is the pump's, as a thread's would
 // be. `active` is cleared when the cache goes away, so a pump still in the
 // queue finds nothing to touch.
-constexpr int kPumpSliceMs = 20;
+constexpr int kPumpSliceMs = kUiSliceMs;
 
 struct RenderCachePump {
     AtomicInt refs = 1;
@@ -321,10 +382,38 @@ static bool FreeIfFull(RenderCache* rc, const PageRenderRequest& req) {
     }
 
     DisplayModel* dm = req.dm;
+    // runs on the render thread: BuildPagesInfo() on the UI thread must not
+    // free pagesInfo while the page accessors below read it
+    ScopedMutex pagesScope(&dm->pagesInfoLock);
+
     // free an invisible page of the same DisplayModel ...
     for (int i = 0; i < n; i++) {
         auto* entry = rc->cache[i];
         if (entry->dm == dm && !dm->PageVisibleNearby(entry->pageNo)) {
+            bool didDrop = rc->DropCacheEntryIfNotUsed(entry);
+            if (didDrop) {
+                return true;
+            }
+        }
+    }
+
+    // ... or a tile rendered at an earlier zoom or rotation (#6366)
+    for (int i = 0; i < n; i++) {
+        auto* entry = rc->cache[i];
+        if (entry->dm != dm) {
+            continue;
+        }
+        bool isStale = entry->zoom != dm->GetRenderZoom(entry->pageNo) ||
+                       entry->rotation != NormalizeRotation(dm->PageRotation(entry->pageNo));
+        if (isStale && rc->DropCacheEntryIfNotUsed(entry)) {
+            return true;
+        }
+    }
+
+    // ... or an off-screen tile of a visible page (a deeply zoomed page has more tiles than the cache)
+    for (int i = 0; i < n; i++) {
+        auto* entry = rc->cache[i];
+        if (entry->dm == dm && entry->tile.res > 0 && !IsTileVisible(dm, entry->pageNo, entry->tile, 0)) {
             bool didDrop = rc->DropCacheEntryIfNotUsed(entry);
             if (didDrop) {
                 return true;
@@ -525,22 +614,6 @@ void RenderCache::FreeForDisplayModel(DisplayModel* dm) {
     }
 }
 
-void RenderCache::FreeNotVisible() {
-    ScopedRecursiveMutex scope(&cacheAccess);
-    // must go from end because freeing changes the cache
-    for (int i = cacheCount - 1; i >= 0; i--) {
-        BitmapCacheEntry* entry = cache[i];
-        // all invisible pages resp. page tiles
-        bool shouldFree = !entry->dm->PageVisibleNearby(entry->pageNo);
-        if (!shouldFree && entry->tile.res > 1) {
-            shouldFree = !IsTileVisible(entry->dm, entry->pageNo, entry->tile, 2.0);
-        }
-        if (shouldFree) {
-            DropCacheEntryIfNotUsed(entry);
-        }
-    }
-}
-
 // keep the cached bitmaps for visible pages to avoid flickering during a reload.
 // mark invisible pages as out-of-date to prevent inconsistencies
 void RenderCache::KeepForDisplayModel(DisplayModel* oldDm, DisplayModel* newDm) {
@@ -642,6 +715,22 @@ void RenderCache::Invalidate(DisplayModel* dm, int pageNo, RectF rect) {
     for (int i = 0; i < cacheCount; i++) {
         auto* e = cache[i];
         if (e->dm == dm && e->pageNo == pageNo && !GetTileRect(mediabox, e->tile).Intersect(rect).IsEmpty()) {
+            e->zoom = kInvalidZoom;
+            e->outOfDate = true;
+        }
+    }
+}
+
+// Re-render all of dm's pages, e.g. after a brightness change. Unlike
+// FreeForDisplayModel, the stale bitmaps stay on screen until replaced.
+void RenderCache::InvalidateAll(DisplayModel* dm) {
+    ScopedRecursiveMutex scopeReq(&requestAccess);
+    AbortRendering(dm);
+
+    ScopedRecursiveMutex scopeCache(&cacheAccess);
+    for (int i = 0; i < cacheCount; i++) {
+        auto* e = cache[i];
+        if (e->dm == dm) {
             e->zoom = kInvalidZoom;
             e->outOfDate = true;
         }
@@ -889,17 +978,29 @@ void RenderCache::Render(DisplayModel* dm, int pageNo, int rotation, float zoom,
     }
 }
 
+// a request that won't be rendered still gets its callback, as aborted: a
+// caller can own data that only the callback frees (RenderThumbnail)
+static void CallRenderAborted(PageRenderRequest* req) {
+    req->abort = true;
+    req->bmp = nullptr;
+    req->errorCode = 0;
+    if (req->renderFinishedCb.IsValid()) {
+        req->renderFinishedCb.Call(req);
+    }
+}
+
 bool RenderCache::Render(DisplayModel* dm, int pageNo, int rotation, float zoom, TilePosition* tile, RectF* pageRect,
                          const Func1<PageRenderRequest*>& renderFinishedCb, const PredictiveChain* chain) {
     rcLogf("RenderCache::Render: pageNo %d\n", pageNo);
     ReportIf(!dm);
-    if (!dm || dm->pauseRendering) {
-        return false;
-    }
     ReportIf(!renderFinishedCb.IsValid());
-
     ReportIf(!(tile || pageRect));
-    if (!tile && !pageRect) {
+    if (!dm || dm->pauseRendering || (!tile && !pageRect)) {
+        PageRenderRequest refused;
+        refused.dm = dm;
+        refused.pageNo = pageNo;
+        refused.renderFinishedCb = renderFinishedCb;
+        CallRenderAborted(&refused);
         return false;
     }
 
@@ -907,14 +1008,12 @@ bool RenderCache::Render(DisplayModel* dm, int pageNo, int rotation, float zoom,
     PageRenderRequest* newRequest;
 
     /* add request to the queue */
-    if (requestCount == kMaxPageRequests) {
+    // startRendering counts queued requests: one that replaces the oldest
+    // in a full queue doesn't add one
+    bool queueWasFull = requestCount == kMaxPageRequests;
+    if (queueWasFull) {
         /* queue is full -> remove the oldest items on the queue */
-        if (requests[0].renderFinishedCb.IsValid()) {
-            requests[0].abort = true;
-            requests[0].bmp = nullptr;
-            requests[0].errorCode = 0;
-            requests[0].renderFinishedCb.Call(&requests[0]);
-        }
+        CallRenderAborted(&requests[0]);
         // PageRenderRequest holds a Func1, so it isn't trivially copyable and
         // memmove() over it is undefined; shift with assignment instead
         for (int i = 0; i < kMaxPageRequests - 1; i++) {
@@ -957,7 +1056,9 @@ bool RenderCache::Render(DisplayModel* dm, int pageNo, int rotation, float zoom,
     }
     newRequest->renderFinishedCb = renderFinishedCb;
 
-    startRendering.Signal();
+    if (!queueWasFull) {
+        startRendering.Signal();
+    }
 
     // Lazy thread spawn: if no thread is currently waiting and we're below
     // the cap, start a new one. Existing busy threads will pick up the work
@@ -1013,6 +1114,8 @@ bool RenderCache::GetNextRequest(PageRenderRequest* req, int threadIdx) {
     *req = requests[idx];
     req->darkModeEpoch = darkModeEpoch;
     req->grayscale = AtomicBoolGet(&grayscalePageColors);
+    req->brightness = req->dm->brightness;
+    req->contrast = req->dm->contrast;
     curReqs[threadIdx] = req;
     ReportIf(req->abort);
 
@@ -1240,11 +1343,13 @@ void RenderCache::ClearQueueForDisplayModel(DisplayModel* dm, int pageNo, TilePo
         PageRenderRequest* req = &(requests[i]);
         bool shouldRemove = req->dm == dm && (pageNo == kRenderCacheAllPages || req->pageNo == pageNo) &&
                             (!tile || req->tile.res != tile->res || !IsTileVisible(dm, req->pageNo, *tile, 0.5));
+        if (shouldRemove) {
+            CallRenderAborted(req);
+        }
         if (i != curPos) {
             requests[curPos] = requests[i];
         }
         if (shouldRemove) {
-            // don't call renderFinishedCb for cleared requests - treat as aborted
             requestCount--;
         } else {
             curPos++;
@@ -1266,6 +1371,18 @@ void RenderCache::AbortCurrentRequest(int threadIdx) {
     UpdateRenderInfo();
 }
 
+void RenderCache::BumpDarkModeEpoch() {
+    ScopedRecursiveMutex scope(&requestAccess);
+    darkModeEpoch++;
+}
+
+// AbortCurrentRequest sets req.abort and BumpDarkModeEpoch the epoch from
+// another thread, both under requestAccess
+static bool RenderWasDropped(RenderCache* cache, PageRenderRequest& req) {
+    ScopedRecursiveMutex scope(&cache->requestAccess);
+    return req.abort || req.darkModeEpoch != cache->darkModeEpoch;
+}
+
 // Renders one queued request into the cache. Returns false when the queue was
 // empty; a request that turns out to be stale still counts as taken.
 static bool RenderCacheRunOne(RenderCache* cache, int threadIdx, PageRenderRequest& req) {
@@ -1278,11 +1395,17 @@ static bool RenderCacheRunOne(RenderCache* cache, int threadIdx, PageRenderReque
     }
 
     if (req.dm->pauseRendering) {
-        // aborted due to pause - do nothing
+        CallRenderAborted(&req);
         return true;
     }
 
     ReportIf(req.abortCookie != nullptr);
+    // an abort before the engine publishes its cookie can't stop the render:
+    // don't start one that's already dropped
+    if (RenderWasDropped(cache, req)) {
+        CallRenderAborted(&req);
+        return true;
+    }
     EngineBase* engine = req.dm->GetEngine();
 
     RenderPageArgs args(req.pageNo, req.zoom, req.rotation, &req.pageRect, RenderTarget::View, &req.abortCookie);
@@ -1306,9 +1429,10 @@ static bool RenderCacheRunOne(RenderCache* cache, int threadIdx, PageRenderReque
 #endif
     auto timeStart = TimeGet();
     Pixmap* bmp = engine->RenderPage(args);
-    if (req.abort || req.darkModeEpoch != cache->darkModeEpoch) {
+    if (RenderWasDropped(cache, req)) {
         // aborted or colors changed mid-render - discard result
         FreePixmap(bmp);
+        CallRenderAborted(&req);
         return true;
     }
     auto durMs = TimeSinceInMs(timeStart);
@@ -1323,6 +1447,10 @@ static bool RenderCacheRunOne(RenderCache* cache, int threadIdx, PageRenderReque
     if (bmp) {
         if (req.grayscale) {
             bmp = GrayscalePagePixmap(bmp);
+            req.bmp = bmp;
+        }
+        if (req.brightness != 0 || req.contrast != 0) {
+            bmp = AdjustPagePixmap(bmp, req.brightness, req.contrast);
             req.bmp = bmp;
         }
         const DarkModeProfile* profile = args.darkProfile;
@@ -1350,10 +1478,10 @@ static bool RenderCacheRunOne(RenderCache* cache, int threadIdx, PageRenderReque
             Color linkCol = profile ? profile->linkColor : cache->linkColor;
             RecolorPixmap(bmp, textCol, bgCol, linkCol, skipRectsPtr);
         }
-        if (req.abort || req.darkModeEpoch != cache->darkModeEpoch) {
+        if (RenderWasDropped(cache, req)) {
             // colors changed while recoloring - discard result
             FreePixmap(bmp);
-            req.bmp = nullptr;
+            CallRenderAborted(&req);
             return true;
         }
         cache->Add(req, bmp);
@@ -1494,7 +1622,14 @@ int RenderCache::PaintTile(
         source.dy = (int)((float)bounds.dy * factor);
     }
 #if defined(SUMATRA_NG)
-    CanvasDrawTile(ctx, entry, target, source);
+    // CmdToggleMirror: Paint() chose the tiles for the mirrored area; each goes
+    // to its mirrored place, drawn flipped
+    if (dm->GetMirror()) {
+        PageInfo* pi = dm->GetPageInfo(pageNo);
+        Rect page = pi ? pi->pageOnScreen : Rect{};
+        target.x = (2 * page.x) + page.dx - (target.x + target.dx);
+    }
+    CanvasDrawTile(ctx, entry, target, source, dm->GetMirror());
     if (gShowTileLayout) {
         CanvasDrawTileOutline(ctx, bounds);
     }
@@ -1566,6 +1701,7 @@ int RenderCache::Paint(
         if (AtomicBoolGet(&grayscalePageColors)) {
             bmp = GrayscalePagePixmap(bmp);
         }
+        bmp = AdjustPagePixmap(bmp, dm->brightness, dm->contrast);
 
         bool success = bmp && BlitPixmap(bmp, hdc, bounds);
         FreePixmap(bmp);
@@ -1575,6 +1711,13 @@ int RenderCache::Paint(
 
     int rotation = dm->PageRotation(pageNo);
     float zoom = dm->GetZoomReal(pageNo);
+#if defined(SUMATRA_NG)
+    // CmdToggleMirror: what shows in bounds is the mirrored part of the page
+    if (dm->GetMirror()) {
+        Rect page = pi->pageOnScreen;
+        bounds.x = (2 * page.x) + page.dx - (bounds.x + bounds.dx);
+    }
+#endif
     u16 targetRes = GetTileRes(dm, pageNo);
     u16 maxRes = GetMaxTileRes(dm, pageNo, rotation);
     maxRes = std::max(maxRes, targetRes);
@@ -1679,10 +1822,7 @@ void DebugTextWnd::ApplyDarkMode() {
 
 void DebugTextWnd::UpdateTheme() {
     WindowBase::UpdateTheme();
-    // Re-apply monospaced font after darkmode child theming (may reset font).
-    if (edit && monoFont) {
-        edit->SetFont(monoFont);
-    }
+    ReapplyEditFont(edit, monoFont);
 }
 
 void DebugTextWnd::SetTextContent(Str text) {

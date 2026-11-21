@@ -2,6 +2,7 @@
    License: GPLv3 */
 
 #include "base/Base.h"
+#include <locale.h>
 #include "base/File.h"
 #include "gui/Dpi.h"
 #include "base/UITask.h"
@@ -42,48 +43,66 @@ static TempStr FormatPageSizeUnitTemp(SizeF sizeInches, double unitsPerInch, Str
     return fmt("%sx%s %s", strWidth, strHeight, unit);
 }
 
+static Str PaperFormatName(SizeF sizeInches) {
+    switch (GetPaperFormatFromSizeApprox(sizeInches)) {
+        case PaperFormat::A2:
+            return StrL("A2");
+        case PaperFormat::A3:
+            return StrL("A3");
+        case PaperFormat::A4:
+            return StrL("A4");
+        case PaperFormat::A5:
+            return StrL("A5");
+        case PaperFormat::A6:
+            return StrL("A6");
+        case PaperFormat::Letter:
+            return StrL("Letter");
+        case PaperFormat::Legal:
+            return StrL("Legal");
+        case PaperFormat::Tabloid:
+            return StrL("Tabloid");
+        case PaperFormat::Statement:
+            return StrL("Statement");
+        case PaperFormat::Other:
+            break;
+    }
+    return StrL("Other");
+}
+
+static SizeF PageSizeInches(EngineBase* engine, int pageNo, int rotation) {
+    RectF mediabox = engine->PageMediabox(pageNo);
+    float zoom = 1.0f / engine->fileDPI;
+    return engine->Transform(mediabox, pageNo, zoom, rotation).Size();
+}
+
+// "W × H mm" or, where Windows measures in inches, "W × H in"
+TempStr FormatSizeInLocaleUnitTemp(SizeF sizeInches) {
+    if (GetMeasurementSystem() == 0) {
+        int w = (int)lround(sizeInches.dx * 25.4);
+        int h = (int)lround(sizeInches.dy * 25.4);
+        return fmt("%d \xC3\x97 %d mm", w, h);
+    }
+    TempStr w = str::FormatFloatWithThousandSepTemp(sizeInches.dx);
+    TempStr h = str::FormatFloatWithThousandSepTemp(sizeInches.dy);
+    return fmt("%s \xC3\x97 %s in", w, h);
+}
+
+// one unit, for the page info bar: "210 × 297 mm (A4)" (#6494)
+TempStr FormatPageSizeShortTemp(EngineBase* engine, int pageNo, int rotation) {
+    SizeF size = PageSizeInches(engine, pageNo, rotation);
+    TempStr res = FormatSizeInLocaleUnitTemp(size);
+    if (GetPaperFormatFromSizeApprox(size) == PaperFormat::Other) {
+        return res;
+    }
+    return fmt("%s (%s)", res, PaperFormatName(size));
+}
+
 // Format page size in cm/mm/in (locale unit first) and points (issue #2186).
 // Metric: "21.0 x 29.7 cm, 210 x 297 mm, 8.27 x 11.69 in, 595 x 842 pt (A4)"
 // US:     "8.27 x 11.69 in, 21.0 x 29.7 cm, 210 x 297 mm, 595 x 842 pt (A4)"
 TempStr FormatPageSizeTemp(EngineBase* engine, int pageNo, int rotation) {
-    RectF mediabox = engine->PageMediabox(pageNo);
-    float fileDpi = engine->fileDPI;
-    float zoom = 1.0f / fileDpi;
-    SizeF size = engine->Transform(mediabox, pageNo, zoom, rotation).Size();
-
-    Str formatName;
-    switch (GetPaperFormatFromSizeApprox(size)) {
-        case PaperFormat::A2:
-            formatName = StrL(" (A2)");
-            break;
-        case PaperFormat::A3:
-            formatName = StrL(" (A3)");
-            break;
-        case PaperFormat::A4:
-            formatName = StrL(" (A4)");
-            break;
-        case PaperFormat::A5:
-            formatName = StrL(" (A5)");
-            break;
-        case PaperFormat::A6:
-            formatName = StrL(" (A6)");
-            break;
-        case PaperFormat::Letter:
-            formatName = StrL(" (Letter)");
-            break;
-        case PaperFormat::Legal:
-            formatName = StrL(" (Legal)");
-            break;
-        case PaperFormat::Tabloid:
-            formatName = StrL(" (Tabloid)");
-            break;
-        case PaperFormat::Statement:
-            formatName = StrL(" (Statement)");
-            break;
-        case PaperFormat::Other:
-            formatName = StrL(" (Other)");
-            break;
-    }
+    SizeF size = PageSizeInches(engine, pageNo, rotation);
+    TempStr formatName = fmt(" (%s)", PaperFormatName(size));
 
     TempStr inStr = FormatPageSizeUnitTemp(size, 1.0, StrL("in"));
     TempStr cmStr = FormatPageSizeUnitTemp(size, 2.54, StrL("cm"));
@@ -339,6 +358,199 @@ TempStr AddTimeZone(TempStr s, int timeZone) {
     return fmt("%s %s%02d:%02d", s, tzSign, hours, mins);
 }
 
+// a parsed document date: the SYSTEMTIME fields we show, on every platform
+struct PropDate {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+};
+
+// See: http://www.verypdf.com/pdfinfoeditor/pdf-date-format.htm
+// Format:  "D:YYYYMMDDHHMMSSxxxxxxx"
+// Example: "D:20091222171933-05'00'"
+static bool PdfDateParseA(Str date, PropDate* timeOut, int* timeZoneOut) {
+    if (len(date) == 0) {
+        return false;
+    }
+
+    *timeOut = PropDate();
+    *timeZoneOut = 0;
+
+    Str slice = date;
+    // "D:" at the beginning is optional
+    str::TrimPrefix(slice, StrL("D:"));
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+    Str end = str::Parse(slice,
+                         "%4d%2d%2d"
+                         "%2d%2d%2d",
+                         &year, &month, &day, &hour, &minute, &second);
+    if (!end.s) {
+        return false;
+    }
+    timeOut->year = year;
+    timeOut->month = month;
+    timeOut->day = day;
+    timeOut->hour = hour;
+    timeOut->minute = minute;
+    timeOut->second = second;
+    // parse optional timezone: Z, +HH'MM', -HH'MM' (or +HH'MM, +HHMM, +HH)
+    if (end.s[0] == 'Z') {
+        *timeZoneOut = 0;
+    } else if (end.s[0] == '+' || end.s[0] == '-') {
+        int sign = (end.s[0] == '+') ? 1 : -1;
+        int tzHour = 0;
+        int tzMin = 0;
+        Str tz = Str(end.s + 1, end.len - 1);
+        Str tzEnd = str::Parse(tz, "%2d'%2d", &tzHour, &tzMin);
+        if (!tzEnd.s) {
+            tzEnd = str::Parse(tz, "%2d:%2d", &tzHour, &tzMin);
+        }
+        if (!tzEnd.s) {
+            str::Parse(tz, "%2d", &tzHour);
+        }
+        *timeZoneOut = sign * ((tzHour * 100) + tzMin);
+    }
+    return true;
+    // don't bother about the day of week, we won't display it anyway
+}
+
+// See: ISO 8601 specification
+// Format:  "YYYY-MM-DDTHH:MM:SSZ"
+// Example: "2011-04-19T22:10:48Z"
+static bool IsoDateParse(Str date, PropDate* timeOut, int* timeZoneOut) {
+    if (len(date) == 0) {
+        return false;
+    }
+
+    *timeOut = PropDate();
+    *timeZoneOut = 0;
+
+    int year = 0, month = 0, day = 0;
+    Str end = str::Parse(date, "%4d-%2d-%2d", &year, &month, &day);
+    if (end.s) { // time is optional
+        timeOut->year = year;
+        timeOut->month = month;
+        timeOut->day = day;
+        int hour = 0, minute = 0, second = 0;
+        Str timeEnd = str::Parse(end, "T%2d:%2d:%2d", &hour, &minute, &second);
+        if (timeEnd.s) {
+            timeOut->hour = hour;
+            timeOut->minute = minute;
+            timeOut->second = second;
+            // parse optional timezone: Z, +HH:MM, -HH:MM
+            if (timeEnd.s[0] == 'Z') {
+                *timeZoneOut = 0;
+            } else if (timeEnd.s[0] == '+' || timeEnd.s[0] == '-') {
+                int sign = (timeEnd.s[0] == '+') ? 1 : -1;
+                int tzHour = 0;
+                int tzMin = 0;
+                Str tz = Str(timeEnd.s + 1, timeEnd.len - 1);
+                Str tzEnd = str::Parse(tz, "%2d:%2d", &tzHour, &tzMin);
+                if (!tzEnd.s) {
+                    str::Parse(tz, "%2d%2d", &tzHour, &tzMin);
+                }
+                *timeZoneOut = sign * ((tzHour * 100) + tzMin);
+            }
+        }
+    }
+    return end.s != nullptr;
+    // don't bother about the day of week, we won't display it anyway
+}
+
+static TempStr FormatDateTemp(const PropDate& date, int timeZone) {
+#if OS_WIN
+    SYSTEMTIME st{};
+    st.wYear = (WORD)date.year;
+    st.wMonth = (WORD)date.month;
+    st.wDay = (WORD)date.day;
+    st.wHour = (WORD)date.hour;
+    st.wMinute = (WORD)date.minute;
+    st.wSecond = (WORD)date.second;
+    WCHAR bufW[512]{};
+    int cchBufLen = dimof(bufW);
+    int ret = GetDateFormatW(LOCALE_USER_DEFAULT, DATE_SHORTDATE, &st, nullptr, bufW, cchBufLen);
+    if (ret < 2) { // GetDateFormat() failed or returned an empty result
+        return {};
+    }
+
+    // don't add 00:00:00 for dates without time
+    if (0 == date.hour && 0 == date.minute && 0 == date.second) {
+        TempStr res = ToUtf8Temp(bufW);
+        return AddTimeZone(res, timeZone);
+    }
+
+    WCHAR* tmp = bufW + ret;
+    tmp[-1] = ' ';
+    ret = GetTimeFormatW(LOCALE_USER_DEFAULT, 0, &st, nullptr, tmp, cchBufLen - ret);
+    if (ret < 2) { // GetTimeFormat() failed or returned an empty result
+        tmp[-1] = '\0';
+    }
+    TempStr res = ToUtf8Temp(bufW);
+    return AddTimeZone(res, timeZone);
+#else
+    if (date.year == 0) {
+        return {};
+    }
+
+    static const char* locale = setlocale(LC_TIME, "");
+    (void)locale;
+    struct tm tm{};
+    tm.tm_year = date.year - 1900;
+    tm.tm_mon = date.month - 1;
+    tm.tm_mday = date.day;
+    tm.tm_hour = date.hour;
+    tm.tm_min = date.minute;
+    tm.tm_sec = date.second;
+    char buf[512]{};
+    const char* format = (date.hour == 0 && date.minute == 0 && date.second == 0) ? "%x" : "%x %X";
+    if (strftime(buf, dimof(buf), format, &tm) == 0) {
+        return {};
+    }
+    return AddTimeZone(Str(buf), timeZone);
+#endif
+}
+
+void AppendDateProp(str::Builder& out, Str key, Str val, bool isPdfDate) {
+    PropDate date;
+    int timeZone = 0;
+    bool ok = false;
+    if (len(val) == 0) {
+        return;
+    }
+    if (isPdfDate) {
+        ok = PdfDateParseA(val, &date, &timeZone);
+    } else {
+        ok = IsoDateParse(val, &date, &timeZone);
+    }
+    if (!ok) {
+        return;
+    }
+    TempStr dateStr = FormatDateTemp(date, timeZone);
+    AppendProp(out, key, dateStr);
+}
+
+#if OS_WIN
+TempStr FileTimeLocalTemp(const FILETIME& ft) {
+    FILETIME local{};
+    SYSTEMTIME st{};
+    if (!FileTimeToLocalFileTime(&ft, &local) || !FileTimeToSystemTime(&local, &st)) {
+        return {};
+    }
+    PropDate d;
+    d.year = st.wYear;
+    d.month = st.wMonth;
+    d.day = st.wDay;
+    d.hour = st.wHour;
+    d.minute = st.wMinute;
+    d.second = st.wSecond;
+    return FormatDateTemp(d, 0);
+}
+
+#endif
+
 // clang-format off
 struct PropLabel {
     DocProp prop;
@@ -394,6 +606,10 @@ static const PropLabel propToName[] = {
     {DocProp::SceneType, TrN("Scene Type:")},
     {DocProp::ImageFileSize, TrN("Image File Size:")},
     {DocProp::ImagePath, TrN("Path:")},
+    {DocProp::Publisher, TrN("Publisher:")},
+    {DocProp::Identifier, TrN("Identifier:")},
+    {DocProp::Source, TrN("Source:")},
+    {DocProp::Language, TrN("Language:")},
     {DocProp::None, {}},
 };
 
@@ -447,7 +663,7 @@ void GetPropsText(DocController* ctrl, str::Builder& out) {
     ReportIf(!ctrl);
 
     Str path = gPluginMode ? gPluginURL : Str(ctrl->GetFilePath());
-    AppendProp(out, Tr("File:"), len(path) == 0 ? StrL("(not available)") : path);
+    AppendProp(out, Tr("File:"), len(path) == 0 ? StrL("(not available)") : PathForDisplayTemp(path));
 
     DisplayModel* dm = ctrl->AsFixed();
     i64 fileSize = file::GetSize(path); // can be gPluginURL
@@ -474,8 +690,14 @@ void GetPropsText(DocController* ctrl, str::Builder& out) {
     AppendPropTranslated(out, DocProp::Subject, GetPropValueTemp(props, DocProp::Subject));
     AppendPropTranslated(out, DocProp::Author, GetPropValueTemp(props, DocProp::Author));
     AppendPropTranslated(out, DocProp::Copyright, GetPropValueTemp(props, DocProp::Copyright));
+    AppendPropTranslated(out, DocProp::Publisher, GetPropValueTemp(props, DocProp::Publisher));
+    AppendPropTranslated(out, DocProp::Identifier, GetPropValueTemp(props, DocProp::Identifier));
+    AppendPropTranslated(out, DocProp::Source, GetPropValueTemp(props, DocProp::Source));
+    AppendPropTranslated(out, DocProp::Language, GetPropValueTemp(props, DocProp::Language));
 
-    bool isPdfDate = dm && kindEngineMupdf == dm->engineType;
+    // EngineMupdf also renders EPUB, whose dates are ISO 8601
+    bool isEpub = GuessFileTypeFromName(path) == FileType::Epub;
+    bool isPdfDate = dm && kindEngineMupdf == dm->engineType && !isEpub;
     Str val = GetPropValueTemp(props, DocProp::CreationDate);
     AppendDateProp(out, Tr("Created:"), val, isPdfDate);
     val = GetPropValueTemp(props, DocProp::ModificationDate);
@@ -520,6 +742,7 @@ void GetPropsText(DocController* ctrl, str::Builder& out) {
         DocProp::CreatorApp, DocProp::PdfProducer, DocProp::PdfVersion,
         DocProp::PdfFileStructure, DocProp::Files,
         DocProp::UnsupportedFeatures, DocProp::FontList,
+        DocProp::Publisher, DocProp::Identifier, DocProp::Source, DocProp::Language,
         DocProp::None,
     };
     // clang-format on
@@ -597,9 +820,9 @@ static void AppendOneCert(str::Builder& out, PdfSigCert* c) {
     if (CertGetCertificateContextProperty(cert, CERT_HASH_PROP_ID, hash, &hashLen) && hashLen > 0) {
         AppendProp(out, Tr("SHA-1:"), HexBytesTemp(hash, (int)hashLen, false));
     }
-    Str trust = EutlCertIsEuTrusted((const u8*)c->der.s, len(c->der)) ? StrL("European Union Trusted List (EUTL)")
-                                                                      : StrL("Windows Certificate Store");
-    AppendProp(out, Tr("Trust:"), trust);
+    if (EutlCertIsListed((const u8*)c->der.s, len(c->der))) {
+        AppendProp(out, Tr("Trust:"), StrL("European Union Trusted List (EUTL)"));
+    }
     CertFreeCertificateContext(cert);
 }
 
@@ -623,7 +846,15 @@ void AppendCertsText(str::Builder& out, PdfSigCert* certs) {
 #if OS_WIN
 void EutlUpdateThread(EutlUpdateJob* job) {
     Str err;
-    job->ok = EutlUpdate(&err);
+    if (job->update) {
+        job->ok = EutlUpdate(&err);
+    }
+    if (job->engine) {
+        EngineMupdfFetchRevocation(job->engine);
+        job->engine->Release();
+        job->engine = nullptr;
+    }
+    job->refreshed = job->ok || job->silent;
     TempStr msg = job->ok ? EutlCacheInfoTemp() : (err ? str::DupTemp(err) : StrL("update failed"));
     job->msg = str::Dup(msg);
     str::Free(err);

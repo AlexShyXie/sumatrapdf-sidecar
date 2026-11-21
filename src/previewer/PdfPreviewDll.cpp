@@ -71,6 +71,8 @@ class PreviewClassFactory : public IClassFactory {
             type = PreviewType::Cbx;
         } else if (IsClsid(StrL(kTgaPreviewClsid))) {
             type = PreviewType::Tga;
+        } else if (IsClsid(StrL(kOfdPreviewClsid))) {
+            type = PreviewType::Ofd;
         } else {
             return E_NOINTERFACE;
         }
@@ -113,9 +115,14 @@ static Str GetReason(DWORD dwReason) {
     return StrL("Unknown reason");
 }
 
+void UnregisterPreviewWndClass();
+
 STDAPI_(BOOL) DllMain(HINSTANCE hInstance, DWORD dwReason, void* /*lpReserved*/) {
     if (dwReason == DLL_PROCESS_ATTACH) {
         ReportIf(hInstance != GetInstance());
+    }
+    if (dwReason == DLL_PROCESS_DETACH) {
+        UnregisterPreviewWndClass();
     }
     gLogAppName = StrL("PdfPreview");
     logf("PdfPreview: DllMain %s\n", GetReason(dwReason));
@@ -150,7 +157,7 @@ STDAPI DllRegisterServer() {
     // in 3.4 we call this code from the installer
     // pre-3.4 we would write to both HKLM (if permissions) and HKCU
     // in 3.4+ this will only install for current user (HKCU)
-    bool ok = InstallPreviewDll(dllPath, false);
+    bool ok = InstallPreviewDll(dllPath, false, {kAllPreviewExts, kAllPreviewExts});
     if (!ok) {
         log(StrL("DllRegisterServer failed!\n"));
         return E_FAIL;

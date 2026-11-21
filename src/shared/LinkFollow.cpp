@@ -27,6 +27,7 @@
 #include "DisplayModel.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #if defined(SUMATRA_NG)
 #include "gui/AppShell.h"
@@ -264,25 +265,20 @@ void ToggleKeyboardLinkFollowing(MainWindow* win) {
 // scrolling stops. The badges stay glued to their links meanwhile because they
 // are stored in page coordinates.
 #if defined(SUMATRA_NG)
-static int gRecomputePendingMs = -1;
+static Countdown gRecomputePending;
 
 void KeyboardLinkFollowingViewportChanged(MainWindow* win, int elapsedMs) {
     if (!KeyboardLinkFollowingActive(win)) {
-        gRecomputePendingMs = -1;
+        gRecomputePending.Cancel();
         return;
     }
     if (elapsedMs < 0) {
-        gRecomputePendingMs = kLinkFollowRecomputeDelayInMs;
+        gRecomputePending.Arm(kLinkFollowRecomputeDelayInMs);
         return;
     }
-    if (gRecomputePendingMs < 0) {
+    if (!gRecomputePending.Tick(elapsedMs)) {
         return;
     }
-    gRecomputePendingMs -= elapsedMs;
-    if (gRecomputePendingMs > 0) {
-        return;
-    }
-    gRecomputePendingMs = -1;
     KeyboardLinkFollowingRecompute(win);
     AppShellInvalidate(win);
 }

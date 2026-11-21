@@ -15,22 +15,14 @@ import type { Toolchain } from "./ng-toolchain";
 import { genPDFScripts } from "../gen-pdf-scripts";
 
 const root = resolve(import.meta.dir, "../..");
+// scripts from ext/ the app embeds as is (markdown rendering, pele, code highlighting)
+export const extScripts = ["markdown-it.min.js", "pele.min.js", "microlighter.min.js"];
+
+// base 14 and Charis SIL (EPUB); the CJK and Noto fallbacks download on first use,
+// as in orig (cmd/pack-embedded-prebuild.cmd)
 export const fontPatterns: [string, string[]][] = [
   ["urw", ["Dingbats.cff", "NimbusMonoPS-*.cff", "NimbusRoman-*.cff", "NimbusSans-*.cff", "StandardSymbolsPS.cff"]],
-  ["droid", ["DroidSansFallbackFull.ttf"]],
   ["sil", ["CharisSIL*.cff"]],
-  [
-    "noto",
-    [
-      "NotoSans-Regular.otf",
-      "NotoSerif-Regular.otf",
-      "NotoSansMath-Regular.otf",
-      "NotoMusic-Regular.otf",
-      "NotoSansSymbols-Regular.otf",
-      "NotoSansSymbols2-Regular.otf",
-      "NotoEmoji-Regular.ttf",
-    ],
-  ],
 ];
 
 function filesUnder(dir: string): string[] {
@@ -85,7 +77,7 @@ export async function packEmbedded(
   const translations = join(inputRoot, ".work/translations.txt");
   if (!existsSync(translations)) writeChanged(translations, "");
   inputs.set("translations.txt", translations);
-  for (const name of ["marked.min.js", "mermaid.min.js"]) inputs.set(name, join(inputRoot, "ext", name));
+  for (const name of extScripts) inputs.set(name, join(inputRoot, "ext", name));
   if (opts.fonts) {
     for (const [forge, patterns] of fontPatterns) {
       const fontDir = join(inputRoot, "ext/mupdf/resources/fonts", forge);

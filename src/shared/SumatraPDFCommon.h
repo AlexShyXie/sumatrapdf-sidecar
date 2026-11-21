@@ -20,8 +20,25 @@ void RestrictPolicies(Perm revokePermission);
 extern bool gForceRtl;
 bool ShouldSaveThumbnail(FileState* ds);
 TempStr BuildZoomString(float zoomLevel);
-void UpdatePageInfoHelper(DocController* ctrl, NotificationWnd* wnd, int pageNo);
+void UpdatePageInfoHelper(MainWindow* win, NotificationWnd* wnd, int pageNo);
+
+// PageInfoLocation
+enum class PageInfoBarMode {
+    Notification,
+    Bottom,
+    BottomOverlay,
+};
+PageInfoBarMode GetPageInfoBarMode();
+bool PageInfoBarShown(MainWindow* win);
+void PageInfoBarTextTemp(MainWindow* win, TempStr* leftOut, TempStr* rightOut);
+// implemented by each app: the bar was shown, hidden or its text changed
+void PageInfoBarChanged(MainWindow* win);
+// implemented by each app: "canvas=x,y,dx,dy bar=x,y,dx,dy" (or bar=none), for tests
+TempStr PageInfoBarGeometryTemp(MainWindow* win);
 bool ShouldUseBrowserView(FileType kind);
+struct CustomCommand;
+void ToggleCaption(CustomCommand* cmd);
+void ToggleSidebarAutoHide(CustomCommand* cmd);
 bool showTocByDefault(Str path, EngineBase* engine);
 bool IsEbookFileType(FileType ft);
 DisplayMode DisplayModeForNewDocument(Str path, EngineBase* engine);
@@ -52,15 +69,28 @@ void CollectHistoryFilesInDir(Str dir, StrVec& out);
 void InsertSortedNatural(StrVec* v, Str s);
 struct PendingNextPrevNav {
     MainWindow* win = nullptr;
+    WindowTab* tab = nullptr;
     bool forward = true;
+    Str path;         // owned
     Str pathToDelete; // owned
-    ~PendingNextPrevNav() { str::Free(pathToDelete); }
+    ~PendingNextPrevNav() {
+        str::Free(path);
+        str::Free(pathToDelete);
+    }
 };
 extern PendingNextPrevNav* gPendingNextPrevNav;
 void ClearPendingNextPrevNav();
+void DeferNextPrevNav(MainWindow* win, WindowTab* tab, bool forward, Str pathToDelete);
+void ReplayPendingNextPrevNav();
 bool IsAtDocumentBottom(MainWindow* win);
 void OnNextFileHintClosed(NotificationClosedEvent* ev);
 void ToggleMangaMode(MainWindow* win);
+void ToggleFacingStepOne(MainWindow* win);
+void ToggleMirror(MainWindow* win);
+void CountWordsInDoc(MainWindow* win);
+TempStr WordCountNotifMsgTemp(MainWindow* win);
+void ShowSelectedText(MainWindow* win);
+TempStr SelectedTextNotifMsgTemp(MainWindow* win);
 void ToggleAutoRotateWidePages();
 void OnMenuZoom(MainWindow* win, int menuId);
 void TogglePresentationMode(MainWindow* win);
@@ -73,7 +103,7 @@ Str HelpThemePref();
 void ManualOnJsNotify(void*, Str method, Str paramsJson);
 TempStr DocURIToLocalManualUrlTemp(Str docURI);
 void TocItemToText(str::Builder& s, TocItem* item, int level);
-bool ShouldToggle(CustomCommand* cmd, bool curState);
+bool ToggleCmdIsNoOp(MainWindow* win, CustomCommand* cmd, int cmdId);
 Str CurrentImageTabPathTemp(MainWindow* win);
 void PrintCurrentFileDeferred(MainWindow* win);
 void PrintSelectionDeferred(MainWindow* win);
@@ -89,6 +119,12 @@ void ToggleContinuousView(MainWindow* win);
 void ShowZoomNotification(MainWindow* win, float zoomLevel);
 void ShowViewModeNotification(MainWindow* win, int cmdId);
 void ZoomToSelection(MainWindow* win);
+void TrimPagesToSelection(MainWindow* win);
+void ShowWholePages(MainWindow* win);
+bool CanSaveTrimmedPages(MainWindow* win);
+TempStr TrimmedPagesPathTemp(Str srcPath);
+bool SaveTrimmedPages(MainWindow* win, Str dstPath);
+void ToggleReadColumns(MainWindow* win);
 bool IsManualDocHtmlPage(Str path);
 Str ManualInjectThemeCss(Str html);
 TempStr DocURIToWebUrlTemp(Str docURI);
@@ -96,6 +132,8 @@ bool SetPointToVisiblePage(DisplayModel* dm, Point& pt, int& pageNo);
 
 // implemented by each app
 void ShowPageInfoIfWanted(MainWindow* win);
+bool AppToggleCmdState(MainWindow* win, int cmdId, bool& on);
+bool IsDocErrorsNotifShown(MainWindow* win);
 void ToggleCursorPositionInDoc(MainWindow* win);
 
 extern Str gNextPrevDir;
@@ -116,13 +154,15 @@ TempStr PeekNextFileInFolderTemp(MainWindow* win, int* outN = nullptr, int* outM
 
 struct CreateThumbnailFromFileData {
     Str filePath;
-    // when set, render from this clone of the open document instead of loading
-    // the file again (owned)
+    // when set, the open document's engine, ref'd for us: render from it
+    // instead of loading the file again
     EngineBase* engine = nullptr;
     Pixmap* bmp = nullptr;
     // see LoadDocumentAsyncData: the thumbnail is rendered off the UI thread,
     // so the per-document ebook settings have to come along as a copy (#4600)
     FileEBookUI* fileEBookUI = nullptr;
+    // the regenerate batch it came from, 0 for a single thumbnail
+    int batchGen = 0;
     ~CreateThumbnailFromFileData() {
         str::Free(filePath);
         SafeEngineRelease(&engine);
@@ -132,11 +172,13 @@ struct CreateThumbnailFromFileData {
 };
 
 TempStr PeekNextFileInFolderTemp(MainWindow* win, int* outN, int* outM);
+bool AreThumbnailThreadsActive();
 
 bool TextSelectExtendFromVk(int key, TextSelectUnit& unit, int& delta);
 
 void NotifyUrlSelectionTruncated(WindowTab* tab);
 void ReopenLastClosedFile(MainWindow* win);
+void RememberClosedWindow(MainWindow* win);
 
 bool SendOpenFileToExistingInstance(HWND targetHwnd, Str fullPath, u32 newWindow);
 bool SendOpenFilesToExistingInstance(HWND targetHwnd, StrVec& paths, u32 newWindow);
@@ -167,6 +209,8 @@ bool SetupPluginMode(Flags& i);
 void OnFrameKeyB(MainWindow* win, bool isShift);
 EngineBase* CreateEngineForThumbnail(Str path);
 void CreateThumbnailFromFileFinish(CreateThumbnailFromFileData* d);
+bool ShouldUsePageAspect(Str path);
+void OnTemporaryFileNotifClosed(NotificationClosedEvent* ev);
 
 constexpr const char* kSumatraWindowTitle = "SumatraPDF";
 
@@ -179,5 +223,6 @@ static Kind kNotifDocErrors = "docErrors";
 static Kind kNotifDefaultApp = "defaultApp";
 static Kind kNotifThumbnailProgress = "thumbnailProgress";
 int SidebarNativeDx(MainWindow* win);
+void ToggleLineWeights();
 
 int SidebarExtraDx(MainWindow* win);

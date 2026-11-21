@@ -88,6 +88,10 @@ static Accel gBuiltInAccelerators[] = {
     {{kShift | kCtrl | kVirt, 'Z'}, CmdRedo},
     {{kCtrl | kVirt, 'D'}, CmdProperties},
     {{kCtrl | kVirt, 'F'}, CmdFindFirst},
+#if !OS_DARWIN
+    // a Mac has this for scrolling a page, see gPlatformAccelerators
+    {{kAlt | kVirt, VK_DOWN}, CmdFindHistory},
+#endif
     {{kCtrl | kVirt, 'G'}, CmdGoToPage},
     {{kVirt, 'G'}, CmdGoToPage},
     {{kCtrl | kVirt, 'K'}, CmdCommandPalette},
@@ -99,6 +103,7 @@ static Accel gBuiltInAccelerators[] = {
     {{0, '$'}, CmdNavigateFavorites},
     {{0, '%'}, CmdNavigateTableOfContents},
     {{0, '&'}, CmdNavigateThumbnail},
+    {{0, '='}, CmdQuickEditSettings},
     {{kShift | kCtrl | kVirt, 'S'}, CmdSaveAnnotations},
     {{kCtrl | kVirt, 'P'}, CmdPrint},
     {{kCtrl | kVirt, 'Q'}, CmdExit},
@@ -133,6 +138,7 @@ static Accel gBuiltInAccelerators[] = {
     {{kVirt, VK_F6}, CmdMoveFrameFocus},
     {{kVirt, VK_F7}, CmdSelectTextViaKeyboard},
     {{kVirt, VK_F8}, CmdToggleToolbar},
+    {{kShift | kVirt, VK_F8}, CmdToggleCaption},
     {{kVirt, VK_F9}, CmdToggleMenuBar},
     {{kCtrl | kVirt, 'L'}, CmdTogglePresentationMode},
     {{kVirt, VK_F5}, CmdTogglePresentationMode},
@@ -145,6 +151,7 @@ static Accel gBuiltInAccelerators[] = {
     {{kShift | kCtrl | kVirt, VK_SUBTRACT}, CmdRotateLeft},
     {{kShift | kCtrl | kVirt, VK_OEM_MINUS}, CmdRotateLeft},
     {{kShift | kCtrl | kVirt, 'T'}, CmdReopenLastClosedFile},
+    {{kCtrl | kVirt, 'T'}, CmdNewTab},
     {{kCtrl | kVirt, VK_NEXT}, CmdNextTab},
     {{kCtrl | kVirt, VK_PRIOR}, CmdPrevTab},
     {{kCtrl | kShift | kVirt, VK_NEXT}, CmdMoveTabRight},
@@ -280,15 +287,69 @@ static bool AccelIsForCmd(const Accel& a, int cmdId) {
     if (a.cmd == cmdId) {
         return true;
     }
+    // only a custom command can alias cmdId; the list walk below is per
+    // accelerator per menu item, so skip it for built-in ids
+    if (a.cmd < (int)CmdFirstCustom) {
+        return false;
+    }
     CustomCommand* cmd = FindCustomCommand(a.cmd);
     return cmd && cmd->origId == cmdId;
 }
+
+#if OS_WASM
+// Keys a page never gets, or that people need the browser to keep (reload,
+// developer tools, the address bar). WasmShell.js asks the app about every
+// other chord the browser would take.
+bool IsBrowserReservedShortcut(const KeyShortcut& sc) {
+    if (!sc.isVirt) {
+        return false;
+    }
+    u16 k = sc.vk;
+    if (sc.alt) {
+        return k == VK_F4 || k == VK_LEFT || k == VK_RIGHT || k == VK_HOME;
+    }
+    if (!sc.ctrl && !sc.cmd) {
+        return k == VK_F5 || k == VK_F12;
+    }
+    if (k == VK_TAB || k == VK_PRIOR || k == VK_NEXT || k == VK_F4 || k == VK_F5) {
+        return true;
+    }
+    if (sc.shift) {
+        return k == 'I' || k == 'J' || k == 'C' || k == 'N' || k == 'T' || k == 'W' || k == 'R' || k == VK_DELETE;
+    }
+    return k == 'R' || k == 'L' || k == 'W' || k == 'N' || k == 'T';
+}
+
+// The command bound to a key, or 0. ch is the character the key types, for
+// shortcuts given as a character ('?', '+').
+int WasmAcceleratorCmd(u16 vk, u32 ch, bool ctrl, bool shift, bool alt) {
+    int n = 0;
+    const Accel* accels = GetAcceleratorTable(n);
+    for (int i = 0; i < n; i++) {
+        const KeyShortcut& sc = accels[i].sc;
+        if (sc.ctrl != ctrl || sc.alt != alt || sc.cmd) {
+            continue;
+        }
+        bool match = sc.isVirt ? (sc.vk == vk && sc.shift == shift) : (ch != 0 && sc.vk == ch);
+        if (match && !IsBrowserReservedShortcut(sc)) {
+            return accels[i].cmd;
+        }
+    }
+    return 0;
+}
+#endif
 
 // the key cmdId is bound to, appended to a menu string. Parsing shortcut
 // strings lives in ShortcutParse.h.
 TempStr AppendAccelKeyToMenuStringTemp(TempStr menuStr, int cmdId) {
     for (int i = 0; i < gAccelsCount; i++) {
         const Accel& a = gAccels[i];
+#if OS_WASM
+        // the menu shouldn't promise a key the browser keeps
+        if (IsBrowserReservedShortcut(a.sc)) {
+            continue;
+        }
+#endif
         if (AccelIsForCmd(a, cmdId)) {
             return AppendAccelKeyToMenuStringTemp(menuStr, a.sc);
         }
@@ -309,6 +370,11 @@ TempStr ShortcutsForCmdTemp(int cmdId, int maxCount) {
         if (!AccelIsForCmd(a, cmdId)) {
             continue;
         }
+#if OS_WASM
+        if (IsBrowserReservedShortcut(a.sc)) {
+            continue;
+        }
+#endif
         TempStr withTab = AppendAccelKeyToMenuStringTemp(StrL(""), a.sc);
         if (len(withTab) == 0 || withTab.s[0] != '\t') {
             continue;
@@ -419,7 +485,8 @@ static bool isSafeOutsideEditAccel(const Accel& a) {
     if (!isChord) {
         return false;
     }
-    return a.cmd == CmdOpenNextFileInFolder || a.cmd == CmdOpenPrevFileInFolder || a.cmd == CmdNavigateFilesInFolder;
+    return a.cmd == CmdOpenNextFileInFolder || a.cmd == CmdOpenPrevFileInFolder || a.cmd == CmdNavigateFilesInFolder ||
+           a.cmd == CmdFindHistory;
 }
 
 // keys the tree uses to move / activate; those stay with the control even
@@ -466,6 +533,23 @@ int SafeAcceleratorCmd(u16 vk, bool ctrl, bool shift, bool alt, bool cmd) {
     return 0;
 }
 
+// Command bound to a virtual key + modifiers, or 0. For keys that don't go
+// through the accelerator table, e.g. mouse side buttons ("Ctrl + XButton1").
+int AcceleratorCmd(u16 vk, bool ctrl, bool shift, bool alt, bool cmd) {
+    u8 mods = kVirt;
+    mods |= cmd ? kCmd : 0;
+    mods |= ctrl ? kCtrl : 0;
+    mods |= shift ? kShift : 0;
+    mods |= alt ? kAlt : 0;
+    for (int i = 0; i < gAccelsCount; i++) {
+        const Accel& a = gAccels[i];
+        if (a.sc.vk == vk && a.sc.Mods() == mods) {
+            return a.cmd;
+        }
+    }
+    return 0;
+}
+
 // the command of an ASCII accelerator ({0, ch}, no modifiers): it matches
 // the typed character, so it works on any keyboard layout
 int AsciiAcceleratorCmd(u32 ch) {
@@ -476,10 +560,6 @@ int AsciiAcceleratorCmd(u32 ch) {
         }
     }
     return 0;
-}
-
-static Str CurrentLangCode() {
-    return trans::GetCurrentLangCode();
 }
 
 namespace {
@@ -640,7 +720,7 @@ static void BuildWinAcceleratorTables() {
 #endif
 
 void CreateSumatraAcceleratorTable() {
-    gShortcutLangCode = CurrentLangCode;
+    gShortcutLangCode = trans::GetCurrentLangCode;
     ReportIf(gAccels);
 
     PatchCreateAnnotEditAccelerators();
@@ -738,6 +818,12 @@ bool Accelerators_UnitTestFolderNavIsSafe() {
     if (SafeAcceleratorCmd(VK_UP, ctrl, true, false, cmd) != CmdNavigateFilesInFolder) {
         return false;
     }
+#if !OS_DARWIN
+    // opens the find history from a document in the WebView2 too
+    if (SafeAcceleratorCmd(VK_DOWN, false, false, true) != CmdFindHistory) {
+        return false;
+    }
+#endif
     // a bare arrow still belongs to the control, so it can scroll / move the selection
     return SafeAcceleratorCmd(VK_RIGHT, false, false, false) == 0;
 }

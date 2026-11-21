@@ -10,9 +10,13 @@
 // chrome.webview.postMessage (window.ipc on mac and Linux).
 
 #include "gui/GpuiBridge.h"
+#include "VirtKeys.h"
 
 #include "base/GuessFileType.h"
 #include "base/Win.h"
+#if OS_WIN
+#include "../../../ext/webview2/WebView2.h"
+#endif
 
 #include "gui/UIModels.h"
 
@@ -21,6 +25,9 @@
 #include "gui/AppShell.h"
 #include "gui/BrowserView.h"
 #include "BrowserViewCommon.h"
+#if OS_WIN
+#include "WebViewCapture.h"
+#endif
 
 #include "SumatraLog.h"
 
@@ -111,6 +118,9 @@ struct BrowserView {
     // drawn in a tool window, which makes it from its own tick
     bool ownHost = false;
     bool visible = false;
+    int clipTop = 0;
+    // composition color; unset keeps the white host chm and markdown use
+    Color background = kColorUnset;
     int zoomPercent = 100;
     // last scroll position the page reported, in CSS pixels; (-1, -1) means
     // "not known yet"
@@ -124,8 +134,17 @@ struct BrowserView {
 
 static Vec<BrowserView*> gBrowserViews;
 
+// Asked while building every frame's command context, so the answer is kept
+// for two seconds: finding the WebView2 runtime reads the registry each time.
 bool BrowserViewAvailable() {
-    return wry::WebViewAvailable();
+    static double checkedAt = -1;
+    static bool available = false;
+    double now = gp::TimeNow();
+    if (checkedAt < 0 || now - checkedAt >= 2.0) {
+        available = wry::WebViewAvailable();
+        checkedAt = now;
+    }
+    return available;
 }
 
 static wry::WebView* Raw(BrowserView* bv) {
@@ -283,10 +302,42 @@ static wry::NewWindowResponse OnNewWindow(void* ctx, gp::Str url, const wry::New
     return wry::NewWindowResponse::Deny;
 }
 
+static wry::Rgba WryColor(Color c) {
+    return wry::Rgba{GetRed(c), GetGreen(c), GetBlue(c), 0xff};
+}
+
+static void ApplyBackground(BrowserView* bv) {
+    if (!bv || ColorSkipsPaint(bv->background)) {
+        return;
+    }
+    wry::WebView* raw = Raw(bv);
+    if (!raw) {
+        return;
+    }
+    wry::WebViewSetBackgroundColor(raw, WryColor(bv->background));
+}
+
+// orig's webView->defaultBackgroundColor: the host shows through until the
+// page paints, and again while the window is resized
+void BrowserViewSetBackground(BrowserView* bv, Color c) {
+    if (!bv) {
+        return;
+    }
+    bv->background = c;
+    ApplyBackground(bv);
+}
+
 static void OnPageLoad(void* ctx, wry::PageLoadEvent ev, gp::Str url) {
     auto* bv = (BrowserView*)ctx;
     if (!bv || !bv->cb || ev != wry::PageLoadEvent::Finished) {
         return;
+    }
+    ApplyBackground(bv);
+    if (!ColorSkipsPaint(bv->background) && bv->visible) {
+        wry::WebView* raw = Raw(bv);
+        if (raw) {
+            wry::WebViewSetVisible(raw, true);
+        }
     }
     TempStr u = UrlForEventTemp(bv, FromGpui(url));
     if (len(u) == 0) {
@@ -396,10 +447,6 @@ void BrowserViewSetVisible(BrowserView* bv, bool visible) {
     }
 }
 
-bool BrowserViewIsVisible(BrowserView* bv) {
-    return bv && bv->visible;
-}
-
 void BrowserViewRefreshSurface(BrowserView*) {}
 
 // --- navigation -------------------------------------------------------------
@@ -435,9 +482,7 @@ static TempStr FullUrlTemp(BrowserView* bv, Str url) {
         return str::DupTemp(url);
     }
     Str rel = url;
-    while (len(rel) > 0 && rel.s[0] == '/') {
-        rel = Str(rel.s + 1, rel.len - 1);
-    }
+    str::TrimAny(rel, "/");
     return str::JoinTemp(bv->virtualHost, rel);
 }
 
@@ -527,6 +572,27 @@ void BrowserViewCopySelection(BrowserView* bv) {
     Eval(bv, StrL("document.execCommand('copy', false, null)"));
 }
 
+#if OS_WIN
+// async png of the visible page; false if not supported (done is then not called)
+bool BrowserViewCapturePng(BrowserView* bv, const Func1<Str>& done) {
+    auto* controller = (ICoreWebView2Controller*)wry::WebViewControllerRaw(Raw(bv));
+    HWND hwnd = nullptr;
+    ICoreWebView2* webview = nullptr;
+    if (!controller || FAILED(controller->get_ParentWindow(&hwnd)) || FAILED(controller->get_CoreWebView2(&webview))) {
+        return false;
+    }
+    bool ok = WebView2CapturePng(webview, hwnd, done);
+    if (webview) {
+        webview->Release();
+    }
+    return ok;
+}
+#else
+bool BrowserViewCapturePng(BrowserView*, const Func1<Str>&) {
+    return false;
+}
+#endif
+
 void BrowserViewPrint(BrowserView* bv, bool) {
     Eval(bv, StrL("window.print()"));
 }
@@ -605,6 +671,38 @@ void BrowserViewFindClear(BrowserView* bv) {
 // one arrow key, in CSS pixels. A page key uses the window height instead.
 constexpr int kBrowserArrowStep = 40;
 
+void BrowserViewScrollKey(BrowserView* bv, int vk) {
+    if (!bv || !Raw(bv)) {
+        return;
+    }
+    switch (vk) {
+        case VK_DOWN:
+            Eval(bv, fmt("window.scrollBy(0, %d)", kBrowserArrowStep));
+            break;
+        case VK_UP:
+            Eval(bv, fmt("window.scrollBy(0, %d)", -kBrowserArrowStep));
+            break;
+        case VK_RIGHT:
+            Eval(bv, fmt("window.scrollBy(%d, 0)", kBrowserArrowStep));
+            break;
+        case VK_LEFT:
+            Eval(bv, fmt("window.scrollBy(%d, 0)", -kBrowserArrowStep));
+            break;
+        case VK_NEXT:
+            Eval(bv, StrL("window.scrollBy(0, window.innerHeight || 400)"));
+            break;
+        case VK_PRIOR:
+            Eval(bv, StrL("window.scrollBy(0, -(window.innerHeight || 400))"));
+            break;
+        case VK_HOME:
+            Eval(bv, StrL("window.scrollTo(0, 0)"));
+            break;
+        case VK_END:
+            Eval(bv, StrL("window.scrollTo(0, document.documentElement.scrollHeight)"));
+            break;
+    }
+}
+
 // Chromium ignores WM_MOUSEWHEEL on the host window, and an arrow key sent to
 // the frame never reaches the page. Both scroll from here.
 LRESULT BrowserViewPassUIMsg(BrowserView* bv, UINT msg, WPARAM wp, LPARAM) {
@@ -613,32 +711,7 @@ LRESULT BrowserViewPassUIMsg(BrowserView* bv, UINT msg, WPARAM wp, LPARAM) {
         return 0;
     }
     if (msg == WM_KEYDOWN) {
-        switch ((int)wp) {
-            case VK_DOWN:
-                Eval(bv, fmt("window.scrollBy(0, %d)", kBrowserArrowStep));
-                break;
-            case VK_UP:
-                Eval(bv, fmt("window.scrollBy(0, %d)", -kBrowserArrowStep));
-                break;
-            case VK_RIGHT:
-                Eval(bv, fmt("window.scrollBy(%d, 0)", kBrowserArrowStep));
-                break;
-            case VK_LEFT:
-                Eval(bv, fmt("window.scrollBy(%d, 0)", -kBrowserArrowStep));
-                break;
-            case VK_NEXT:
-                Eval(bv, StrL("window.scrollBy(0, window.innerHeight || 400)"));
-                break;
-            case VK_PRIOR:
-                Eval(bv, StrL("window.scrollBy(0, -(window.innerHeight || 400))"));
-                break;
-            case VK_HOME:
-                Eval(bv, StrL("window.scrollTo(0, 0)"));
-                break;
-            case VK_END:
-                Eval(bv, StrL("window.scrollTo(0, document.documentElement.scrollHeight)"));
-                break;
-        }
+        BrowserViewScrollKey(bv, (int)wp);
         return 0;
     }
     if (msg == WM_KEYUP) {
@@ -698,14 +771,17 @@ static void CreateWebView(BrowserView* bv, gp::Ctx* cx) {
     attrs.customProtocols = &protocol;
     attrs.customProtocolCount = 1;
     attrs.initializationScripts = scripts;
-    attrs.initializationScriptCount = 3;
+    attrs.initializationScriptCount = dimofi(scripts);
     attrs.ctx = bv;
     attrs.navigationHandler = OnNavigationStarting;
     attrs.onPageLoadHandler = OnPageLoad;
     attrs.newWindowReqHandler = OnNewWindow;
     attrs.ipcHandler = OnIpcMessage;
     attrs.hasBackgroundColor = true;
-    attrs.backgroundColor = wry::Rgba{0xff, 0xff, 0xff, 0xff};
+    attrs.backgroundColor = WryColor(ColorSkipsPaint(bv->background) ? kColWhite : bv->background);
+    // an empty document is the dark canvas; keep it hidden until the page is
+    // up so the theme-colored window is what shows
+    attrs.visible = ColorSkipsPaint(bv->background);
     // keep the keyboard with the application until the user clicks the page
     attrs.focused = false;
     // gpui zeroes the bounds and positions the view from its element's bounds
@@ -722,11 +798,14 @@ static void CreateWebView(BrowserView* bv, gp::Ctx* cx) {
         attrs.url = ToGpui(ToWebViewUrlTemp(bv->pendingUrl));
     }
 
+    // creating runs a nested message loop, which can ask for another page
+    Str startUrl = str::Dup(bv->pendingUrl);
     gWebViewCreateDepth++;
     bv->view = gp::WebViewNew(cx, &attrs);
     gWebViewCreateDepth--;
     gp::WebView* wv = bv->view.Get(cx->app);
     if (!wv || !gp::WebViewRaw(wv)) {
+        str::Free(startUrl);
         bv->view = {};
         // give up and show the missing-runtime message
         if (bv->createTries >= 3) {
@@ -750,9 +829,17 @@ static void CreateWebView(BrowserView* bv, gp::Ctx* cx) {
         r.size = wry::LogicalSize(rc.dx, rc.dy);
         wry::WebViewSetBounds(gp::WebViewRaw(wv), r);
     }
-    str::FreePtr(&bv->pendingUrl);
+    // a navigation asked for while it was being made is loaded on the next build
+    if (str::Eq(bv->pendingUrl, startUrl)) {
+        str::FreePtr(&bv->pendingUrl);
+    }
+    str::Free(startUrl);
     if (bv->zoomPercent != 100) {
         wry::WebViewZoom(gp::WebViewRaw(wv), (double)bv->zoomPercent / 100.0);
+    }
+    // hidden before the tick made it (a panel closed right after opening)
+    if (!bv->visible) {
+        gp::WebViewHide(wv);
     }
     logf("BrowserView: webview created, host '%s'\n", bv->virtualHost);
 }
@@ -783,14 +870,47 @@ void BrowserViewCreatePendingIn(BrowserView* bv, gp::Ctx* cx) {
     AppShellInvalidate(bv->win);
 }
 
-gp::El* BrowserViewBuild(BrowserView* bv, gp::Ctx* cx) {
+static void ClipBrowserTop(BrowserView* bv, int top) {
+#if OS_WIN
+    if (top == bv->clipTop) {
+        return;
+    }
+    auto* controller = (ICoreWebView2Controller*)wry::WebViewControllerRaw(Raw(bv));
+    HWND hwnd = nullptr;
+    if (!controller || FAILED(controller->get_ParentWindow(&hwnd)) || !hwnd) {
+        return;
+    }
+    // Clip the native surface without changing the page's viewport or scroll position.
+    HRGN region = nullptr;
+    if (top > 0) {
+        Rect frame = HwndClientRect(AppShellNativeHwnd(bv->win));
+        region = CreateRectRgn(0, AppShellDpiPx(bv->win, top), frame.dx, frame.dy);
+    }
+    if (!SetWindowRgn(hwnd, region, TRUE)) {
+        if (region) {
+            DeleteObject(region);
+        }
+        return;
+    }
+    bv->clipTop = top;
+#endif
+}
+
+gp::El* BrowserViewBuild(BrowserView* bv, gp::Ctx* cx, int clipTop) {
     if (!bv) {
         return nullptr;
     }
     if (!bv->created) {
         bv->wantCreate = true;
-        const gp::Theme& th = gp::ThemeNow(cx->app);
-        return gp::Div(cx->a)->SizeFull()->Bg(th.tokens.muted);
+        // orig's host brush shows until the web view exists. An unset color
+        // keeps the muted fill chm and markdown use.
+        gp::El* fill = gp::Div(cx->a)->SizeFull();
+        if (ColorSkipsPaint(bv->background)) {
+            fill->Bg(gp::ThemeNow(cx->app).tokens.muted);
+        } else {
+            fill->Bg(ToGpui(bv->background));
+        }
+        return fill;
     }
     if (!bv->view.IsValid()) {
         const gp::Theme& th = gp::ThemeNow(cx->app);
@@ -809,5 +929,6 @@ gp::El* BrowserViewBuild(BrowserView* bv, gp::Ctx* cx) {
             str::FreePtr(&bv->pendingUrl);
         }
     }
+    ClipBrowserTop(bv, clipTop);
     return gp::WebViewEl(bv->view, cx);
 }

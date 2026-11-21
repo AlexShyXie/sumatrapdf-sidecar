@@ -28,11 +28,13 @@ static const struct {
     {StrL(".djvu"), 6}, {StrL(".chm"), 5}, {StrL(".mobi"), 9}, {StrL(".epub"), 3},
     {StrL(".md"), kDefaultFileIcon}, {StrL(".markdown"), kDefaultFileIcon}, {StrL(".svg"), kDefaultFileIcon}, {StrL(".azw"), 9},
     {StrL(".azw3"), 9}, {StrL(".azw4"), 9}, {StrL(".fb2"), kDefaultFileIcon}, {StrL(".fb2z"), kDefaultFileIcon},
-    {StrL(".prc"), 9}, {StrL(".tif"), 7}, {StrL(".tiff"), 7}, {StrL(".jp2"), 7},
+    {StrL(".prc"), 9}, {StrL(".lit"), 9}, {StrL(".rtf"), kDefaultFileIcon}, {StrL(".tif"), 7}, {StrL(".tiff"), 7}, {StrL(".jp2"), 7},
     {StrL(".png"), 7}, {StrL(".jpg"), 7}, {StrL(".jpeg"), 7}, {StrL(".tga"), 7},
     {StrL(".gif"), 7}, {StrL(".avif"), 7}, {StrL(".heic"), 7}, {StrL(".heif"), 7},
     {StrL(".jfif"), 7}, {StrL(".webp"), 7}, {StrL(".jxl"), 7}, {StrL(".bmp"), 7},
     {StrL(".ico"), 7}, {StrL(".jxr"), 7}, {StrL(".hdp"), 7}, {StrL(".wdp"), 7},
+    {StrL(".caj"), kDefaultFileIcon}, {StrL(".kdh"), kDefaultFileIcon}, {StrL(".nh"), kDefaultFileIcon},
+    {StrL(".ofd"), kDefaultFileIcon},
 };
 // clang-format on
 
@@ -41,6 +43,14 @@ static const struct {
 // https://docs.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shchangenotify
 static void ShellNotifyAssociationsChanged() {
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+}
+
+// CAJ files need caj2pdf, which is x64 only
+static bool IsExtUsable(Str ext) {
+    if (IsOs64()) {
+        return true;
+    }
+    return !str::Eq(ext, StrL(".caj")) && !str::Eq(ext, StrL(".kdh")) && !str::Eq(ext, StrL(".nh"));
 }
 
 static bool HasRegistryValue(HKEY hkey, Str keyName, Str valName) {
@@ -62,7 +72,7 @@ static bool HasOurOpenWithEntry(HKEY hkey, Str ext) {
 static bool HasAllOurOpenWithEntries(HKEY hkey) {
     for (const auto& type : gSupportedExts) {
         Str ext = type.ext;
-        if (!HasOurOpenWithEntry(hkey, ext)) {
+        if (IsExtUsable(ext) && !HasOurOpenWithEntry(hkey, ext)) {
             return false;
         }
     }
@@ -151,6 +161,9 @@ static bool RegisterForDefaultPrograms(HKEY hkey, Str installedExePath) {
 
     for (const auto& type : gSupportedExts) {
         Str ext = type.ext;
+        if (!IsExtUsable(ext)) {
+            continue;
+        }
         // must match the per-extension ProgID created by RegisterForOpenWith
         // (e.g. "SumatraPDF.pdf"); Default Apps UI hides the app if the
         // FileAssociations ProgID can't be resolved under HKCR
@@ -173,6 +186,9 @@ static bool RegisterForOpenWith(HKEY hkey, Str installedExePath) {
     bool ok = true;
     for (const auto& type : gSupportedExts) {
         Str ext = type.ext;
+        if (!IsExtUsable(ext)) {
+            continue;
+        }
         TempStr progIDName = str::JoinTemp(StrL(kAppName), ext);
         TempStr progIDKey = str::JoinTemp(StrL("Software\\Classes\\"), progIDName);
 

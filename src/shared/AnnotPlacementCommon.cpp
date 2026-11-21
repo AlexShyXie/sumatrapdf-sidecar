@@ -14,6 +14,7 @@
 #include "DisplayModel.h"
 #include "Theme.h"
 #include "TextSelection.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "SumatraPDF.h"
 #include "AnnotEditToolbar.h"
@@ -852,4 +853,87 @@ TempStr PointPlacementDumpLineTemp(MainWindow* win, AnnotPlacementKind kind, Str
     bool preview = active && dm && dm->ValidPageNo(pageNo);
     return fmt("%s active=%d notification=%d cursor=%d preview=%d cmd=%d message=%s\n", key, active ? 1 : 0,
                notif ? 1 : 0, cursor ? 1 : 0, preview ? 1 : 0, cmdOut, message);
+}
+
+bool AnnotationPlacementOnMouseMove(MainWindow* win, Point pt, bool isShift, bool lButtonDown) {
+    if (!IsPlacingAnnotation(win) || KindOf(win) == AnnotPlacementKind::Highlighter) {
+        return false;
+    }
+    // a right-drag pan or a middle-click scroll under way keeps its moves
+    if (win->mouseAction == MouseAction::Dragging || win->mouseAction == MouseAction::Scrolling) {
+        return false;
+    }
+    DisplayModel* dm = win->AsFixed();
+    if (!dm) {
+        return true;
+    }
+    if (win->annotationUnderCursor) {
+        win->annotationUnderCursor = nullptr;
+        if (IsPlacingPointAnnotation(win)) {
+            ScheduleRepaint(win, 0);
+        }
+    }
+    PlacementHideHover(win);
+    SetPlacementCursor(win);
+
+    AnnotPlacement& p = win->annotPlacement;
+    switch (p.kind) {
+        case AnnotPlacementKind::Ink:
+            if (p.mouseDown && lButtonDown) {
+                AppendInkPoint(win, dm, pt);
+            }
+            break;
+        case AnnotPlacementKind::Shape:
+            if (p.pageNo > 0) {
+                if (p.mouseDown) {
+                    Point start = dm->CvtToScreen(p.pageNo, p.start);
+                    if (IsDragDistance(pt.x, start.x, pt.y, start.y)) {
+                        p.didDrag = true;
+                    }
+                }
+                if (pt != p.end || isShift != p.constrain) {
+                    p.end = pt;
+                    p.constrain = isShift;
+                    ScheduleRepaint(win, 0);
+                }
+            }
+            break;
+        case AnnotPlacementKind::Line:
+            if (p.pageNo > 0) {
+                Point start = dm->CvtToScreen(p.pageNo, p.start);
+                Point end = isShift ? SnapLineEndpoint(start, pt) : pt;
+                // Compare the snapped point, not the pointer: Shift at the same
+                // spot still has to move the preview, and releasing it has to put it back.
+                if (end != p.end) {
+                    p.end = end;
+                    ScheduleRepaint(win, 0);
+                }
+            }
+            break;
+        case AnnotPlacementKind::PolyLine:
+            if (len(p.points) > 0) {
+                Point last = dm->CvtToScreen(p.pageNo, p.points[len(p.points) - 1]);
+                Point end = isShift ? SnapLineEndpoint(last, pt) : pt;
+                if (end != p.end) {
+                    p.end = end;
+                    ScheduleRepaint(win, 0);
+                }
+            }
+            break;
+        case AnnotPlacementKind::Text:
+        case AnnotPlacementKind::FreeText:
+        case AnnotPlacementKind::Stamp:
+        case AnnotPlacementKind::Caret:
+        case AnnotPlacementKind::FileAttachment: {
+            bool previewMoved = HasPreview(p.kind) && pt != p.pos;
+            p.pos = pt;
+            if (previewMoved) {
+                ScheduleRepaint(win, 0);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    return true;
 }

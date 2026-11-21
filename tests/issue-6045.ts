@@ -46,7 +46,9 @@ function findHelpWindow(pid: number): number {
 function findWebViewHost(help: number): number {
   let found = 0;
   enumChildWindows(help, (hwnd) => {
-    if (getClassName(hwnd) === "SumatraWgDefaultWinClass") {
+    const cls = getClassName(hwnd);
+    // orig's WebView2 host, or ng's wry container in the manual tool window
+    if (cls === "SumatraWgDefaultWinClass" || cls === "WRY_WEBVIEW") {
       found = hwnd;
       return false;
     }

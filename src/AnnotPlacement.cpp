@@ -23,12 +23,14 @@
 #include "DisplayModel.h"
 #include "Theme.h"
 #include "TextSelection.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "SumatraPDF.h"
 #include "AnnotEditToolbar.h"
 #include "Notifications.h"
 #include "MainWindow.h"
 #include "Canvas.h"
+#include "CanvasCommon.h"
 #include "Selection.h"
 #include "SelectTextKeyboard.h"
 #include "Commands.h"
@@ -137,6 +139,10 @@ void SetPlacementCursor(MainWindow* win) {
 }
 
 // what placement asks of the window system; ng has its own
+void PlacementHideHover(MainWindow* win) {
+    HideAnnotationHoverOverlay(win);
+}
+
 void PlacementFocusFrame(MainWindow* win) {
     HwndSetFocus(win->hwndFrame);
 }
@@ -152,9 +158,7 @@ void PlacementRunCreateCmd(MainWindow* win, int cmdId, Point pt) {
 }
 
 void PlacementReleaseMouse(MainWindow* win) {
-    if (GetCapture() == win->hwndCanvas) {
-        ReleaseCapture();
-    }
+    CanvasSetCapture(win, false);
 }
 
 void RestoreCanvasCursor(MainWindow* win) {
@@ -167,9 +171,7 @@ void ReleasePlacementCapture(MainWindow* win) {
     if (!win || !win->annotPlacement.mouseDown) {
         return;
     }
-    if (GetCapture() == win->hwndCanvas) {
-        ReleaseCapture();
-    }
+    CanvasSetCapture(win, false);
 }
 
 static void OnPlacementNotifClosed(MainWindow* win, NotificationClosedEvent* ev) {
@@ -209,6 +211,10 @@ void StartAnnotationPlacement(MainWindow* win, int cmdId) {
         return;
     }
 
+    // a drag or selection still under way would finish into the placement
+    if (win->mouseAction != MouseAction::None || win->annotationBeingDragged || win->annotationBeingResized) {
+        CancelDrag(win);
+    }
     EndCurrentPlacement(win);
 
     AnnotPlacement& p = win->annotPlacement;
@@ -260,87 +266,6 @@ void StartAnnotationPlacement(MainWindow* win, int cmdId) {
     if (HwndClientRect(win->hwndCanvas).Contains(pt)) {
         SetPlacementCursor(win);
     }
-}
-
-bool AnnotationPlacementOnMouseMove(MainWindow* win, Point pt, bool isShift, bool lButtonDown) {
-    if (!IsPlacingAnnotation(win) || KindOf(win) == AnnotPlacementKind::Highlighter) {
-        return false;
-    }
-    DisplayModel* dm = win->AsFixed();
-    if (!dm) {
-        return true;
-    }
-    if (win->annotationUnderCursor) {
-        win->annotationUnderCursor = nullptr;
-        if (IsPlacingPointAnnotation(win)) {
-            ScheduleRepaint(win, 0);
-        }
-    }
-    HideAnnotationHoverOverlay(win);
-    SetPlacementCursor(win);
-
-    AnnotPlacement& p = win->annotPlacement;
-    switch (p.kind) {
-        case AnnotPlacementKind::Ink:
-            if (p.mouseDown && lButtonDown) {
-                AppendInkPoint(win, dm, pt);
-            }
-            break;
-        case AnnotPlacementKind::Shape:
-            if (p.pageNo > 0) {
-                bool constrain = isShift;
-                if (p.mouseDown) {
-                    Point start = dm->CvtToScreen(p.pageNo, p.start);
-                    if (IsDragDistance(pt.x, start.x, pt.y, start.y)) {
-                        p.didDrag = true;
-                    }
-                }
-                if (pt != p.end || constrain != p.constrain) {
-                    p.end = pt;
-                    p.constrain = constrain;
-                    ScheduleRepaint(win, 0);
-                }
-            }
-            break;
-        case AnnotPlacementKind::Line:
-            if (p.pageNo > 0) {
-                Point start = dm->CvtToScreen(p.pageNo, p.start);
-                bool shift = isShift;
-                Point end = shift ? SnapLineEndpoint(start, pt) : pt;
-                // Compare the snapped point, not the pointer: Shift at the same
-                // spot still has to move the preview, and releasing it has to put it back.
-                if (end != p.end) {
-                    p.end = end;
-                    ScheduleRepaint(win, 0);
-                }
-            }
-            break;
-        case AnnotPlacementKind::PolyLine:
-            if (len(p.points) > 0) {
-                Point last = dm->CvtToScreen(p.pageNo, p.points[len(p.points) - 1]);
-                Point end = isShift ? SnapLineEndpoint(last, pt) : pt;
-                if (end != p.end) {
-                    p.end = end;
-                    ScheduleRepaint(win, 0);
-                }
-            }
-            break;
-        case AnnotPlacementKind::Text:
-        case AnnotPlacementKind::FreeText:
-        case AnnotPlacementKind::Stamp:
-        case AnnotPlacementKind::Caret:
-        case AnnotPlacementKind::FileAttachment: {
-            bool previewMoved = HasPreview(p.kind) && pt != p.pos;
-            p.pos = pt;
-            if (previewMoved) {
-                ScheduleRepaint(win, 0);
-            }
-            break;
-        }
-        default:
-            break;
-    }
-    return true;
 }
 
 bool AnnotationPlacementOnKeyDown(MainWindow* win, WPARAM key) {
@@ -591,29 +516,29 @@ static void PaintInkPlacement(MainWindow* win, HDC hdc, DisplayModel* dm) {
     // every vertex, so a 40% highlighter looks closer to solid while dragging
     pen.SetLineJoin(Gdiplus::LineJoinRound);
 
-    Vec<Gdiplus::Point> pts;
-    VecGrow(pts, len(p.points));
+    // a temp array, not a Vec: Gdiplus::Point isn't trivially copyable
+    Gdiplus::Point* pts = AllocArrayTemp<Gdiplus::Point>(len(p.points));
     int pointIdx = 0;
     for (int count : p.strokeCounts) {
         if (count <= 0 || pointIdx >= len(p.points)) {
             continue;
         }
-        pts.len = 0;
+        int nPts = 0;
         for (int i = 0; i < count && pointIdx < len(p.points); i++) {
             Point pt = dm->CvtToScreen(pageNo, p.points[pointIdx++]);
-            VecAppend(pts, Gdiplus::Point(pt.x, pt.y));
+            pts[nPts++] = Gdiplus::Point(pt.x, pt.y);
         }
-        if (len(pts) == 0) {
+        if (nPts == 0) {
             continue;
         }
-        if (len(pts) == 1) {
+        if (nPts == 1) {
             int dotSize = std::max(DpiScale(3), 2);
             int dotHalf = dotSize / 2;
             Gdiplus::SolidBrush brush(strokeCol);
             gs.FillEllipse(&brush, pts[0].X - dotHalf, pts[0].Y - dotHalf, dotSize, dotSize);
             continue;
         }
-        gs.DrawLines(&pen, pts.els, len(pts));
+        gs.DrawLines(&pen, pts, nPts);
     }
 }
 

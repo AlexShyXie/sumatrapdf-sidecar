@@ -26,6 +26,7 @@
 #include "EngineBase.h"
 #include "AppSettings.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "SumatraPDF.h"
 #include "Translations.h"
@@ -36,19 +37,20 @@
 #include "AIChatCommon.h"
 #include "AIChatPanel.h"
 #include "AIChatPanelCommon.h"
+#include "AIChatAPI.h"
 
 // timer ids on hwndAiChatBox
 constexpr UINT_PTR kTimerAutoSelectSession = 42;
 constexpr UINT_PTR kTimerWebViewSize = 43;
 
-// The chat page and its marked.min.js are both served to WebView2 from the
+// The chat page and its markdown-it.min.js are both served to WebView2 from the
 // provider's virtual host (https://<provider>/). NavigateToString/SetHtml does
 // not reliably load in the current WebView2 runtime (the page stays blank),
 // whereas Navigate() to a resource-served URL does - the same mechanism the
-// in-app manual and CHM viewers use. marked.min.js comes from IDR_EMBEDDED_PAK.
+// in-app manual and CHM viewers use. markdown-it.min.js comes from IDR_EMBEDDED_PAK.
 struct AIChatWebResources {
-    u8* marked = nullptr; // owned (malloc); from GetEmbeddedFileData
-    int markedLen = 0;
+    u8* markdownJs = nullptr; // owned (malloc); from GetEmbeddedFileData
+    int markdownJsLen = 0;
     Str html; // owned; the chat page HTML
 };
 static AIChatWebResources gAIChatWebResources;
@@ -68,9 +70,9 @@ static bool AIChatGetResource(void* ctx, Str path, WebViewResourceResult* res) {
         res->ownsData = false;
         return true;
     }
-    if (r->marked && r->markedLen > 0 && AIChatPathIs(path, StrL("marked.min.js"))) {
-        res->data = r->marked;
-        res->dataLen = (size_t)r->markedLen;
+    if (r->markdownJs && r->markdownJsLen > 0 && AIChatPathIs(path, StrL("markdown-it.min.js"))) {
+        res->data = r->markdownJs;
+        res->dataLen = (size_t)r->markdownJsLen;
         res->contentType = str::Dup(StrL("text/javascript"));
         res->ownsData = false;
         return true;
@@ -233,6 +235,7 @@ static void OnSessionComboChange(MainWindow* win) {
         AIChatLog(p->logger, StrL("session"), StrL("new"));
         str::ReplaceWithCopy(&st->sessionId, Str{});
         st->chatLog.Reset();
+        AIChatResetAPI(st);
         WebViewClearChat(win);
         return;
     }
@@ -247,6 +250,7 @@ static void OnSessionComboChange(MainWindow* win) {
         AIChatLog(p->logger, StrL("session"), sessions[sessionIdx].sessionId);
         str::ReplaceWithCopy(&st->sessionId, sessions[sessionIdx].sessionId);
         st->chatLog.Reset();
+        AIChatResetAPI(st);
         WebViewClearChat(win);
         p->LoadSessionHistory(win, st->sessionId, dir);
         // LoadSessionHistory writes to the webview which rebuilds chatLog
@@ -278,7 +282,10 @@ static void ApplyAIChatSettingsToUI(MainWindow* win) {
         StrVec models;
         p->BuildModelsList(models);
         Str model = AIChatResolveModel(models, p->GetModel(), p->defaultModel);
-        int modelIdx = std::max(AIChatFindModelInList(models, model), 0);
+        int modelIdx = AIChatFindModelInList(models, model);
+        if (modelIdx < 0 && len(models) > 0) {
+            modelIdx = 0;
+        }
         CbSetCurrentSelection(win->aiChatModelCombo, modelIdx);
     }
     if (win->aiChatOptionCombo) {
@@ -300,10 +307,10 @@ static void SyncAIChatSettingsFromUI(MainWindow* win) {
         return;
     }
     if (win->aiChatModelCombo) {
-        int sel = CbGetCurrentSelection(win->aiChatModelCombo);
         StrVec models;
         p->BuildModelsList(models);
-        if (sel >= 0 && sel < len(models)) {
+        int sel = AIChatFindModelInList(models, HwndGetTextTemp(win->aiChatModelCombo->hwnd));
+        if (sel >= 0) {
             p->SetModel(models[sel]);
         }
     }
@@ -326,7 +333,7 @@ void UpdateAIChatPanelForCurrentTab(MainWindow* win) {
     WindowTab* tab = win->CurrentTab();
     AIChatTabState* st = GetTabState(tab, win->aiChatProvider);
     bool supported = IsAIChatSupportedForTab(tab);
-    bool working = supported && st && st->process != nullptr;
+    bool working = supported && st && (st->process != nullptr || st->apiRequest != nullptr);
     bool enableInput = supported && !working;
 
     if (win->aiChatInput) {
@@ -445,10 +452,6 @@ static void AIChatReadThread(AIChatReadThreadCtx* ctx) {
     delete ctx;
 }
 
-static void StartAIChatReadThread(AIChatReadThreadCtx* ctx) {
-    AIChatReadThread(ctx);
-}
-
 // --- Headless chat runner (for -dbg-control tests) ---
 
 static void AIChatReadAllPipe(HANDLE hPipe, str::Builder& out) {
@@ -464,6 +467,7 @@ static void AIChatReadAllPipe(HANDLE hPipe, str::Builder& out) {
 // provider parser while capturing the emitted text/errors. Same provider code
 // the panel uses, so it exercises the real path.
 bool RunAIChatSync(AIChatBackend backend, Str filePath, Str message, Str& outText, Str& outErr) {
+    if (backend == AIChatBackend::CustomAPI) return AIChatRunAPISync(message, outText, outErr);
     AIChatProvider* p = GetAIChatProvider((int)backend);
     if (!p) {
         outErr = str::Dup(StrL("unknown backend"));
@@ -530,9 +534,9 @@ bool RunAIChatSync(AIChatBackend backend, Str filePath, Str message, Str& outTex
     // parse the collected output through the real provider parser, capturing the
     // text it emits instead of posting to a (nonexistent) webview
     AIChatCaptureSink sink;
-    gAIChatCapture = &sink;
     AIChatStreamCtx ctx;
     ctx.providerId = (int)backend;
+    ctx.capture = &sink;
     Str out = ToStr(raw);
     int off = 0;
     while (off < out.len) {
@@ -549,7 +553,6 @@ bool RunAIChatSync(AIChatBackend backend, Str filePath, Str message, Str& outTex
             off++;
         }
     }
-    gAIChatCapture = nullptr;
     str::Free(ctx.sessionId);
 
     Str err = ToStr(sink.err);
@@ -588,7 +591,7 @@ static void SendAIChatMessage(MainWindow* win) {
     if (!tab || len(tab->filePath) == 0 || !st) {
         return;
     }
-    if (st->process) {
+    if (st->process || st->apiRequest) {
         return; // this tab already has a running request
     }
 
@@ -616,6 +619,11 @@ static void SendAIChatMessage(MainWindow* win) {
     int optionIdx = p->GetOption();
     if (optionIdx < 0 || optionIdx >= p->optionCount) {
         optionIdx = p->optionDefault;
+    }
+
+    if (p->backend == AIChatBackend::CustomAPI) {
+        AIChatStartAPI(win, input, model);
+        return;
     }
 
     TempStr exePath = p->FindExecutableTemp();
@@ -664,7 +672,9 @@ static void SendAIChatMessage(MainWindow* win) {
     ctx->stream.hwndFrame = win->hwndFrame;
     ctx->stream.providerId = win->aiChatProvider;
     ctx->stream.sessionId = str::Dup(st->sessionId ? st->sessionId : kAIChatPendingSessionId());
-    RunAsync(MkFunc0(StartAIChatReadThread, ctx), StrL("AIChatReadThread"));
+    st->turnId = AIChatNewTurnId();
+    ctx->stream.turnId = st->turnId;
+    RunAsync(MkFunc0(AIChatReadThread, ctx), StrL("AIChatReadThread"));
 }
 
 // --- WndProcs ---
@@ -815,19 +825,19 @@ static void EnsureWebViewReady(MainWindow* win) {
     // use unique data dir per process to avoid locking conflicts
     webView->dataDir =
         str::Dup(fmt("%s\\SumatraPDF\\%s_%d", localAppData, p->webViewDataDirPrefix, (int)GetCurrentProcessId()));
-    int markedLen = 0;
-    u8* markedData = GetEmbeddedFileData(StrL("marked.min.js"), &markedLen);
-    if (!markedData || markedLen <= 0) {
-        free(markedData);
+    int markdownJsLen = 0;
+    u8* markdownJs = GetEmbeddedFileData(StrL("markdown-it.min.js"), &markdownJsLen);
+    if (!markdownJs || markdownJsLen <= 0) {
+        free(markdownJs);
         delete webView;
         return;
     }
     wstr::Free(webView->resourceUriPrefix);
     webView->resourceUriPrefix = wstr::Dup(ToWStrTemp(p->virtualHost));
-    // serve both the chat page and marked.min.js from the virtual host
-    free(gAIChatWebResources.marked);
-    gAIChatWebResources.marked = markedData;
-    gAIChatWebResources.markedLen = markedLen;
+    // serve both the chat page and markdown-it.min.js from the virtual host
+    free(gAIChatWebResources.markdownJs);
+    gAIChatWebResources.markdownJs = markdownJs;
+    gAIChatWebResources.markdownJsLen = markdownJsLen;
     str::ReplaceWithCopy(&gAIChatWebResources.html, AIChatFormatChatHtmlTemp(p->virtualHost, BgColorForProvider(p)));
     webView->resourceProvider.ctx = &gAIChatWebResources;
     webView->resourceProvider.getResource = AIChatGetResource;
@@ -1172,7 +1182,7 @@ void OnAIChatTabChanged(MainWindow* win) {
     }
 
     // update working state for this tab
-    SetAIChatWorking(win, st->process != nullptr);
+    SetAIChatWorking(win, (st->process != nullptr || st->apiRequest != nullptr));
 
     // if tab has in-memory chat log, replay it (fast, includes current session)
     if (len(st->chatLog) > 0) {

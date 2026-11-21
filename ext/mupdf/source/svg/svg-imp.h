@@ -41,6 +41,17 @@ struct svg_class_s
 	char *decl;
 };
 
+/* SumatraPDF: an @font-face font from a <style> sheet (#6339) */
+typedef struct svg_font_face_s svg_font_face;
+struct svg_font_face_s
+{
+	svg_font_face *next;
+	char *family;
+	int is_bold;
+	int is_italic;
+	fz_font *font;
+};
+
 struct svg_document_s
 {
 	fz_document super;
@@ -48,9 +59,11 @@ struct svg_document_s
 	fz_xml *root;
 	fz_tree *idmap;
 	svg_class *classes;
+	svg_font_face *fonts;
 	float width;
 	float height;
 	svg_cycle_list *cycle; /* for detecting mutual recursive <use> invocations */
+	fz_path *clip_collect; /* SumatraPDF: while set, shapes add to this clip-path instead of painting */
 	fz_archive *zip; /* for locating external resources */
 	char base_uri[2048];
 };
@@ -72,6 +85,7 @@ float svg_parse_angle(const char *str);
 void svg_parse_color_from_style(fz_context *ctx, svg_document *doc, const char *str,
 	int *fill_is_set, float fill[3], int *stroke_is_set, float stroke[3]);
 void svg_parse_color(fz_context *ctx, svg_document *doc, const char *str, float *rgb);
+float svg_parse_color_alpha(const char *str);
 fz_matrix svg_parse_transform(fz_context *ctx, svg_document *doc, const char *str, fz_matrix transform);
 
 int svg_is_whitespace_or_comma(int c);

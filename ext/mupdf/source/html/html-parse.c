@@ -63,7 +63,7 @@ static const char *html_default_css =
 "menu{display:block;list-style-type:disc;margin:1em 0;padding:0 0 0 30pt}"
 "ol{display:block;list-style-type:decimal;margin:1em 0;padding:0 0 0 30pt}"
 "p{display:block;margin:1em 0}"
-"pre{display:block;font-family:monospace;margin:1em 0;white-space:pre}"
+"pre{display:block;font-family:monospace;margin:1em 0;white-space:pre-wrap}"
 "q:before{content:'\xe2\x80\x9c'}"
 "q:after{content:'\xe2\x80\x9d'}"
 "s{text-decoration:line-through}"
@@ -159,6 +159,7 @@ static const char *markdown_publisher_css =
 "a.footnote-backref,sup.footnote-ref a{text-decoration:none}"
 "sup.footnote-ref a:before{content:'['}"
 "sup.footnote-ref a:after{content:']'}"
+"div.mupdf-epub-notes{margin-top:2em;padding-top:1em;border-top:1px solid silver}"
 ;
 
 static const char *known_html_tags[] = {
@@ -263,6 +264,7 @@ struct genstate
 	fz_bidi_direction markup_dir;
 	fz_text_language markup_lang;
 	char *href;
+	int href_noteref;
 
 	table_styles tab_styles;
 	int col_num;
@@ -842,6 +844,25 @@ fz_html *fz_keep_html(fz_context *ctx, fz_html *html)
 	return NULL;
 }
 
+/* is word one of the space separated words in list? */
+static int has_word(const char *list, const char *word)
+{
+	size_t n = strlen(word);
+	const char *s = list;
+	if (!s)
+		return 0;
+	while (*s)
+	{
+		while (iswhite(*s))
+			s++;
+		if (!strncmp(s, word, n) && (s[n] == 0 || iswhite(s[n])))
+			return 1;
+		while (*s && !iswhite(*s))
+			s++;
+	}
+	return 0;
+}
+
 static fz_html_box *new_box(fz_context *ctx, struct genstate *g, fz_xml *node, int type, fz_css_style *style)
 {
 	fz_html_box *box;
@@ -912,11 +933,18 @@ static fz_html_box *new_box(fz_context *ctx, struct genstate *g, fz_xml *node, i
 			href = fz_xml_att(node, "href");
 		}
 		if (href)
+		{
 			g->href = fz_pool_strdup(ctx, g->pool, href);
+			g->href_noteref = has_word(fz_xml_att(node, "epub:type"), "noteref");
+		}
 	}
 
+	box->is_noteref = 0;
 	if (g->href)
+	{
 		box->href = g->href;
+		box->is_noteref = g->href_noteref;
+	}
 
 	if (type == BOX_FLOW)
 	{
@@ -1341,31 +1369,119 @@ static void gen2_image_common(fz_context *ctx, struct genstate *g, fz_html_box *
 	}
 }
 
+static void gen2_image_sized(fz_context *ctx, struct genstate *g, fz_html_box *root_box, fz_xml *node, fz_image *img, int display, fz_css_style *style)
+{
+	fz_css_style local_style = *style;
+	int w, h;
+	const char *w_att = fz_xml_att(node, "width");
+	const char *h_att = fz_xml_att(node, "height");
+
+	if (w_att && (w = fz_atoi(w_att)) > 0)
+	{
+		local_style.width.value = w;
+		local_style.width.unit = strchr(w_att, '%') ? N_PERCENT : N_LENGTH;
+	}
+	if (h_att && (h = fz_atoi(h_att)) > 0)
+	{
+		local_style.height.value = h;
+		local_style.height.unit = strchr(h_att, '%') ? N_PERCENT : N_LENGTH;
+	}
+
+	gen2_image_common(ctx, g, root_box, node, img, display, &local_style);
+}
+
 static void gen2_image_html(fz_context *ctx, struct genstate *g, fz_html_box *root_box, fz_xml *node, int display, fz_css_style *style)
 {
 	const char *src = fz_xml_att(node, "src");
 	if (src)
+		gen2_image_sized(ctx, g, root_box, node, load_html_image(ctx, g->zip, g->base_uri, src), display, style);
+}
+
+/* SumatraPDF: <video> / <audio> can't play on a page. Draw its poster or a
+ * "[video: name]" label as a link to the media file, which the app opens (#6421). */
+static const char *media_src(fz_xml *node)
+{
+	const char *src = fz_xml_att(node, "src");
+	fz_xml *child;
+
+	if (src)
+		return src;
+	for (child = fz_xml_down(node); child; child = fz_xml_next(child))
 	{
-		fz_css_style local_style = *style;
-		fz_image *img;
-		int w, h;
-		const char *w_att = fz_xml_att(node, "width");
-		const char *h_att = fz_xml_att(node, "height");
-
-		if (w_att && (w = fz_atoi(w_att)) > 0)
-		{
-			local_style.width.value = w;
-			local_style.width.unit = strchr(w_att, '%') ? N_PERCENT : N_LENGTH;
-		}
-		if (h_att && (h = fz_atoi(h_att)) > 0)
-		{
-			local_style.height.value = h;
-			local_style.height.unit = strchr(h_att, '%') ? N_PERCENT : N_LENGTH;
-		}
-
-		img = load_html_image(ctx, g->zip, g->base_uri, src);
-		gen2_image_common(ctx, g, root_box, node, img, display, &local_style);
+		const char *tag = fz_xml_tag(child);
+		if (tag && !strcmp(tag, "source") && (src = fz_xml_att(child, "src")) != NULL)
+			return src;
 	}
+	return NULL;
+}
+
+static void gen2_media_label(fz_context *ctx, struct genstate *g, fz_html_box *root_box, fz_xml *node, const char *label, int display, fz_css_style *style)
+{
+	fz_html_box *box;
+
+	if (display == DIS_INLINE || display == DIS_INLINE_BLOCK)
+	{
+		root_box = find_inline_context(ctx, g, root_box);
+		box = new_box(ctx, g, node, BOX_INLINE, style);
+		append_box(ctx, root_box, box);
+	}
+	else
+	{
+		fz_css_style text_style = *style;
+		fz_html_box *block_box;
+
+		/* the inner box inherits the block's font size, don't apply it twice */
+		text_style.font_size.value = 1;
+		text_style.font_size.unit = N_SCALE;
+
+		root_box = find_block_context(ctx, root_box);
+		block_box = new_box(ctx, g, node, BOX_BLOCK, style);
+		append_box(ctx, root_box, block_box);
+		root_box = find_inline_context(ctx, g, block_box);
+		box = new_box(ctx, g, NULL, BOX_INLINE, &text_style);
+		append_box(ctx, root_box, box);
+	}
+	generate_text(ctx, box, label, g->markup_lang, g);
+}
+
+static void gen2_tag(fz_context *ctx, struct genstate *g, fz_html_box *root_box, fz_xml *node,
+	fz_css_match *match, int display, fz_css_style *style);
+
+static void gen2_media(fz_context *ctx, struct genstate *g, fz_html_box *root_box, fz_xml *node,
+	fz_css_match *match, int display, fz_css_style *style)
+{
+	const char *tag = fz_xml_tag(node);
+	const char *src = media_src(node);
+	const char *poster = fz_xml_att(node, "poster");
+	const char *name;
+	char *save_href = g->href;
+	int save_href_noteref = g->href_noteref;
+	fz_image *img = NULL;
+	char label[256];
+
+	if (!src || display == DIS_NONE)
+	{
+		gen2_tag(ctx, g, root_box, node, match, display, style);
+		return;
+	}
+
+	g->href = fz_pool_strdup(ctx, g->pool, src);
+	g->href_noteref = 0;
+	if (poster)
+		img = load_html_image(ctx, g->zip, g->base_uri, poster);
+	if (img)
+	{
+		gen2_image_sized(ctx, g, root_box, node, img, display, style);
+	}
+	else
+	{
+		name = strrchr(src, '/');
+		name = name ? name + 1 : src;
+		fz_snprintf(label, sizeof label, "[%s: %s]", tag, name);
+		gen2_media_label(ctx, g, root_box, node, label, display, style);
+	}
+	g->href = save_href;
+	g->href_noteref = save_href_noteref;
 }
 
 static void gen2_image_fb2(fz_context *ctx, struct genstate *g, fz_html_box *root_box, fz_xml *node, int display, fz_css_style *style)
@@ -1435,6 +1551,7 @@ static void gen2_tag(fz_context *ctx, struct genstate *g, fz_html_box *root_box,
 	int save_markup_dir;
 	int save_markup_lang;
 	char *save_href;
+	int save_href_noteref;
 
 	/* Limit recursion depth to prevent stack overflow on deeply nested HTML. */
 	if (g->depth > 500)
@@ -1444,6 +1561,7 @@ static void gen2_tag(fz_context *ctx, struct genstate *g, fz_html_box *root_box,
 	save_markup_dir = g->markup_dir;
 	save_markup_lang = g->markup_lang;
 	save_href = g->href;
+	save_href_noteref = g->href_noteref;
 
 	if (display == DIS_NONE)
 		goto end;
@@ -1595,6 +1713,7 @@ end:
 	g->markup_dir = save_markup_dir;
 	g->markup_lang = save_markup_lang;
 	g->href = save_href;
+	g->href_noteref = save_href_noteref;
 	g->depth--;
 }
 
@@ -1641,6 +1760,10 @@ static void gen2_children(fz_context *ctx, struct genstate *g, fz_html_box *root
 			else if (tag[0]=='s' && tag[1]=='v' && tag[2]=='g' && tag[3]==0)
 			{
 				gen2_image_svg(ctx, g, root_box, node, display, &style);
+			}
+			else if (!strcmp(tag, "video") || !strcmp(tag, "audio"))
+			{
+				gen2_media(ctx, g, root_box, node, &match, display, &style);
 			}
 			else if (tag[0]=='c' && tag[1]=='o' && tag[2]=='l' && tag[3]==0)
 			{
@@ -2139,6 +2262,87 @@ collect_text(fz_context *ctx, fz_pool *pool, fz_xml *node)
 	return s;
 }
 
+/* EPUB 3 notes (<aside epub:type="footnote">, also "endnote" and "rearnote")
+   are not part of the reading flow: readers show them in a popup from their
+   noteref link. */
+static int is_epub_note(fz_xml *node)
+{
+	const char *type;
+	if (!fz_xml_is_tag(node, "aside"))
+		return 0;
+	type = fz_xml_att(node, "epub:type");
+	return has_word(type, "footnote") || has_word(type, "endnote") || has_word(type, "rearnote");
+}
+
+static int is_epub_notes_box(fz_xml *node)
+{
+	const char *cls = fz_xml_att(node, "class");
+	return fz_xml_is_tag(node, "div") && cls && !strcmp(cls, "mupdf-epub-notes");
+}
+
+/* Move the EPUB notes to the end of the body, under a separator, where links
+   still reach them. */
+static void move_epub_notes(fz_context *ctx, fz_xml_doc *xml)
+{
+	fz_xml *body = fz_dom_body(ctx, xml);
+	fz_xml **notes = NULL;
+	fz_xml *node, *box;
+	int i, len = 0, cap = 0;
+
+	if (!body)
+		return;
+	/* moved already: the same parsed chapter is laid out again */
+	for (node = fz_xml_down(body); node; node = fz_xml_next(node))
+		if (is_epub_notes_box(node))
+			return;
+
+	fz_var(notes);
+	fz_try(ctx)
+	{
+		/* depth-first, not into a note */
+		node = fz_xml_down(body);
+		while (node)
+		{
+			if (is_epub_note(node))
+			{
+				if (len == cap)
+				{
+					cap = cap ? cap * 2 : 16;
+					notes = fz_realloc_array(ctx, notes, cap, fz_xml *);
+				}
+				notes[len++] = node;
+			}
+			else if (fz_xml_down(node))
+			{
+				node = fz_xml_down(node);
+				continue;
+			}
+			while (node != body && !fz_xml_next(node))
+				node = fz_xml_up(node);
+			if (node == body)
+				break;
+			node = fz_xml_next(node);
+		}
+
+		if (len > 0)
+		{
+			box = fz_dom_create_element(ctx, xml, "div");
+			fz_dom_add_attribute(ctx, box, "class", "mupdf-epub-notes");
+			fz_dom_append_child(ctx, body, box);
+			for (i = 0; i < len; i++)
+				fz_dom_append_child(ctx, box, notes[i]);
+		}
+	}
+	fz_always(ctx)
+		fz_free(ctx, notes);
+	fz_catch(ctx)
+	{
+		fz_rethrow_if(ctx, FZ_ERROR_SYSTEM);
+		fz_report_error(ctx);
+		fz_warn(ctx, "cannot move epub notes");
+	}
+}
+
 static void
 xml_to_boxes(fz_context *ctx,
 	fz_html_font_set *set,
@@ -2242,6 +2446,9 @@ xml_to_boxes(fz_context *ctx,
 	{
 		fz_css_style style;
 		int display;
+
+		if (!g.is_fb2)
+			move_epub_notes(ctx, g.xml);
 
 		fz_match_css_at_page(ctx, &root_match, g.css);
 		fz_apply_css_style(ctx, g.set, &style, &root_match);

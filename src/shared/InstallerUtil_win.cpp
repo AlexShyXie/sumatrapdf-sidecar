@@ -1021,7 +1021,9 @@ bool CheckInstallUninstallPossible(bool silent) {
     return possible;
 }
 
-void RestartElevatedForAllUsers(Flags* cli) {
+// Returns the exit code to leave with: a silent install is scripted, so wait
+// for the elevated install and pass on how it went (#6562)
+int RestartElevatedForAllUsers(Flags* cli) {
     TempStr exePath = GetSelfExePathTemp();
     TempStr cmdLine = StrL("-run-install-now");
     bool allUsersChecked = InstallerAllUsersChecked();
@@ -1047,15 +1049,20 @@ void RestartElevatedForAllUsers(Flags* cli) {
     Str dir = cli->installDir;
     // a dir ending in \ must not escape the closing quote
     cmdLine = str::JoinTemp(cmdLine, StrL(" -install-dir "), QuoteCmdLineArgTemp(dir));
+    if (cli->silent) {
+        // it has finished when we exit, so ours to delete if it's a temp copy
+        return RunElevatedAndWait(exePath, cmdLine);
+    }
     logf("LaunchElevated('%s', '%s')\n", exePath, cmdLine);
     bool ok = LaunchElevated(exePath, cmdLine);
     if (!ok) {
         logf("LaunchElevated('%s', '%s') failed!\n", exePath, cmdLine);
         LogLastError();
-    } else {
-        logf("LaunchElevated() ok!\n");
-        NoteTempInstallerRelaunch();
+        return 1;
     }
+    logf("LaunchElevated() ok!\n");
+    NoteTempInstallerRelaunch();
+    return 0;
 }
 
 void RemoveInstalledFiles() {
@@ -1078,3 +1085,14 @@ void AnimStep() {
 
 Str gMsgError;
 Flags* gCli = nullptr;
+
+// Kill a process with given <processId> if it has a module (dll or exe) <modulePath>.
+// If <waitUntilTerminated> is true, will wait until process is fully killed.
+// Returns TRUE if killed a process
+bool KillProcWithIdAndModule(DWORD processId, Str modulePath, bool waitUntilTerminated) {
+    if (!IsProcWithModule(processId, modulePath)) {
+        return false;
+    }
+    logf("KillProcWithIdAndModule() processId=%d, modulePath=%s\n", processId, modulePath);
+    return KillProcWithId(processId, waitUntilTerminated);
+}

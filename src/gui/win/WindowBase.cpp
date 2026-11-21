@@ -30,10 +30,6 @@ static const WStr kDefaultClassName = L"SumatraWgDefaultWinClass";
 // window can be told apart in a debugger / spy tool
 static const WStr kControlClassName = L"SumatraWgControlClass";
 
-TempStr WinMsgNameTemp(UINT msg) {
-    return fmt("0x%x", (int)msg);
-}
-
 //--- the single HWND -> object list, shared by windows and controls
 
 struct HwndToWnd {
@@ -108,10 +104,19 @@ static LRESULT CALLBACK WndBaseWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LP
         HwndListAdd(w);
     }
 
-    if (w) {
-        return w->OnMessage(hwnd, msg, wparam, lparam);
+    if (!w) {
+        return ::DefWindowProc(hwnd, msg, wparam, lparam);
     }
-    return ::DefWindowProc(hwnd, msg, wparam, lparam);
+    LRESULT res = w->OnMessage(hwnd, msg, wparam, lparam);
+    // Windows destroys child and owned windows without asking us: drop the
+    // mapping so a recycled HWND can't reach this object, and later Destroy()
+    // doesn't destroy someone else's window. comctl32 removes subclasses here.
+    if (msg == WM_NCDESTROY && HwndBaseFromHwnd(hwnd) == w) {
+        HwndListRemove(w);
+        w->subclassId = 0;
+        w->hwnd = nullptr;
+    }
+    return res;
 }
 
 static LRESULT CALLBACK WndBaseSubclassedWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR /*subclassId*/,
@@ -199,7 +204,7 @@ void HwndBase::SetText(Str s) {
         s = StrL("");
     }
     HwndSetText(hwnd, s);
-    HwndRepaintNow(hwnd); // TODO: move inside HwndSetText()?
+    HwndInvalidate(hwnd);
 }
 
 TempStr HwndBase::GetTextTemp() {
@@ -511,21 +516,43 @@ void WindowBase::OnThemeChange() {
     RedrawWindow(hwnd, nullptr, nullptr, flags);
 }
 
-LRESULT WindowBase::OnMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+// shared by WindowBase and ControlBase: run the onWndProc hook, then WndProcDefault
+template <typename T>
+static LRESULT DispatchOnMessage(T* self, HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     DpiScope dpi(hwnd);
-    if (onWndProc.IsValid()) {
-        WndProcEvent ev;
-        ev.w = this;
+    if (self->onWndProc.IsValid()) {
+        typename T::WndProcEvent ev;
+        ev.w = self;
         ev.hwnd = hwnd;
         ev.msg = msg;
         ev.wparam = wparam;
         ev.lparam = lparam;
-        onWndProc.Call(&ev);
+        self->onWndProc.Call(&ev);
         if (ev.didHandle) {
             return ev.result;
         }
     }
-    return WndProcDefault(hwnd, msg, wparam, lparam);
+    return self->WndProcDefault(hwnd, msg, wparam, lparam);
+}
+
+// shared by WindowBase and ControlBase: subclass an existing HWND and fire onAttach
+template <typename T>
+static void AttachToHwnd(T* self, HWND hwnd) {
+    ReportIf(!IsWindow(hwnd));
+    ReportIf(HwndBaseFromHwnd(hwnd));
+
+    self->hwnd = hwnd;
+    DpiSetFromHwnd(hwnd);
+    self->Subclass();
+    if (self->onAttach.IsValid()) {
+        typename T::AttachEvent ev;
+        ev.w = self;
+        self->onAttach.Call(&ev);
+    }
+}
+
+LRESULT WindowBase::OnMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    return DispatchOnMessage(this, hwnd, msg, wparam, lparam);
 }
 
 HWND WindowBase::CreateCustom(const CreateCustomArgs& args) {
@@ -993,8 +1020,9 @@ LRESULT WindowBase::WndProcDefault(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
                 return 0;
             }
         }
-        // TODO: should only send WM_DESTROY, the rest should be hooked in OnDestroy
-        Destroy();
+        // not Destroy(): that unmaps us first, so WM_DESTROY (and onDestroy)
+        // would never reach this object; WM_NCDESTROY does the unmapping
+        ::DestroyWindow(hwnd);
         return 0;
     }
 
@@ -1474,17 +1502,7 @@ bool WindowBase::PreTranslateMessage(MSG& msg) {
 }
 
 void WindowBase::Attach(HWND hwnd) {
-    ReportIf(!IsWindow(hwnd));
-    ReportIf(HwndBaseFromHwnd(hwnd));
-
-    this->hwnd = hwnd;
-    DpiSetFromHwnd(hwnd);
-    Subclass();
-    if (onAttach.IsValid()) {
-        AttachEvent ev;
-        ev.w = this;
-        onAttach.Call(&ev);
-    }
+    AttachToHwnd(this, hwnd);
 }
 
 int WindowBase::GetDpi() const {
@@ -1503,20 +1521,7 @@ ControlBase* ControlBase::AsControlBase() {
 }
 
 LRESULT ControlBase::OnMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-    DpiScope dpi(hwnd);
-    if (onWndProc.IsValid()) {
-        WndProcEvent ev;
-        ev.w = this;
-        ev.hwnd = hwnd;
-        ev.msg = msg;
-        ev.wparam = wparam;
-        ev.lparam = lparam;
-        onWndProc.Call(&ev);
-        if (ev.didHandle) {
-            return ev.result;
-        }
-    }
-    return WndProcDefault(hwnd, msg, wparam, lparam);
+    return DispatchOnMessage(this, hwnd, msg, wparam, lparam);
 }
 
 void ControlBase::SetVisibility(Visibility newVisibility) {
@@ -1900,6 +1905,8 @@ LRESULT ControlBase::WndProcDefault(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 }
                 cev.mouseWindow = ptW;
                 onContextMenu.Call(&cev);
+                // DefWindowProc would pass it to the parent, which shows its own menu
+                return 0;
             }
             break;
         }
@@ -1931,24 +1938,7 @@ LRESULT ControlBase::WndProcDefault(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 }
 
 void ControlBase::Attach(HWND hwnd) {
-    ReportIf(!IsWindow(hwnd));
-    ReportIf(HwndBaseFromHwnd(hwnd));
-
-    this->hwnd = hwnd;
-    DpiSetFromHwnd(hwnd);
-    Subclass();
-    if (onAttach.IsValid()) {
-        AttachEvent ev;
-        ev.w = this;
-        onAttach.Call(&ev);
-    }
-}
-
-// Attaches a CWnd object to a dialog item.
-void ControlBase::AttachDlgItem(UINT id, HWND parent) {
-    ReportIf(!::IsWindow(parent));
-    HWND wnd = ::GetDlgItem(parent, (int)id);
-    Attach(wnd);
+    AttachToHwnd(this, hwnd);
 }
 
 HWND ControlBase::CreateControl(const CreateControlArgs& args) {
@@ -2006,18 +1996,6 @@ HWND ControlBase::CreateCustom(const CreateCustomArgs& args) {
     return CreateCustomHwnd(args, kControlClassName);
 }
 
-void ControlBase::SetInsetsPt(int uniform) {
-    insets = DpiScaledInsets(uniform);
-}
-
-void ControlBase::SetInsetsPt(int topBottom, int leftRight) {
-    insets = DpiScaledInsets(topBottom, leftRight);
-}
-
-void ControlBase::SetInsetsPt(int top, int right, int bottom, int left) {
-    insets = DpiScaledInsets(top, right, bottom, left);
-}
-
 bool ControlBase::IsFocused() const {
     return hwnd && HwndIsFocused(hwnd);
 }
@@ -2040,6 +2018,40 @@ void SizeToIdealSize(ControlBase* c) {
 }
 
 //--- message loops
+
+// Darkmode child theming may reset the font of an edit; set it again.
+void ReapplyEditFont(Edit* edit, PlatformFont* font) {
+    if (edit && font) {
+        edit->SetFont(font);
+    }
+}
+
+// Double-buffered paint of a popup bar: background, virtual controls, 1px border.
+void PaintBorderedBar(HwndBase* w, HDC hdc, Color colBg, Color colBorder) {
+    Rect rc = HwndClientRect(w->hwnd);
+    Gfx* gfx = GfxCreateWithDoubleBuffer(w, hdc);
+    gfx->FillRect(rc, colBg);
+    if (w->vroot) {
+        w->vroot->Paint(gfx, rc);
+    }
+    gfx->DrawRect(rc, colBorder);
+    delete gfx;
+}
+
+// Moves the window to the DPI-suggested rect once its layout exists; returns false
+// while still creating, when the rect must not be applied.
+bool ApplyDpiChangedRect(HWND hwnd, WindowBase::DpiChangedEvent* ev, bool ready) {
+    ev->didHandle = true;
+    if (!ready) {
+        return false;
+    }
+    RECT* r = ev->suggested;
+    if (r) {
+        SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    return true;
+}
 
 // application.cpp
 bool PreTranslateMessage(MSG& msg) {

@@ -15,7 +15,15 @@ import {
   VK_RETURN,
   WM_KEYDOWN,
 } from "./winapi.ts";
-import { killAndWait, launchControlled, sendCommand, findPalette } from "./win-automation.ts";
+import {
+  killAndWait,
+  launchControlled,
+  sendCommand,
+  findPalette,
+  waitForPalette,
+  paletteSetText,
+  paletteState,
+} from "./win-automation.ts";
 
 const THUMBNAIL_CLASS = "SumatraPDF_ThumbnailNavigation";
 const SETTINGS = `UiLanguage = en
@@ -28,13 +36,8 @@ RememberOpenedFiles = false
 type ThumbnailState = { active: boolean; page: number; rendered: number };
 
 async function thumbnailState(client: ControlClient): Promise<ThumbnailState | null> {
-  const res = await client.request(ControlCommand.TestCommandPalette, []);
-  if ((res[0] as number) !== 0) {
-    return null;
-  }
-  const out = String(res[1] ?? "");
-  const m = /thumb=(\d+) page=(\d+) rendered=(\d+)/.exec(out);
-  return m ? { active: m[1] === "1", page: +m[2]!, rendered: +m[3]! } : null;
+  const s = await paletteState(client);
+  return s.open ? { active: s.thumb === 1, page: s.page, rendered: s.rendered } : null;
 }
 
 async function waitForThumbnail(client: ControlClient, expected: boolean): Promise<ThumbnailState | null> {
@@ -61,8 +64,7 @@ async function waitForPage(client: ControlClient, page: number): Promise<boolean
 }
 
 async function paletteOpen(client: ControlClient): Promise<boolean> {
-  const res = await client.request(ControlCommand.TestCommandPalette, []);
-  return (res[0] as number) === 0;
+  return (await paletteState(client)).open;
 }
 
 async function currentPage(client: ControlClient): Promise<number> {
@@ -92,7 +94,7 @@ export async function testit(): Promise<void> {
           break;
         }
       } else {
-        handles = findPalette(frame);
+        handles = await waitForPalette(client, frame, 50);
         if (handles.palette && handles.edit) {
           break;
         }
@@ -117,7 +119,11 @@ export async function testit(): Promise<void> {
       throw new Error("command-palette-thumbnails: right arrow did not select page 2");
     }
 
-    sendText(handles.edit, ">");
+    if (IS_MAC) {
+      sendText(handles.edit, ">");
+    } else {
+      await paletteSetText(client, handles, ">");
+    }
     if ((await waitForThumbnail(client, false))?.active !== false) {
       throw new Error("command-palette-thumbnails: thumbnail grid remained in command view");
     }
@@ -136,7 +142,11 @@ export async function testit(): Promise<void> {
       }
     }
 
-    sendText(IS_MAC ? frame : findPalette(frame).edit, "&");
+    if (IS_MAC) {
+      sendText(frame, "&");
+    } else {
+      await paletteSetText(client, findPalette(frame), "&");
+    }
     const returned = await waitForThumbnail(client, true);
     if (!returned?.active || returned.page !== 2) {
       throw new Error(`command-palette-thumbnails: thumbnail grid did not return: ${JSON.stringify(returned)}`);

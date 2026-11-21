@@ -16,7 +16,8 @@ void WebViewFlushBlock(MainWindow* win);
 void WebViewClearChat(MainWindow* win);
 void WebViewShowUnsupportedFileType(MainWindow* win);
 void SetAIChatWorking(MainWindow* win, bool /*working*/);
-WindowTab* FindAIChatUpdateTab(MainWindow* win, int pid, Str sessionId);
+WindowTab* FindAIChatUpdateTab(MainWindow* win, int pid, int turnId);
+int AIChatNewTurnId();
 
 // implemented by each app
 void WebViewEval(MainWindow* win, Str js, bool record = true);
@@ -41,8 +42,6 @@ MainWindow* AIChatUpdateWindow(HWND hwndFrame, MainWindow* win);
 bool AIChatPanelShown(MainWindow* win);
 void AIChatUpdateApplied(MainWindow* win);
 void OnAIChatFinished(MainWindow* win, AIChatProvider* p, AIChatTabState* st, bool isActiveTab);
-
-extern AIChatCaptureSink* gAIChatCapture;
 
 // --- Splitter ---
 constexpr int kAIChatMinDx = 150;

@@ -20,8 +20,11 @@
 #include "TextSearch.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "Selection.h"
 #include "AnnotPlacement.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
+#include "Tabs.h"
 #include "Commands.h"
 #include "CommandAvailability.h"
 #include "Menu.h"
@@ -113,6 +116,8 @@ int OriginalCommandId(int cmdId) {
 
 TempStr ToolbarTipTemp(int cmdId, Str tip, bool translate) {
     TempStr s = translate ? trans::GetTranslation(tip) : TempStr(tip);
+    // some tips are menu strings: "Rotate &Left" shows as "Rotate Left" (#6469)
+    s = ParseMenuAccelTextTemp(s).display;
     TempStr accelStr = AppendAccelKeyToMenuStringTemp({}, cmdId);
     if (accelStr) {
         Str accel = accelStr.len > 1 ? Str(accelStr.s + 1, accelStr.len - 1) : accelStr;
@@ -123,7 +128,7 @@ TempStr ToolbarTipTemp(int cmdId, Str tip, bool translate) {
 
 // toolbar mode for this window: Fullscreen.Toolbar in fullscreen, else Toolbar
 int ToolbarModeForWindow(MainWindow* win) {
-    if (win->isFullScreen) {
+    if (win->IsFullScreen()) {
         return FullscreenToolbarModeFromPrefs();
     }
     return ToolbarModeFromPrefs();
@@ -361,6 +366,13 @@ Str* AnnotPresetColorList(int cmdId) {
     return (cmdId == CmdCreateAnnotInk) ? &a.inkColors : &a.presetColors;
 }
 
+// the color the button's next annotation is made in
+Color AnnotColorForCmd(int cmdId) {
+    ParsedColor* setting = AnnotPresetColorSetting(cmdId);
+    Color col = setting ? GetParsedColor(*setting, kColorUnset) : kColorUnset;
+    return col != kColorUnset ? col : AnnotDefaultColor(cmdId);
+}
+
 void SetAnnotPresetColor(int cmdId, Color col) {
     ParsedColor* setting = AnnotPresetColorSetting(cmdId);
     if (!setting) {
@@ -386,7 +398,10 @@ bool CanCreateAnnotFromSelection(MainWindow* win, int cmdId) {
         return false;
     }
     DisplayModel* dm = win->AsFixed();
-    return dm && dm->textSelection && dm->textSelection->result.len > 0;
+    if (dm && dm->textSelection && dm->textSelection->result.len > 0) {
+        return true;
+    }
+    return cmdId == CmdCreateAnnotHighlight && IsDrawnRectSelection(win);
 }
 
 // alpha 0 and 0xff both mean opaque, so a palette color matches an
@@ -429,6 +444,12 @@ static ToolbarButtonInfo gToolbarButtons[] = {
 };
 
 constexpr int kButtonsCount = dimof(gToolbarButtons);
+
+// built-in buttons that are only on the toolbar when ToolbarCustomLayout lists them
+static ToolbarButtonInfo gOptionalToolbarButtons[] = {
+    {gIconChapterPrev, CmdGoToPrevChapter, TrN("Previous Chapter")},
+    {gIconChapterNext, CmdGoToNextChapter, TrN("Next Chapter")},
+};
 
 // The built-in buttons actually on the toolbar, which is gToolbarButtons unless
 // ToolbarCustomLayout asks for a different set / order (issue #5095). A layout
@@ -498,6 +519,11 @@ void PopulateToolbarLayout() {
                 break;
             }
         }
+        for (int i = 0; !found && i < dimof(gOptionalToolbarButtons) && cmdId != CmdNone; i++) {
+            if (gOptionalToolbarButtons[i].cmdId == cmdId) {
+                found = &gOptionalToolbarButtons[i];
+            }
+        }
         if (!found) {
             logf("ToolbarCustomLayout: no built-in toolbar button for '%s'\n", tok);
             continue;
@@ -529,15 +555,21 @@ void EnablePdfAnnotationsToolbar(MainWindow* win) {
 }
 
 bool ShouldShowToolbar(MainWindow* win) {
-    if (win->presentation || win->isQuickLook) {
+    if (win->InPresentation() || win->isQuickLook) {
         return false;
     }
+#if OS_WASM
+    // the tab strip and its menu button replace the toolbar on Home
+    if (win->IsCurrentTabAbout() && TabsAreVisible(win)) {
+        return false;
+    }
+#endif
     int mode = ToolbarModeForWindow(win);
     return mode == kToolbarShow;
 }
 
 bool ShouldOverlayToolbar(MainWindow* win) {
-    if (win->presentation || win->isQuickLook) {
+    if (win->InPresentation() || win->isQuickLook) {
         return false;
     }
     if (ToolbarModeForWindow(win) != kToolbarOverlay) {

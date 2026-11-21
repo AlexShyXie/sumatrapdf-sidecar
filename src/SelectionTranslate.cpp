@@ -21,6 +21,7 @@
 #include "SumatraPDF.h"
 #include "SumatraConfig.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "TextSelection.h"
 #include "Selection.h"
@@ -29,9 +30,20 @@
 #include "Translations.h"
 #include "Theme.h"
 #include "DarkMode.h"
+#include "SumatraDialogs.h"
+#include "shared/PdfToolsCommon.h"
 #include "SelectionTranslate.h"
 #include "SelectionTranslateCommon.h"
 
+//   the selected text, editable
+//   ---------------------------------------------- hairline
+//   Translation                           (once there is one)
+//   the translation
+//   ---------------------------------------------- hairline
+//   Translate with   [Google               v]
+//   From:  [auto     v]   To:  [English     v]
+//                             [Close] [Translate]
+constexpr int kTranslateTextPadDy = 4;
 struct SelectionTranslateWnd : WindowBase {
     ~SelectionTranslateWnd() override;
 
@@ -49,6 +61,8 @@ struct SelectionTranslateWnd : WindowBase {
     VirtButton* btnClose = nullptr;
     VirtText* staticResultLabel = nullptr;
     Edit* editResult = nullptr;
+    // the translation's section and the hairline over it, shown with it
+    ILayout* resultBox = nullptr;
 
     // engine pre-selected in the dropdown when the dialog opens
     TranslateEngine engine = TranslateEngine::Google;
@@ -144,10 +158,6 @@ TempStr OsDefaultDestinationLanguageTemp() {
     return StrL("English");
 }
 
-static void LogTranslation(AIChatBackend backend, Str direction, Str text) {
-    logf("selection-translate %s %s: %s", BackendLogName(backend), direction, text);
-}
-
 static void ReadPipeToStrBuilder(HANDLE hPipe, str::Builder& out) {
     char buf[4096];
     DWORD bytesRead = 0;
@@ -175,41 +185,16 @@ static void PopulateEngineDropDown(DropDown* dd, TranslateEngine selected) {
     CbSetCurrentSelection(dd, selIdx);
 }
 
-static bool RunTranslation(AIChatBackend backend, Str srcLang, Str dstLang, Str text, Str& msgOut) {
-    TempStr exePath = FindBackendExecutableTemp(backend);
-    if (len(exePath) == 0) {
-        msgOut = str::Dup(Tr("The selected AI CLI is not installed."));
-        return false;
-    }
+TempStr TranslateTempDirTemp() {
+    return GetTempDirTemp();
+}
 
-    TempStr prompt = BuildTranslationPromptTemp(srcLang, dstLang, text);
-    TempStr cwd = StripTrailingSlashTemp(GetTempDirTemp());
-    TempStr cmdLine;
-    if (backend == AIChatBackend::Grok) {
-        cmdLine = BuildGrokTranslateCmdLineTemp(exePath, prompt, cwd);
-    } else if (backend == AIChatBackend::Claude) {
-        cmdLine = BuildClaudeTranslateCmdLineTemp(exePath, prompt);
-    } else if (backend == AIChatBackend::Codex) {
-        cmdLine = BuildCodexTranslateCmdLineTemp(exePath, prompt, cwd);
-    } else if (backend == AIChatBackend::AntiGravity) {
-        cmdLine = BuildAntiGravityTranslateCmdLineTemp(exePath, prompt);
-    }
-
-    LogTranslation(backend, StrL(">>> backend"), BackendDisplayName(backend));
-    LogTranslation(backend, StrL(">>> srcLang"), srcLang);
-    LogTranslation(backend, StrL(">>> dstLang"), dstLang);
-    LogTranslation(backend, StrL(">>> prompt"), prompt);
-    LogTranslation(backend, StrL(">>> cmd"), cmdLine);
-
+TranslateRun RunTranslateCli(Str cmdLine, Str cwd, str::Builder& output) {
     AIChatProcessLaunchResult launch;
     if (!AIChatLaunchProcessWithStdoutPipe(cmdLine, cwd, &launch)) {
-        msgOut = str::Dup(Tr("Failed to launch the AI CLI."));
-        LogTranslation(backend, StrL("<<< error"), msgOut);
-        return false;
+        return TranslateRun::LaunchFailed;
     }
 
-    str::Builder output;
-    output.Reserve(4096);
     ReadPipeToStrBuilder(launch.hReadPipe, output);
     CloseHandle(launch.hReadPipe);
     launch.hReadPipe = nullptr;
@@ -218,30 +203,10 @@ static bool RunTranslation(AIChatBackend backend, Str srcLang, Str dstLang, Str 
     if (waitRes == WAIT_TIMEOUT) {
         TerminateProcess(launch.hProcess, 1);
         AIChatCloseProcess(&launch.hProcess, false);
-        msgOut = str::Dup(Tr("Translation timed out."));
-        LogTranslation(backend, StrL("<<< error"), msgOut);
-        return false;
+        return TranslateRun::TimedOut;
     }
     AIChatCloseProcess(&launch.hProcess, false);
-
-    LogTranslation(backend, StrL("<<< raw"), ToStr(output));
-
-    str::Builder translation;
-    translation.Reserve(1024);
-    ParseTranslationOutput(backend, ToStr(output), translation);
-    LogTranslation(backend, StrL("<<< parsed"), ToStr(translation));
-    if (len(translation) == 0) {
-        msgOut = str::Dup(Tr("Translation response did not contain text."));
-        LogTranslation(backend, StrL("<<< error"), msgOut);
-        return false;
-    }
-    if (TranslationLooksLikeError(ToStr(translation))) {
-        msgOut = translation.TakeStr();
-        LogTranslation(backend, StrL("<<< error"), msgOut);
-        return false;
-    }
-    msgOut = translation.TakeStr();
-    return true;
+    return TranslateRun::Done;
 }
 
 // backend: 0=Claude, 1=Grok, 2=Codex, 3=AntiGravity
@@ -264,10 +229,10 @@ TempStr SelectionTranslateResultTemp(int backend, Str srcLang, Str dstLang, Str 
     return res;
 }
 
-// re-pick the app font for the window's current DPI and push it to every child.
-// GetAppFont() caches a PlatformFont per DPI.
+// re-pick the dialog font for the window's current DPI and push it to every
+// child. DlgUiFont() caches a PlatformFont per size.
 void SelectionTranslateWnd::UpdateFont() {
-    SetFont(GetAppFont());
+    SetFont(DlgUiFont(kToolDlgTextFontPx));
     HwndSetFontForWindowAndItsChildren(hwnd, GetHFont());
     VirtText* virts[] = {staticPrompt, staticFromLabel, staticToLabel, staticResultLabel, btnTranslate, btnClose};
     for (VirtText* w : virts) {
@@ -278,7 +243,8 @@ void SelectionTranslateWnd::UpdateFont() {
 }
 
 VirtButton* SelectionTranslateWnd::NewButton(Str text, bool isDefault) {
-    return NewThemedButton(hwnd, text, font, isDefault);
+    DlgButtonStyle style = isDefault ? DlgButtonStyle::Filled : DlgButtonStyle::Outline;
+    return NewDlgButton(hwnd, text, font, style, isDefault);
 }
 
 void SelectionTranslateWnd::SetTranslateButtonText(Str s) {
@@ -313,7 +279,7 @@ void SelectionTranslateWnd::Relayout(bool initial) {
     if (initial || !sizeInitialized) {
         LayoutAndSizeToContent(layout, 0, 0, hwnd);
         // pick up the virtual controls so we paint them and they get their input
-        DoLayout(HwndClientRect(hwnd).Size());
+        DoLayout();
         HwndCenterDialog(hwnd, hwndOwner);
         sizeInitialized = true;
         return;
@@ -321,7 +287,7 @@ void SelectionTranslateWnd::Relayout(bool initial) {
     // keep current client size (or grow if new content needs more space, e.g. result)
     Rect rc = HwndClientRect(hwnd);
     LayoutAndSizeToContent(layout, rc.dx, rc.dy, hwnd);
-    DoLayout(HwndClientRect(hwnd).Size());
+    DoLayout();
 }
 
 void SelectionTranslateWnd::OnGetMinMaxInfo(WindowBase::GetMinMaxInfoEvent* ev) {
@@ -350,7 +316,7 @@ void SelectionTranslateWnd::UpdateTranslateButtonState() {
     bool sameLang = LanguagesAreSameTemp(srcLang, dstLang);
     bool hasText = !str::IsEmptyOrWhiteSpace(srcText);
     bool enable = !translating && hasText && !sameLang;
-    btnTranslate->SetIsEnabled(enable);
+    SetDlgButtonEnabled(btnTranslate, DlgButtonStyle::Filled, enable);
 }
 
 void SelectionTranslateWnd::ShowTranslationResult(Str text, bool isError) {
@@ -359,6 +325,7 @@ void SelectionTranslateWnd::ShowTranslationResult(Str text, bool isError) {
     }
     Str label = isError ? Str(Tr("Error:")) : Str(Tr("Translation:"));
     if (!resultVisible) {
+        resultBox->SetVisibility(Visibility::Visible);
         if (staticResultLabel) {
             staticResultLabel->SetVisibility(Visibility::Visible);
         }
@@ -412,10 +379,11 @@ void SelectionTranslateWnd::StartTranslation(VirtMouseEvent*) {
         dropDstLang->SetIsEnabled(false);
     }
     if (btnTranslate) {
-        btnTranslate->SetIsEnabled(false);
+        SetDlgButtonEnabled(btnTranslate, DlgButtonStyle::Filled, false);
         SetTranslateButtonText(Tr("Translating..."));
     }
     if (resultVisible) {
+        resultBox->SetVisibility(Visibility::Collapse);
         if (staticResultLabel) {
             staticResultLabel->SetVisibility(Visibility::Collapse);
         }
@@ -496,181 +464,165 @@ static void TeardownSelectionTranslateWnd() {
     w->ScheduleDelete();
 }
 
-static void OnSelectionTranslateClose(WindowBase::CloseEvent* ev) {
-    if (gSelectionTranslateWnd == (SelectionTranslateWnd*)ev->e->self) {
+static void TeardownIfCurrent(void* self) {
+    if (gSelectionTranslateWnd == (SelectionTranslateWnd*)self) {
         TeardownSelectionTranslateWnd();
     }
 }
 
+static void OnSelectionTranslateClose(WindowBase::CloseEvent* ev) {
+    TeardownIfCurrent(ev->e->self);
+}
+
 static void OnSelectionTranslateDestroy(WindowBase::DestroyEvent* ev) {
-    if (gSelectionTranslateWnd == (SelectionTranslateWnd*)ev->e->self) {
-        TeardownSelectionTranslateWnd();
-    }
+    TeardownIfCurrent(ev->e->self);
 }
 
 bool SelectionTranslateWnd::Create(HWND owner, Str selText, Str title) {
     hwndOwner = owner;
     bool isRtl = IsUIRtl();
-
+    Color colTxt = ThemeWindowTextColor();
+    Color colBg = ThemeWindowControlBackgroundColor();
+    Color colMuted = ThemeWindowDarkerTextColor();
+    PlatformFont* fontText = DlgUiFont(kToolDlgTextFontPx);
+    PlatformFont* fontMeta = DlgUiFont(kToolDlgMetaFontPx);
+    SetFont(fontText);
     {
         CreateCustomArgs args;
         args.title = title;
         args.visible = false;
         // resizable: thick frame; CLIPCHILDREN avoids flicker while resizing
         args.style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN;
-        args.font = GetFont();
+        args.font = fontText;
+        args.isRtl = isRtl;
+        args.bgColor = colBg;
         args.icon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(GetAppIconID()));
         CreateCustom(args);
     }
     if (!hwnd) {
         return false;
     }
+    SetColors(colTxt, colBg);
 
     auto* vbox = new VBox();
-    vbox->alignMain = MainAxisAlign::MainStart;
     vbox->alignCross = CrossAxisAlign::Stretch;
-
+    // The two text fields come first and the controls that act on them
+    // (engine, languages, buttons) follow, so the dialog reads top to bottom.
+    // flex so source/result edits absorb extra height when the window is resized
     {
         Edit::CreateArgs args;
         args.parent = hwnd;
-        args.font = GetFont();
+        args.font = fontText;
         args.text = selText;
         args.isMultiLine = true;
-        args.withBorder = true;
+        args.withBorder = false;
         args.idealSizeLines = 7;
-        // prefer ~40 chars wide; cap so long selection text does not widen the dialog
         args.idealWidthChars = 40;
         args.maxWidthChars = 120;
         args.isRtl = isRtl;
         editSrcText = new Edit();
+        editSrcText->SetColors(colTxt, colBg);
         editSrcText->Create(args);
         editSrcText->onTextChanged =
             MkMethod0<SelectionTranslateWnd, &SelectionTranslateWnd::UpdateTranslateButtonState>(this);
+        vbox->AddChild(NewDlgSection(new Padding(editSrcText, DpiScaledInsets(kTranslateTextPadDy, 0))), 1);
     }
 
-    // The two text fields come first and the controls that act on them
-    // (engine, languages, buttons) follow, so the dialog reads top to bottom.
-    // flex so source/result edits absorb extra height when the window is resized
-    vbox->AddChild(editSrcText, 1);
-
+    // the translation, under a hairline once there is one
     {
-        staticResultLabel = NewVirtText({
-            .s = Tr("Translation:"),
-            .font = font,
-            .isRtl = isRtl,
-            .padding = DpiScaledInsets(8, 0, 0, 0),
-        });
+        auto* result = new VBox();
+        result->alignCross = CrossAxisAlign::Stretch;
+        staticResultLabel = NewDlgLabel(Tr("Translation:"), fontMeta, colMuted, kToolDlgRowDy);
         staticResultLabel->SetVisibility(Visibility::Collapse);
-        vbox->AddChild(staticResultLabel);
-    }
-    {
+        result->AddChild(staticResultLabel);
+
         Edit::CreateArgs args;
         args.parent = hwnd;
-        args.font = GetFont();
+        args.font = fontText;
         args.isMultiLine = true;
-        args.withBorder = true;
+        args.withBorder = false;
         args.idealSizeLines = 6;
         args.idealWidthChars = 40;
         args.maxWidthChars = 120;
         args.isRtl = isRtl;
         editResult = new Edit();
+        editResult->SetColors(colTxt, colBg);
         editResult->Create(args);
         SendMessageW(editResult->hwnd, EM_SETREADONLY, TRUE, 0);
         editResult->SetVisibility(Visibility::Collapse);
-        editResult->SetInsetsPt(4, 0, 0, 0);
-        vbox->AddChild(editResult, 1);
+        result->AddChild(editResult, 1);
+        auto* box = new VBox();
+        box->alignCross = CrossAxisAlign::Stretch;
+        box->AddChild(new VirtLine());
+        box->AddChild(NewDlgSection(result), 1);
+        box->SetVisibility(Visibility::Collapse);
+        resultBox = box;
+        vbox->AddChild(box, 1);
     }
+    vbox->AddChild(new VirtLine());
 
+    // the engine and the languages, the labels muted
     {
-        auto* engineRow = new HBox();
-        engineRow->alignMain = MainAxisAlign::MainStart;
-        engineRow->alignCross = CrossAxisAlign::CrossCenter;
-        staticPrompt = NewVirtText({.s = Tr("Translate with"), .font = font, .isRtl = isRtl});
+        auto* box = new VBox();
+        box->alignCross = CrossAxisAlign::Stretch;
+        auto newDropDown = [&](bool editable) {
+            DropDown::CreateArgs args;
+            args.parent = hwnd;
+            args.font = fontText;
+            args.isEditable = editable;
+            args.isRtl = isRtl;
+            auto* d = new DropDown();
+            d->Create(args);
+            return d;
+        };
+        auto label = [&](Str s) { return NewDlgLabel(s, fontText, colMuted, kToolDlgRowDy); };
+
+        HBox* engineRow = NewDlgFieldRow();
+        staticPrompt = label(Tr("Translate with"));
         engineRow->AddChild(staticPrompt);
-        {
-            DropDown::CreateArgs args;
-            args.parent = hwnd;
-            args.font = GetFont();
-            args.isRtl = isRtl;
-            dropEngine = new DropDown();
-            dropEngine->Create(args);
-            PopulateEngineDropDown(dropEngine, engine);
-            dropEngine->onSelectionChanged =
-                MkMethod0<SelectionTranslateWnd, &SelectionTranslateWnd::UpdateTranslateButtonState>(this);
-            dropEngine->SetInsetsPt(0, 0, 0, 4);
-            engineRow->AddChild(dropEngine, 1);
-        }
-        vbox->AddChild(new Padding(engineRow, DpiScaledInsets(8, 0, 0, 0)));
-    }
+        dropEngine = newDropDown(false);
+        PopulateEngineDropDown(dropEngine, engine);
+        dropEngine->onSelectionChanged =
+            MkMethod0<SelectionTranslateWnd, &SelectionTranslateWnd::UpdateTranslateButtonState>(this);
+        engineRow->AddChild(dropEngine, 1);
+        box->AddChild(engineRow);
 
-    {
-        auto* langRow = new HBox();
-        langRow->alignMain = MainAxisAlign::MainStart;
-        langRow->alignCross = CrossAxisAlign::CrossCenter;
-
-        staticFromLabel = NewVirtText({.s = Tr("From:"), .font = font, .isRtl = isRtl});
+        HBox* langRow = NewDlgFieldRow();
+        staticFromLabel = label(Tr("From:"));
         langRow->AddChild(staticFromLabel);
-        {
-            DropDown::CreateArgs args;
-            args.parent = hwnd;
-            args.font = GetFont();
-            args.isEditable = true;
-            args.isRtl = isRtl;
-            dropSrcLang = new DropDown();
-            dropSrcLang->Create(args);
-            PopulateLanguageDropDown(dropSrcLang, DefaultSourceLanguageTemp(), true);
-            dropSrcLang->onTextChanged =
-                MkMethod0<SelectionTranslateWnd, &SelectionTranslateWnd::UpdateTranslateButtonState>(this);
-            dropSrcLang->onSelectionChanged =
-                MkMethod0<SelectionTranslateWnd, &SelectionTranslateWnd::UpdateTranslateButtonState>(this);
-            dropSrcLang->SetInsetsPt(0, 0, 0, 4);
-            langRow->AddChild(dropSrcLang, 1);
-        }
-        staticToLabel = NewVirtText({
-            .s = Tr("To:"),
-            .font = font,
-            .isRtl = isRtl,
-            .padding = DpiScaledInsets(0, 0, 0, 4),
-        });
+        dropSrcLang = newDropDown(true);
+        PopulateLanguageDropDown(dropSrcLang, DefaultSourceLanguageTemp(), true);
+        dropSrcLang->onTextChanged =
+            MkMethod0<SelectionTranslateWnd, &SelectionTranslateWnd::UpdateTranslateButtonState>(this);
+        dropSrcLang->onSelectionChanged =
+            MkMethod0<SelectionTranslateWnd, &SelectionTranslateWnd::UpdateTranslateButtonState>(this);
+        langRow->AddChild(dropSrcLang, 1);
+        staticToLabel = label(Tr("To:"));
         langRow->AddChild(staticToLabel);
-        {
-            DropDown::CreateArgs args;
-            args.parent = hwnd;
-            args.font = GetFont();
-            args.isEditable = true;
-            args.isRtl = isRtl;
-            dropDstLang = new DropDown();
-            dropDstLang->Create(args);
-            PopulateLanguageDropDown(dropDstLang, DefaultDestinationLanguageTemp(), false);
-            dropDstLang->onTextChanged =
-                MkMethod0<SelectionTranslateWnd, &SelectionTranslateWnd::UpdateTranslateButtonState>(this);
-            dropDstLang->onSelectionChanged =
-                MkMethod0<SelectionTranslateWnd, &SelectionTranslateWnd::UpdateTranslateButtonState>(this);
-            langRow->AddChild(dropDstLang, 1);
-        }
-        vbox->AddChild(new Padding(langRow, DpiScaledInsets(8, 0, 0, 0)));
+        dropDstLang = newDropDown(true);
+        PopulateLanguageDropDown(dropDstLang, DefaultDestinationLanguageTemp(), false);
+        dropDstLang->onTextChanged =
+            MkMethod0<SelectionTranslateWnd, &SelectionTranslateWnd::UpdateTranslateButtonState>(this);
+        dropDstLang->onSelectionChanged =
+            MkMethod0<SelectionTranslateWnd, &SelectionTranslateWnd::UpdateTranslateButtonState>(this);
+        langRow->AddChild(dropDstLang, 1);
+        box->AddChild(langRow);
+
+        Vec<VirtText*> labels;
+        VecAppend(labels, staticPrompt);
+        VecAppend(labels, staticFromLabel);
+        AlignDlgLabels(labels);
+        vbox->AddChild(NewDlgSection(box));
     }
 
-    {
-        auto* btnRow = new HBox();
-        btnRow->alignMain = MainAxisAlign::MainEnd;
-        btnRow->alignCross = CrossAxisAlign::CrossCenter;
-        btnRow->gap = font->averageCharWidth;
+    btnClose = NewButton(Tr("Close"), false);
+    btnClose->onClick = MkMethod1<SelectionTranslateWnd, VirtMouseEvent*, &SelectionTranslateWnd::OnCloseClicked>(this);
+    btnTranslate = NewButton(Tr("Translate"), true);
+    btnTranslate->onClick =
+        MkMethod1<SelectionTranslateWnd, VirtMouseEvent*, &SelectionTranslateWnd::StartTranslation>(this);
+    vbox->AddChild(NewDlgFooter(btnClose, btnTranslate));
+    layout = vbox;
 
-        btnClose = NewButton(Tr("Close"), false);
-        btnClose->onClick =
-            MkMethod1<SelectionTranslateWnd, VirtMouseEvent*, &SelectionTranslateWnd::OnCloseClicked>(this);
-        btnRow->AddChild(btnClose);
-
-        btnTranslate = NewButton(Tr("Translate"), true);
-        btnTranslate->onClick =
-            MkMethod1<SelectionTranslateWnd, VirtMouseEvent*, &SelectionTranslateWnd::StartTranslation>(this);
-        btnTranslate->padding = DpiScaledInsets(0, 4, 0, 4);
-        btnRow->AddChild(btnTranslate);
-        vbox->AddChild(new Padding(btnRow, DpiScaledInsets(8, 0, 0, 0)));
-    }
-
-    layout = new Padding(vbox, DpiScaledInsets(12, 12));
     Relayout(true);
     UpdateTheme();
     UpdateTranslateButtonState();

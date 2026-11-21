@@ -22,6 +22,7 @@ struct MainWindow;
 struct WindowTab;
 struct DocController;
 struct DocControllerCallback;
+class EngineBase;
 
 DocControllerCallback* CreateControllerCallbackHandler(MainWindow* win);
 void DeleteControllerAsync(DocController* ctrl);
@@ -49,6 +50,7 @@ enum class SidebarResizeFrame {
 };
 void SetSidebarVisibility(MainWindow* win, bool tocVisible, bool showFavorites,
                           SidebarResizeFrame resizeFrame = SidebarResizeFrame::Keep);
+void SetTocVisibility(MainWindow* win, bool tocVisible, SidebarResizeFrame = SidebarResizeFrame::Keep);
 
 void UpdateWindowTitle(MainWindow* win);
 void RebuildMenuBar(MainWindow* win);
@@ -64,6 +66,7 @@ struct RenderedBitmap;
 void CopyTextToClipboard(MainWindow* win, Str s);
 // takes ownership of bmp
 void CopyRenderedBitmapToClipboard(MainWindow* win, RenderedBitmap* bmp);
+void CopyPngToClipboard(MainWindow* win, Str png);
 // orig's SaveDataToFile: asks where, then writes (the prompt does not block)
 void SaveDataToFile(MainWindow* win, Str fileName, Str data);
 void DeleteFileFromDiskAndHistory(Str path);
@@ -113,6 +116,10 @@ MainWindow* LoadDocument(MainWindow* win, Str path, LoadPrefs prefs = LoadPrefs:
 void OpenDroppedFiles(MainWindow* win, const Str* paths, int n);
 void SelectTabInWindow(WindowTab* tab);
 MainWindow* FindMainWindowByFile(Str file, bool focusTab, MainWindow* limitWin = nullptr);
+MainWindow* FindMainWindowToActivate(Str file, MainWindow* limitWin = nullptr);
+bool IsWinOnCurrentDesktop(MainWindow* win);
+bool CanFocusWinHere(MainWindow* win);
+bool BringWinHere(MainWindow* win);
 MainWindow* FindMainWindowBySyncFile(Str path, bool focusTab);
 struct SessionData;
 MainWindow* CreateAndShowMainWindow(SessionData* data = nullptr);
@@ -123,8 +130,13 @@ enum class PlaceWindowWhen {
 void PlaceMainWindow(MainWindow* win, SessionData* data, PlaceWindowWhen when);
 void PlaceMainWindowLater(MainWindow* win, Rect pos, bool maximize);
 void DuplicateTabInNewWindow(WindowTab* tab);
+void DuplicateTabInNewTab(WindowTab* tab);
 void ReloadDocument(MainWindow* win, bool autoRefresh);
+void StartLazyTabLoad(WindowTab* tab);
+void LoadDocumentWithEngine(MainWindow* win, Str path, EngineBase* engine);
+extern AtomicInt gTestLoadDelayMs;
 bool ForwardBrowserMsg(MainWindow* win, UINT msg, WPARAM wp, LPARAM lp);
+bool ScrollBrowserDocKey(MainWindow* win, int vk);
 // the shell's tick: the delayed reload the file watcher asked for
 void AutoReloadTick(MainWindow* win, int elapsedMs);
 // next / prev openable file in the current document's folder (no wrap)
@@ -132,6 +144,9 @@ void OpenNextPrevFileInFolder(MainWindow* win, bool forward, Str pathToDelete = 
 // the page-info tip (CmdTogglePageInfo): put it up or refresh it when the
 // user asked for it and a document is loaded
 void ShowPageInfoIfWanted(MainWindow* win);
+bool PageInfoBarTakesRow(MainWindow* win);
+bool PageInfoBarOverlays(MainWindow* win);
+void PageInfoBarTextTemp(MainWindow* win, TempStr* leftOut, TempStr* rightOut);
 #if OS_WIN
 void ShowDefaultAppNotification(MainWindow* win, const StrVec& missing);
 // orig's window picker. hwndRestore gets focus back when the picker closes.
@@ -195,6 +210,7 @@ struct SettingsApplyState {
     bool disableAntiAlias = false;
     bool chmUseFixedPageUI = false;
     bool markdownUseFixedPageUI = false;
+    bool markdownPreserveLineBreaks = false;
     bool explorerQuickLook = false;
     // owned copy of the ebook layout inputs; ApplyChangedSettingsAndRelayout frees it
     Str ebookLayout;
@@ -229,7 +245,6 @@ constexpr int kToolbarOverlay = 2;
 extern SeqStrings gToolbarModeNames;
 
 int ToolbarModeFromPrefs();
-bool ToolbarModeIsOverlay();
 bool ToolbarModeIsHidden();
 void SetToolbarMode(int mode);
 int FullscreenToolbarModeFromPrefs();

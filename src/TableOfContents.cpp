@@ -26,6 +26,7 @@
 #include "MainWindow.h"
 #include "DisplayModel.h"
 #include "Favorites.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "resource.h"
 #include "Commands.h"
@@ -37,6 +38,8 @@
 #include "FilterHighlightDraw.h"
 #include "PageThumbnails.h"
 #include "SidebarPanel.h"
+#include "SignatureUI.h"
+#include "LayersUI.h"
 #include "TableOfContents.h"
 #include "TableOfContentsCommon.h"
 #include "MenuDefs.h"
@@ -472,9 +475,27 @@ static void TocCollapseSameLevel(TreeView* tv, TreeItem ti) {
     tv->ResumeRedraw();
 }
 
+// Expand or collapse `ti` and everything under it, leaving other chapters alone.
+static void TocSetChapterExpanded(TreeView* tv, TreeItem ti, uint flag) {
+    if (!tv || !tv->hwnd) {
+        return;
+    }
+    HTREEITEM hItem = tv->GetHandleByTreeItem(ti);
+    if (!hItem) {
+        return;
+    }
+    tv->SuspendRedraw();
+    TreeViewExpandRecursively(tv->hwnd, hItem, flag, true);
+    tv->ResumeRedraw();
+}
+
 static void TocContextMenu(ContextMenuEvent* ev) {
     MainWindow* win = FindMainWindowByHwnd(ev->w->hwnd);
-    Str filePath = win->ctrl->GetFilePath();
+    if (!win || !win->ctrl) {
+        return;
+    }
+    DocController* ctrl = win->ctrl;
+    Str filePath = ctrl->GetFilePath();
 
     Point pt{};
 
@@ -491,6 +512,10 @@ static void TocContextMenu(ContextMenuEvent* ev) {
 
     WindowTab* tab = win->CurrentTab();
     HMENU popup = BuildMenuFromDef(menuDefContextToc, CreatePopupMenu(), nullptr);
+    if (!dti || !dti->child) {
+        MenuRemove(popup, CmdTocExpandChapter);
+        MenuRemove(popup, CmdTocCollapseChapter);
+    }
 
     Str path;
     Str fileName;
@@ -516,15 +541,13 @@ static void TocContextMenu(ContextMenuEvent* ev) {
 
     int attachmentNo = -1;
     if (destKind == kindDestinationAttachment) {
-        auto* attachment = (PageDestinationFile*)dest;
+        auto* attachment = (PageDestination*)dest;
         // this is a path to a file on disk, e.g. a path to opened PDF
         // with the embedded stream number
-        path = attachment->path;
+        path = attachment->value;
         // this is name of the file as set inside PDF file
         fileName = dest->GetName();
-        // hack: attachmentNo is saved in pageNo see
-        // PdfLoadAttachments and DestFromAttachment
-        attachmentNo = pageNo;
+        attachmentNo = attachment->attachmentNo;
         bool canOpenEmbedded = str::EndsWithI(fileName, StrL(".pdf"));
         if (!canOpenEmbedded) {
             MenuRemove(popup, CmdOpenAttachment);
@@ -563,11 +586,14 @@ static void TocContextMenu(ContextMenuEvent* ev) {
         MenuRemove(popup, CmdFavoriteDel);
     }
     RemoveBadMenuSeparators(popup);
-    MarkMenuOwnerDraw(popup);
     uint flags = TPM_RETURNCMD | TPM_RIGHTBUTTON;
     int cmd = TrackPopupMenu(popup, flags, pt.x, pt.y, 0, win->hwndFrame, nullptr);
-    FreeMenuOwnerDrawInfoData(popup);
     DestroyMenu(popup);
+    // the menu runs a message loop: DDE or a reload can close or replace the
+    // document meanwhile, freeing filePath, dti, dest and tab
+    if (!IsMainWindowValidAndNotClosing(win) || win->ctrl != ctrl || win->CurrentTab() != tab) {
+        return;
+    }
     switch (cmd) {
         case CmdExpandAll:
             win->tocTreeView->ExpandAll();
@@ -586,6 +612,12 @@ static void TocContextMenu(ContextMenuEvent* ev) {
             break;
         case CmdTocCollapseSameLevel:
             TocCollapseSameLevel(win->tocTreeView, ti);
+            break;
+        case CmdTocExpandChapter:
+            TocSetChapterExpanded(win->tocTreeView, ti, TVE_EXPAND);
+            break;
+        case CmdTocCollapseChapter:
+            TocSetChapterExpanded(win->tocTreeView, ti, TVE_COLLAPSE);
             break;
         case CmdExpandToCurrentPage:
             ExpandTocToCurrentPage(win);
@@ -614,6 +646,8 @@ static void TocContextMenu(ContextMenuEvent* ev) {
 }
 
 static void OnTocCustomDraw(TreeView::CustomDrawEvent* /*ev*/);
+
+static void OnTocMeasureLines(TreeView::MeasureLinesEvent* ev);
 
 void LoadTocTree(MainWindow* win) {
     WindowTab* tab = win->CurrentTab();
@@ -658,6 +692,8 @@ void LoadTocTree(MainWindow* win) {
     AutoExpandTopLevelItems(tocTree->root->child);
 
     treeView->onCustomDraw = MkFunc1Void(OnTocCustomDraw);
+    treeView->onMeasureLines = MkFunc1Void(OnTocMeasureLines);
+    treeView->SetWrapText(gSettings->tocWrapText);
     treeView->SetTreeModel(tocTree);
     if (SidebarPanel* p = SidebarPanelShowing(win, SidebarView::Bookmarks)) {
         RelayoutSidebarPanel(p);
@@ -758,6 +794,47 @@ static bool HasTocFilter(MainWindow* win) {
     return len(words) > 0;
 }
 
+constexpr int kTocPageGapDx = 8;
+// titleRect.Inflate(-2, -1) in DrawTocItemPostPaint
+constexpr int kTocTitleInsetDx = 4;
+// a pathological title doesn't get an unbounded row
+constexpr int kTocMaxLines = 20;
+
+// the width the page number takes at the right of a bookmark, with its gap
+static int TocPageReserveDx(MainWindow* win, TocItem* tocItem, Gfx& gfx, PlatformFont* font) {
+    if (!gSettings->showTocPageNumbers || !win || !win->ctrl || tocItem->pageNo <= 0) {
+        return 0;
+    }
+    TempStr label = win->ctrl->GetPageLabeTemp(tocItem->pageNo);
+    if (len(label) == 0) {
+        return 0;
+    }
+    return gfx.MeasureText(label, font).dx + DpiScale(kTocPageGapDx);
+}
+
+// TocWrapText (#1139): the rows a bookmark's title wraps to, next to its page number
+static void OnTocMeasureLines(TreeView::MeasureLinesEvent* ev) {
+    TocItem* tocItem = (TocItem*)ev->treeItem;
+    TreeView* tv = ev->treeView;
+    if (!tocItem || len(tocItem->title) == 0) {
+        return;
+    }
+    MainWindow* win = FindMainWindowByHwnd(tv->hwnd);
+    HDC hdc = GetDC(tv->hwnd);
+    PlatformFont* font = tocItem->fontFlags != 0 ? UpdateFont(hdc, tocItem->fontFlags) : tv->GetFont();
+    GfxHdc gfx(hdc);
+    int dx = ev->availDx - kTocTitleInsetDx - TocPageReserveDx(win, tocItem, gfx, font);
+    int lineDy = gfx.MeasureText(StrL("Ag"), font).dy;
+    if (dx > 0 && lineDy > 0) {
+        int textDy = HdcMeasureText(hdc, tocItem->title, dx, DT_WORDBREAK | DT_NOPREFIX, font->GetHFont()).dy;
+        // rows are rowDy tall, lines lineDy; the first line is centered in its row
+        int rowDy = std::max(TreeView_GetItemHeight(tv->hwnd), 1);
+        int needDy = textDy + std::max(rowDy - lineDy, 0);
+        ev->lines = limitValue((needDy + rowDy - 1) / rowDy, 1, kTocMaxLines);
+    }
+    ReleaseDC(tv->hwnd, hdc);
+}
+
 // POSTPAINT: redraw title (optional filter highlight), optional right-aligned
 // page label, and multi-match "current page" highlight (issue #4642).
 static void DrawTocItemPostPaint(TreeView::CustomDrawEvent* ev, MainWindow* win) {
@@ -820,7 +897,9 @@ static void DrawTocItemPostPaint(TreeView::CustomDrawEvent* ev, MainWindow* win)
     // Always repaint selected / multi-match rows so themed selection colors
     // replace Explorer's light inactive-selection face (issue #5848). Also
     // when page numbers or filter bars need drawing.
-    if (!showPage && !filterActive && !isSelected) {
+    // a wrapped title is several rows the tree only draws the first line of
+    bool isWrapped = tv->wrapText && labelRect.dy > TreeView_GetItemHeight(tv->hwnd);
+    if (!showPage && !filterActive && !isSelected && !isWrapped) {
         return;
     }
 
@@ -843,11 +922,13 @@ static void DrawTocItemPostPaint(TreeView::CustomDrawEvent* ev, MainWindow* win)
     if (showPage) {
         if (len(pageLabel) > 0) {
             pageSize = gfx.MeasureText(pageLabel, font);
-            pageReserve = pageSize.dx + DpiScale(8);
+            pageReserve = pageSize.dx + DpiScale(kTocPageGapDx);
         } else {
             showPage = false;
         }
     }
+    // the page number and a title's first line sit in the first row
+    int rowDy = isWrapped ? TreeView_GetItemHeight(tv->hwnd) : 0;
 
     Rect drawRect = ToRect(drawRc);
     gfx.FillRect(drawRect, bgCol);
@@ -856,7 +937,12 @@ static void DrawTocItemPostPaint(TreeView::CustomDrawEvent* ev, MainWindow* win)
     titleRect.dx = std::max(0, titleRect.dx - pageReserve);
     titleRect.Inflate(-2, -1);
 
-    if (filterActive) {
+    if (isWrapped) {
+        int lineDy = gfx.MeasureText(StrL("Ag"), font).dy;
+        int pad = std::max(0, (rowDy - lineDy) / 2);
+        Rect wrapRect = {titleRect.x, drawRect.y + pad, titleRect.dx, drawRect.dy - pad};
+        gfx.DrawText(tocItem->title, wrapRect, gfxTextWrap | gfxTextEllipsis, font, txtCol);
+    } else if (filterActive) {
         DrawTreeItemFilterHighlight(&gfx, titleRect, tocItem->title, words, bgCol, txtCol, font);
     } else {
         gfx.DrawText(tocItem->title, titleRect, gfxTextVCenter | gfxTextEllipsis, font, txtCol);
@@ -864,6 +950,9 @@ static void DrawTocItemPostPaint(TreeView::CustomDrawEvent* ev, MainWindow* win)
 
     if (showPage && len(pageLabel) > 0) {
         Rect pageRect = drawRect;
+        if (isWrapped) {
+            pageRect.dy = rowDy;
+        }
         pageRect.Inflate(-2, -1);
         int right = pageRect.x + pageRect.dx;
         pageRect.x = std::max(pageRect.x, right - pageSize.dx);
@@ -938,8 +1027,8 @@ void OnTocCustomDraw(TreeView::CustomDrawEvent* ev) {
             res |= CDRF_NEWFONT;
         }
         // POSTPAINT: selection colors (issue #5848), page numbers, filter, multi-match.
-        bool needPost =
-            isSelected || filterActive || (showPageNumbers && tocItem->pageNo > 0) || (multiHighlight && isMultiMatch);
+        bool needPost = isSelected || filterActive || (showPageNumbers && tocItem->pageNo > 0) ||
+                        (multiHighlight && isMultiMatch) || tv->wrapText;
         if (needPost) {
             res |= CDRF_NOTIFYPOSTPAINT;
         }
@@ -1179,6 +1268,30 @@ static LRESULT CALLBACK WndProcTocFilterEdit(HWND hwnd, UINT msg, WPARAM wp, LPA
 }
 
 // The Bookmarks and Thumbnails views; a sidebar panel shows them (SidebarPanel.cpp)
+// the visible bookmark rows, for tests: "OK rowDy=18 width=240 wrap=1", then
+// "row y=0 dy=36 title=..." each (#1139)
+TempStr TocRowsResultTemp(int* exitCodeOut) {
+    *exitCodeOut = 2;
+    MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
+    TreeView* tv = win ? win->tocTreeView : nullptr;
+    if (!tv || !tv->hwnd || !win->tocLoaded) {
+        return str::DupTemp(StrL("NOTREADY no-toc\n"));
+    }
+    *exitCodeOut = 0;
+    HWND hwnd = tv->hwnd;
+    str::Builder out;
+    int width = HwndClientRect(hwnd).dx;
+    out.Append(fmt("OK rowDy=%d width=%d wrap=%d\n", TreeView_GetItemHeight(hwnd), width, tv->wrapText ? 1 : 0));
+    for (HTREEITEM h = TreeView_GetFirstVisible(hwnd); h; h = TreeView_GetNextVisible(hwnd, h)) {
+        RECT rc{};
+        TreeView_GetItemRect(hwnd, h, &rc, FALSE);
+        TocItem* item = (TocItem*)tv->GetTreeItemByHandle(h);
+        out.Append(
+            fmt("row y=%d dy=%d title=%s\n", (int)rc.top, (int)(rc.bottom - rc.top), item ? item->title : Str{}));
+    }
+    return ToStrTemp(out);
+}
+
 void CreateToc(MainWindow* win) {
     HWND parent = win->sidebarTop->hwnd;
     auto* filterEdit = new Edit();
@@ -1226,6 +1339,8 @@ void CreateToc(MainWindow* win) {
     int dpi = DpiGetForHwnd(parent);
     win->pageThumbs = new PageThumbnailsCtrl(win, GetAppFont(), dpi, ThumbnailsHost::Sidebar);
     win->pageThumbs->SetIsVisible(false);
+    CreateSignaturesCtrl(win);
+    CreateLayersCtrl(win);
 
     UpdateControlsColors(win);
 }
@@ -1242,6 +1357,9 @@ void UpdateSidebarColors(MainWindow* win) {
     }
     win->pageThumbs->SetColor(kColListText, ThemeWindowTextColor());
     win->pageThumbs->SetColor(kColListBg, ThemeControlBackgroundColor());
+    SignaturesCtrlColorsAndDpi(win, DpiGetForHwnd(win->hwndFrame));
+    LayersCtrlColorsAndDpi(win, DpiGetForHwnd(win->hwndFrame));
+    SigBarUpdate(win);
     UpdateSidebarPanelsIcons(win);
 }
 

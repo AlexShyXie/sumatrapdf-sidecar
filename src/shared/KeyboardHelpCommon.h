@@ -25,7 +25,11 @@ static const int kSecView[] = {
 
 static const int kSecDoc[] = {
     CmdOpenFile, CmdSaveAs, CmdPrint, CmdReloadDocument,
-    CmdClose, CmdNewWindow, CmdOpenNextFileInFolder,
+    CmdClose,
+#if !OS_WASM
+    CmdNewWindow,
+#endif
+    CmdOpenNextFileInFolder,
     CmdOpenPrevFileInFolder, CmdRenameFile, CmdProperties, 0,
 };
 
@@ -37,7 +41,7 @@ static const int kSecFind[] = {
 
 static const int kSecTabs[] = {
     CmdNextTabSmart, CmdNextTab, CmdPrevTab,
-    CmdMoveTabLeft, CmdMoveTabRight, CmdReopenLastClosedFile, 0,
+    CmdMoveTabLeft, CmdMoveTabRight, CmdNewTab, CmdReopenLastClosedFile, 0,
 };
 
 static const int kSecAnnot[] = {
@@ -46,7 +50,7 @@ static const int kSecAnnot[] = {
 };
 
 static const int kSecIface[] = {
-    CmdCommandPalette, CmdToggleBookmarks, CmdToggleToolbar, CmdToggleMenuBar,
+    CmdCommandPalette, CmdToggleBookmarks, CmdToggleToolbar, CmdToggleCaption, CmdToggleMenuBar,
     CmdToggleCursorPosition, CmdTogglePageInfo,
     CmdFavoriteAdd, CmdFavoriteToggle, CmdHelpOpenManual,0,
 };
@@ -87,9 +91,11 @@ static const struct {
     {CmdFindPrev, "Shift + F3"}, {CmdSelectAll, "Ctrl + A"}, {CmdCopySelection, "Ctrl + C"},
     {CmdSelectTextViaKeyboard, "F7"}, {CmdToggleKeyboardLinkFollowing, "Shift + F"}, {CmdNextTabSmart, "Ctrl + Tab"},
     {CmdNextTab, "Ctrl + Page Down"}, {CmdPrevTab, "Ctrl + Page Up"}, {CmdMoveTabLeft, "Ctrl + Shift + Page Up"},
-    {CmdMoveTabRight, "Ctrl + Shift + Page Down"}, {CmdReopenLastClosedFile, "Ctrl + Shift + T"},
+    {CmdMoveTabRight, "Ctrl + Shift + Page Down"}, {CmdNewTab, "Ctrl + T"},
+    {CmdReopenLastClosedFile, "Ctrl + Shift + T"},
     {CmdCreateAnnotHighlight, "A"}, {CmdCreateAnnotUnderline, "U"}, {CmdSaveAnnotations, "Ctrl + Shift + S"},
     {CmdDeleteAnnotation, "Ctrl + Delete"}, {CmdToggleBookmarks, "F12"}, {CmdToggleToolbar, "F8"},
+    {CmdToggleCaption, "Shift + F8"},
     {CmdToggleMenuBar, "F9"}, {CmdToggleCursorPosition, "M"}, {CmdTogglePageInfo, "I"}, {CmdCommandPalette, "Ctrl + K"},
     {CmdFavoriteAdd, "Ctrl + B"}, {CmdHelpOpenManual, "F1"}, {CmdToggleKeyboardHelp, "?"},
 };

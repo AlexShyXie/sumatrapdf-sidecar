@@ -375,10 +375,59 @@ void fz_drop_context_windows(fz_context* ctx) {
 
 static Pixmap* PixmapFromFzPixmap(fz_context* ctx, fz_pixmap* pix);
 
+// Decoding contexts are pooled: a fresh context parses the default ICC
+// profiles and the first conversion builds an lcms link, which together cost
+// more than decoding a typical ebook image. A pooled context keeps both in its
+// store across images and threads. The store is small so cached decoded
+// pixmaps don't pile up; a link weighs 1000 bytes there and survives.
+constexpr size_t kImageCtxStoreSize = 8 << 20;
+constexpr int kMaxPooledImageCtx = 8;
+
+static Mutex gImageCtxLock;
+static Vec<fz_context*> gImageCtxPool;
+
+static fz_context* AcquireImageCtx() {
+    {
+        ScopedMutex lock(&gImageCtxLock);
+        if (len(gImageCtxPool) > 0) {
+            return VecPop(gImageCtxPool);
+        }
+    }
+    return fz_new_context_windows(kImageCtxStoreSize);
+}
+
+static void ReleaseImageCtx(fz_context* ctx) {
+    {
+        ScopedMutex lock(&gImageCtxLock);
+        if (len(gImageCtxPool) < kMaxPooledImageCtx) {
+            VecAppend(gImageCtxPool, ctx);
+            return;
+        }
+    }
+    fz_drop_context_windows(ctx);
+}
+
+void FreeImageCtxPool() {
+    ScopedMutex lock(&gImageCtxLock);
+    for (fz_context* ctx : gImageCtxPool) {
+        fz_drop_context_windows(ctx);
+    }
+    VecReset(gImageCtxPool);
+}
+
+// fz_image::orientation, in MuPDF's numbering, as the EXIF Orientation value
+int FzOrientationToExif(u8 fzOrientation) {
+    static const u8 kExif[9] = {0, 1, 8, 3, 6, 2, 5, 4, 7};
+    return fzOrientation < dimof(kExif) ? kExif[fzOrientation] : 0;
+}
+
+// MuPDF decodes the image as stored and leaves its EXIF orientation to the
+// caller: a JPEG with orientation 6 showed sideways (#6470)
 static Pixmap* PixmapFromImageData(fz_context* ctx, const u8* data, size_t n) {
     fz_buffer* buf = nullptr;
     fz_image* img = nullptr;
     fz_pixmap* pix = nullptr;
+    int exifOrientation = 0;
 
     fz_var(buf);
     fz_var(img);
@@ -387,6 +436,7 @@ static Pixmap* PixmapFromImageData(fz_context* ctx, const u8* data, size_t n) {
     fz_try(ctx) {
         buf = fz_new_buffer_from_shared_data(ctx, data, n);
         img = fz_new_image_from_buffer(ctx, buf);
+        exifOrientation = FzOrientationToExif(img->orientation);
         pix = fz_get_pixmap_from_image(ctx, img, nullptr, nullptr, nullptr, nullptr);
     }
     fz_always(ctx) {
@@ -399,7 +449,8 @@ static Pixmap* PixmapFromImageData(fz_context* ctx, const u8* data, size_t n) {
         return nullptr;
     }
 
-    return pix ? PixmapFromFzPixmap(ctx, pix) : nullptr;
+    Pixmap* res = pix ? PixmapFromFzPixmap(ctx, pix) : nullptr;
+    return PixmapApplyExifOrientation(res, exifOrientation);
 }
 
 // Standalone JPEG → packed C,M,Y,K (stride = w*4). 0 = no ink (PDF polarity).
@@ -558,7 +609,7 @@ Pixmap* PixmapFromDataFz(Str d) {
         return nullptr;
     }
 
-    fz_context* ctx = fz_new_context_windows();
+    fz_context* ctx = AcquireImageCtx();
     if (!ctx) {
         return nullptr;
     }
@@ -579,7 +630,7 @@ Pixmap* PixmapFromDataFz(Str d) {
         result = PixmapFromImageData(ctx, data, n);
     }
 
-    fz_drop_context_windows(ctx);
+    ReleaseImageCtx(ctx);
 
     return result;
 }
@@ -589,39 +640,15 @@ static Pixmap* PixmapFromDataFzAny(Str d) {
     if (len(d) <= 0 || len(d) > INT_MAX) {
         return nullptr;
     }
-    fz_context* ctx = fz_new_context_windows();
+    fz_context* ctx = AcquireImageCtx();
     if (!ctx) {
         return nullptr;
     }
     Pixmap* result = PixmapFromImageData(ctx, (const u8*)d.s, (size_t)len(d));
-    fz_drop_context_windows(ctx);
+    ReleaseImageCtx(ctx);
     return result;
 }
 #endif
-
-// adapted from http://cpansearch.perl.org/src/RJRAY/Image-Size-3.230/lib/Image/Size.pm
-// Cheap size probe (header parse, else full decode). Returns empty Size on failure.
-Size ImageSizeFromData(Str d) {
-    Size result;
-    FileTypeInfo fti = GuessFileInfoFromData(d);
-    if (fti.hasImageSize) {
-        result = Size(fti.imageDx, fti.imageDy);
-    } else if (fti.imageSizes) {
-        // multi-image file (animated GIF, multi-page TIFF, ...): the first image
-        result = fti.imageSizes[0];
-    }
-    FreeFileTypeInfo(&fti);
-    if (!result.IsEmpty()) {
-        return result;
-    }
-    // try expensive way of getting the info by decoding the image
-    Pixmap* px = PixmapFromData(d);
-    if (px) {
-        result = Size(px->width, px->height);
-        FreePixmap(px);
-    }
-    return result;
-}
 
 #if OS_WIN
 
@@ -972,32 +999,6 @@ Vec<Pixmap*> PixmapsFromData(Str bmpData) {
         VecAppend(res, px);
     }
     return res;
-}
-
-// Load path into a RenderedBitmap (Windows); nullptr on POSIX for now.
-RenderedBitmap* LoadRenderedBitmap(Str path) {
-    if (len(path) == 0) {
-        return nullptr;
-    }
-    Str data = file::ReadFile(path);
-    if (len(data) == 0) {
-        return nullptr;
-    }
-
-    Gdiplus::Bitmap* bmp = NewGdiplusBitmapFromPixmap(PixmapFromData(data));
-    str::Free(data);
-    if (!bmp) {
-        return nullptr;
-    }
-
-    HBITMAP hbmp = nullptr;
-    RenderedBitmap* rendered = nullptr;
-    if (bmp->GetHBITMAP((Gdiplus::ARGB)Gdiplus::Color::White, &hbmp) == Gdiplus::Ok) {
-        rendered = new RenderedBitmap(hbmp, Size((int)bmp->GetWidth(), (int)bmp->GetHeight()));
-    }
-    delete bmp;
-
-    return rendered;
 }
 
 #else
@@ -1537,10 +1538,6 @@ Vec<Pixmap*> PixmapsFromData(Str bmpData) {
         VecAppend(res, px);
     }
     return res;
-}
-
-RenderedBitmap* LoadRenderedBitmap(Str) {
-    return nullptr;
 }
 
 #endif

@@ -37,6 +37,7 @@ extern "C" {
 #include "TextSearch.h"
 #include "MainWindow.h"
 #include "SumatraPDF.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "PagePosition.h"
 #include "Selection.h"
@@ -52,6 +53,7 @@ extern "C" {
 #include "EbookBase.h"
 #include "ChmFile.h"
 #include "RefHover.h"
+#include "Notifications.h"
 #include "SumatraTest.h"
 
 // internal LZX test hook, defined in chm.c but not exposed in chm.h
@@ -352,6 +354,75 @@ TempStr RectSelectionDragResultTemp(Str word, int* exitCodeOut) {
     }
     if (exitCodeOut) {
         *exitCodeOut = ok ? 0 : 1;
+    }
+    return ToStrTemp(out);
+}
+
+// Drag-selects `word` on page 1 from its first glyph's outer edge to its last
+// glyph's (issue #6488): in right-to-left text the first glyph's outer edge is
+// its right one. Reports the selected text and the glyph range.
+TempStr SelectWordEdgesResultTemp(Str word, int* exitCodeOut) {
+    str::Builder out;
+    auto fail = [&](Str msg) -> Str {
+        out.Append(msg);
+        out.AppendChar('\n');
+        if (exitCodeOut) {
+            *exitCodeOut = 1;
+        }
+        return ToStrTemp(out);
+    };
+
+    if (len(gWindows) == 0) {
+        return fail(StrL("NOTREADY no-window"));
+    }
+    DisplayModel* dm = gWindows[0]->AsFixed();
+    if (!dm || !dm->textSelection) {
+        return fail(StrL("NOTREADY no-doc"));
+    }
+    const int pageNo = 1;
+    Rect* coords = nullptr;
+    int textLen = 0;
+    Str text = dm->GetEngine()->GetTextForPage(pageNo, &textLen, &coords);
+    int wordLen = Utf8CodepointCount(word);
+    int first = -1;
+    for (int i = 0; i <= textLen - wordLen; i++) {
+        if (str::Eq(Utf8SliceByCodepoints(text, i, wordLen), word)) {
+            first = i;
+            break;
+        }
+    }
+    if (first < 0 || wordLen < 2) {
+        return fail(StrL("ERROR word-not-found"));
+    }
+    int last = first + wordLen - 1;
+
+    // a point inside glyph i, near its edge away from glyph `other`
+    auto outerEdge = [&](int i, int other) -> PointF {
+        const Rect& r = coords[i];
+        float cx = (float)r.x + ((float)r.dx / 2.f);
+        float ocx = (float)coords[other].x + ((float)coords[other].dx / 2.f);
+        float dx = (float)r.dx * 0.4f;
+        return {ocx < cx ? cx + dx : cx - dx, (float)r.y + ((float)r.dy / 2.f)};
+    };
+    PointF p0 = outerEdge(first, first + 1);
+    PointF p1 = outerEdge(last, last - 1);
+
+    for (int i = std::max(first - 2, 0); i <= std::min(last + 2, textLen - 1); i++) {
+        const Rect& r = coords[i];
+        out.Append(fmt("glyph %d: x=%d dx=%d y=%d dy=%d\n", i, r.x, r.dx, r.y, r.dy));
+    }
+    out.Append(fmt("p0=%g,%g p1=%g,%g\n", p0.x, p0.y, p1.x, p1.y));
+
+    TextSelection* sel = dm->textSelection;
+    sel->Reset();
+    sel->StartAt(pageNo, p0.x, p0.y);
+    sel->SelectUpTo(pageNo, p1.x, p1.y);
+    TempStr selected = sel->ExtractTextTemp(StrL(" "));
+    out.Append(
+        fmt("OK first=%d last=%d start=%d end=%d\ntext=%s\n", first, last, sel->startGlyph, sel->endGlyph, selected));
+    sel->Reset();
+    if (exitCodeOut) {
+        *exitCodeOut = 0;
     }
     return ToStrTemp(out);
 }
@@ -770,174 +841,6 @@ TempStr ScrollToLinkResultTemp(int minViewportDelta, int* exitCodeOut) {
     return ToStrTemp(out);
 }
 
-// Verifies Tr resolves error-path strings through the translation table.
-TempStr I18nErrorStringResultTemp(int* exitCodeOut) {
-    str::Builder out;
-    Str err = Tr("Error");
-    Str crash = Tr("SumatraPDF crashed");
-    Str printers = Tr("SumatraPDF - Show Printers");
-    bool ok = len(err) > 0 && len(crash) > 0 && len(printers) > 0 &&
-              str::Eq(err, trans::GetTranslation(StrL("Error"))) &&
-              str::Eq(crash, trans::GetTranslation(StrL("SumatraPDF crashed"))) &&
-              str::Eq(printers, trans::GetTranslation(StrL("SumatraPDF - Show Printers")));
-    if (ok) {
-        out.Append(fmt("OK error=%s crash=%s printers=%s\n", err, crash, printers));
-    } else {
-        out.Append(fmt("FAIL error=%s crash=%s printers=%s\n", err ? err : StrL("(null)"),
-                       crash ? crash : StrL("(null)"), printers ? printers : StrL("(null)")));
-    }
-    if (exitCodeOut) {
-        *exitCodeOut = ok ? 0 : 1;
-    }
-    return ToStrTemp(out);
-}
-
-// Open any document, render page 1, and report dest size plus how many
-// red-ish / non-white pixels it has. Used to check that a WebP inside an
-// EPUB actually paints (issue #3415) instead of the IMAGE placeholder.
-TempStr PageRenderColorsResultTemp(Str path, int* exitCodeOut, int pageNo, int zoomPercent) {
-    str::Builder out;
-    auto fail = [&out, exitCodeOut](Str msg) {
-        if (exitCodeOut) {
-            *exitCodeOut = 1;
-        }
-        out.Append(msg);
-        return ToStrTemp(out);
-    };
-
-    EngineBase* engine = nullptr;
-    bool ownEngine = true;
-    if (len(gWindows) > 0 && gWindows[0]) {
-        WindowTab* tab = gWindows[0]->CurrentTab();
-        if (tab && tab->filePath && str::EqI(tab->filePath, path)) {
-            DisplayModel* dm = tab->AsFixed();
-            engine = dm ? dm->GetEngine() : nullptr;
-            ownEngine = false;
-        }
-    }
-    if (!engine) {
-        engine = CreateEngineFromFile(path, nullptr, false);
-    }
-    if (!engine) {
-        return fail(fmt("ERROR engine-create-failed path=%s\n", path));
-    }
-    if (pageNo < 1) {
-        pageNo = 1;
-    }
-    auto release = [&]() {
-        if (ownEngine) {
-            SafeEngineRelease(&engine);
-        }
-    };
-    if (pageNo > engine->PageCount()) {
-        int nPages = engine->PageCount();
-        release();
-        return fail(fmt("ERROR bad-page page=%d pages=%d\n", pageNo, nPages));
-    }
-    if (!engine->BenchLoadPage(pageNo)) {
-        release();
-        return fail(StrL("ERROR page-load-failed\n"));
-    }
-
-    float zoom = zoomPercent > 0 ? (float)zoomPercent / 100.f : 1.f;
-    RenderPageArgs rargs(pageNo, zoom, 0, nullptr, RenderTarget::Export);
-    Pixmap* bmp = engine->RenderPage(rargs);
-    if (!bmp || !bmp->data) {
-        FreePixmap(bmp);
-        int nPages = engine->PageCount();
-        release();
-        return fail(fmt("ERROR render-failed page=%d pages=%d\n", pageNo, nPages));
-    }
-    Pixmap* rgb = bmp;
-    if (bmp->format != PixmapFormat::BGRA8 && bmp->format != PixmapFormat::BGR8 && bmp->format != PixmapFormat::RGBA8) {
-        rgb = PixmapCopyAs32bppDIB(bmp);
-    }
-    if (!rgb || !rgb->data) {
-        FreePixmap(bmp);
-        release();
-        return fail(fmt("ERROR pixmap-convert-failed fmt=%d\n", (int)bmp->format));
-    }
-    int bpp = PixmapBytesPerPixel(rgb->format);
-    int red = 0;
-    int blue = 0;
-    int nonWhite = 0;
-    int gray = 0;
-    // bounding box of the non-white pixels
-    int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
-    int rMin = 255, rMax = 0, gMin = 255, gMax = 0, bMin = 255, bMax = 0;
-    if (bpp >= 3) {
-        for (int y = 0; y < rgb->height; y++) {
-            const u8* row = rgb->data + ((size_t)y * (size_t)rgb->stride);
-            for (int x = 0; x < rgb->width; x++) {
-                const u8* px = row + ((size_t)x * bpp);
-                int r, g, b;
-                if (rgb->format == PixmapFormat::RGBA8) {
-                    r = px[0];
-                    g = px[1];
-                    b = px[2];
-                } else {
-                    b = px[0];
-                    g = px[1];
-                    r = px[2];
-                }
-                if (r < 250 || g < 250 || b < 250) {
-                    if (nonWhite == 0) {
-                        bx0 = x, by0 = y, bx1 = x + 1, by1 = y + 1;
-                    }
-                    bx0 = std::min(bx0, x);
-                    by0 = std::min(by0, y);
-                    bx1 = std::max(bx1, x + 1);
-                    by1 = std::max(by1, y + 1);
-                    nonWhite++;
-                }
-                // mid-tones: what a blurred black-and-white image is made of
-                if (r >= 64 && r <= 192 && g >= 64 && g <= 192 && b >= 64 && b <= 192) {
-                    gray++;
-                }
-                if (r > 180 && g < 80 && b < 80) {
-                    red++;
-                }
-                if (b > 180 && r < 80 && g < 80) {
-                    blue++;
-                }
-                if (r < rMin) {
-                    rMin = r;
-                }
-                if (r > rMax) {
-                    rMax = r;
-                }
-                if (g < gMin) {
-                    gMin = g;
-                }
-                if (g > gMax) {
-                    gMax = g;
-                }
-                if (b < bMin) {
-                    bMin = b;
-                }
-                if (b > bMax) {
-                    bMax = b;
-                }
-            }
-        }
-    }
-    int spread = (rMax - rMin) + (gMax - gMin) + (bMax - bMin);
-    out.Append(fmt("red=%d nonwhite=%d size=%dx%d pages=%d page=%d blue=%d spread=%d gray=%d box=%d,%d,%d,%d\n", red,
-                   nonWhite, rgb->width, rgb->height, engine->PageCount(), pageNo, blue, spread, gray, bx0, by0, bx1,
-                   by1));
-    if (rgb != bmp) {
-        FreePixmap(rgb);
-    }
-    FreePixmap(bmp);
-    if (ownEngine) {
-        SafeEngineRelease(&engine);
-    }
-    if (exitCodeOut) {
-        *exitCodeOut = 0;
-    }
-    return ToStrTemp(out);
-}
-
 // Extracts the first image of a page the way Copy Image / Save Image do and
 // reports its size and corner colors, so a test can check it is oriented the
 // way it is drawn on the page (issue #6214).
@@ -1286,13 +1189,58 @@ TempStr RefHoverResultTemp(Str action, int x, int y, int* exitCodeOut) {
             return fmt("ERROR no-link x=%d y=%d", x, y);
         }
     }
+    // canvas point of the current page's x-th EPUB footnote link, to click
+    if (str::Eq(action, StrL("noteref")) && dm) {
+        int pageNo = dm->CurrentPageNo();
+        int n = 0;
+        for (IPageElement* el : dm->GetEngine()->GetElements(pageNo)) {
+            IPageDestination* dest = el && el->Is(kindPageElementDest) ? el->AsLink() : nullptr;
+            if (!dest || !dest->isNoteRef) {
+                continue;
+            }
+            // skip the zero-width link mupdf adds at the <a>'s anchor
+            RectF r = el->GetRect();
+            if (r.dx <= 0.f || n++ < x) {
+                continue;
+            }
+            Point pt = dm->CvtToScreen(pageNo, PointF(r.x + (r.dx / 2), r.y + (r.dy / 2)));
+            return fmt("OK noteref=%d,%d page=%d rect=%g,%g,%g,%g", pt.x, pt.y, pageNo, r.x, r.y, r.dx, r.dy);
+        }
+        if (exitCodeOut) {
+            *exitCodeOut = 1;
+        }
+        return fmt("ERROR no-noteref page=%d", pageNo);
+    }
     RefHoverState* s = win ? win->refHover : nullptr;
     if (!s || !s->hwndPopup || !HwndIsVisible(s->hwndPopup)) {
         return fmt("OK visible=0");
     }
     auto& d = s->displayed;
-    return fmt("OK visible=1 hwnd=%d page=%d y=%d zoom=%d", (int)(INT_PTR)s->hwndPopup, d.destPage, (int)d.region.y,
-               (int)(d.userZoom * 100));
+    return fmt("OK visible=1 hwnd=%d page=%d y=%d zoom=%d x=%d", (int)(INT_PTR)s->hwndPopup, d.destPage,
+               (int)d.region.y, (int)(d.userZoom * 100), (int)d.region.x);
+}
+
+// The current document: from a temporary folder?, is the notification about
+// that up, and its path. "dismiss" closes the notification the way its close
+// button does. Used by tests/issue-6437.ts
+TempStr TemporaryFileResultTemp(Str action, int* exitCodeOut) {
+    if (exitCodeOut) {
+        *exitCodeOut = 0;
+    }
+    MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
+    WindowTab* tab = win ? win->CurrentTab() : nullptr;
+    if (!tab || len(tab->filePath) == 0 || !win->IsDocLoaded()) {
+        if (exitCodeOut) {
+            *exitCodeOut = 2;
+        }
+        return str::DupTemp(StrL("NOTREADY no-doc"));
+    }
+    NotificationWnd* wnd = GetNotificationForGroup(win, kNotifTemporaryFile);
+    if (str::Eq(action, StrL("dismiss")) && wnd) {
+        CloseNotification(wnd, NotifCloseReason::User);
+    }
+    return fmt("OK temp=%d notif=%d show=%d path=%s", IsTemporaryFile(tab->filePath) ? 1 : 0, wnd ? 1 : 0,
+               gSettings->temporaryFileShowNotification ? 1 : 0, tab->filePath);
 }
 
 // The current tab's pages: each page's width, which a test gives a unique value
@@ -1353,10 +1301,11 @@ TempStr SidebarThumbnailsResultTemp(int* exitCodeOut) {
     sb.Append(fmt(" ring=%d", (int)thumbs->HasFlag(vwfFocused)));
     // e.g. top=1234,1,thumbnails,110,010:2,2,22,22;26,2,22,22;50,2,22,22
     // (enabled icons, selected icon, icon rects in order B, T, F)
-    SidebarPanel* panels[] = {win->sidebarTop, win->sidebarBottom};
-    bool visible[] = {win->uiState.sidebarTopVisible, win->uiState.sidebarBottomVisible};
-    Str names[] = {StrL("top"), StrL("bottom")};
-    for (int i = 0; i < 2; i++) {
+    SidebarPanel* panels[] = {win->sidebarTop, win->sidebarMiddle, win->sidebarBottom};
+    const MainWindow::UIState& ui = win->uiState;
+    bool visible[] = {ui.sidebarTopVisible, ui.sidebarMiddleVisible, ui.sidebarBottomVisible};
+    Str names[] = {StrL("top"), StrL("middle"), StrL("bottom")};
+    for (int i = 0; i < 3; i++) {
         SidebarPanel* p = panels[i];
         sb.Append(fmt(" %s=%d,%d,%s,", names[i], (int)(intptr_t)p->hwnd, (int)visible[i], SidebarViewToStr(p->view)));
         for (VirtIconButton* b : p->viewBtns) {

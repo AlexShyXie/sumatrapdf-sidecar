@@ -4,6 +4,7 @@
 struct DocController;
 struct ChmModel;
 struct MarkdownModel;
+struct BrowserDocController;
 struct DisplayModel;
 struct IPageElement;
 struct IPageDestination;
@@ -78,11 +79,14 @@ struct DocControllerCallback {
     virtual void PagesRenumbered(DisplayModel* dm) = 0;
 };
 
+struct DocController;
+extern Func1<DocController*> gOnDocControllerDestroyed;
+
 struct DocController {
     DocControllerCallback* cb;
 
     explicit DocController(DocControllerCallback* cb) : cb(cb) { ReportIf(!cb); }
-    virtual ~DocController() = default;
+    virtual ~DocController();
 
     // meta data
     virtual Str GetFilePath() const = 0;
@@ -189,11 +193,14 @@ struct DocController {
     virtual DisplayModel* AsFixed() { return nullptr; }
     virtual ChmModel* AsChm() { return nullptr; }
     virtual MarkdownModel* AsMarkdown() { return nullptr; }
+    virtual BrowserDocController* AsBrowser() { return nullptr; }
 };
 
 struct BrowserDocController : DocController {
     explicit BrowserDocController(DocControllerCallback* cb);
     ~BrowserDocController() override;
+
+    BrowserDocController* AsBrowser() override { return this; }
 
     int PageCount() const override;
     int CurrentPageNo() const override;
@@ -237,11 +244,11 @@ struct BrowserDocController : DocController {
     void SaveHtmlScrollPos();
     void SaveHtmlScrollPosForPage(int pageNo);
     void SaveHtmlScrollPosForUrl(Str url, PointF pos);
-    bool GetSavedHtmlScrollPosForPage(int pageNo, PointF* pos) const;
     bool GetSavedHtmlScrollPosForUrl(Str url, PointF* pos) const;
     void RestoreHtmlScrollPos();
     Str GetCachedData(Str url) const;
     Str CacheData(Str url, Str data);
+    void GetCachedUrls(StrVec& urls);
 
     StrVec pages;
     int currentPageNo = 1;
@@ -279,5 +286,5 @@ struct BrowserDocController : DocController {
 };
 
 inline bool IsBrowserDocController(DocController* ctrl) {
-    return ctrl && (ctrl->AsChm() || ctrl->AsMarkdown());
+    return ctrl && ctrl->AsBrowser();
 }

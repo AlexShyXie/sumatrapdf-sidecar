@@ -20,6 +20,7 @@
 #include "DisplayMode.h"
 #include "Flags.h"
 #include "Commands.h"
+#include "AIChatTypes.h"
 #include "AIChatCommon.h"
 #include "SystemFonts.h"
 
@@ -34,6 +35,13 @@ void install_load_mac_font_funcs(fz_context* ctx);
 }
 #endif
 
+extern "C" {
+#include <mupdf/fitz.h>
+#include <mupdf/ucdn.h>
+}
+#include "mupdf/noto_sumatra.h"
+#include "EmbeddedResources.h"
+
 // must be last to over-write assert()
 #include "base/tests/UtAssert.h"
 
@@ -42,15 +50,23 @@ void BenchRangeTest();
 void versioncheck_test();
 void hexstrTest();
 void colorTest();
+void PngSizeTest();
 void parseCommandsTest();
 void DocPropertiesTest();
 void ParseFileArgsTest();
+void ParseCommandLineTest();
+void HexViewTest();
 void RestrictedUseConfigTest();
+void ControlFrameActionTest();
+void OpenDdeCmdTest();
+void UpdateCheckDecisionTest();
 
 void CachedObjects_UnitTests();
 void CommandPaletteModel_UnitTests();
 void ImageReader_UnitTests();
 bool RenderCache_UnitTestCookieUnlocked();
+bool RenderCache_UnitTestFullOfOneVisiblePage();
+bool RenderCache_UnitTestFullOfOldZoom();
 
 #if OS_POSIX && !OS_WASM
 static void AIChatProcessTest() {
@@ -126,6 +142,71 @@ static void OpenMarkdownWithSystemFonts(fz_context* ctx) {
 }
 #endif
 
+// which font file the built-in font table asks the loader for
+static const char* gAskedFont = nullptr;
+static bool gHaveSourceHan = true;
+
+static const unsigned char* StubFontLoader(const char* fileName, int* size) {
+    static const unsigned char kData[] = {0};
+    if (!gHaveSourceHan && str::StartsWith(Str(fileName), StrL("SourceHan"))) {
+        *size = 0;
+        return nullptr;
+    }
+    gAskedFont = fileName;
+    *size = (int)sizeof(kData);
+    return kData;
+}
+
+static bool AskedFor(fz_context* ctx, int script, int lang, Str fileName, int subfont) {
+    int size = 0;
+    int sub = -1;
+    gAskedFont = nullptr;
+    const unsigned char* data = fz_lookup_noto_font(ctx, script, lang, &size, &sub);
+    return data && gAskedFont && str::Eq(Str(gAskedFont), fileName) && sub == subfont;
+}
+
+// CJK text tagged with a language gets that language's Source Han Serif face;
+// untagged text, or a failed download, gets Droid Sans Fallback
+static void BuiltinFontTableTest() {
+    fz_context* ctx = fz_new_context(nullptr, nullptr, FZ_STORE_UNLIMITED);
+    utassert(ctx);
+    fz_set_builtin_font_loader(StubFontLoader);
+
+    Str han = StrL("SourceHanSerif-Regular.ttc");
+    Str droid = StrL("DroidSansFallbackFull.ttf");
+    utassert(AskedFor(ctx, UCDN_SCRIPT_HAN, FZ_LANG_ja, han, 0));
+    utassert(AskedFor(ctx, UCDN_SCRIPT_HIRAGANA, FZ_LANG_ja, han, 0));
+    utassert(AskedFor(ctx, UCDN_SCRIPT_HAN, FZ_LANG_ko, han, 1));
+    utassert(AskedFor(ctx, UCDN_SCRIPT_HANGUL, FZ_LANG_ko, han, 1));
+    utassert(AskedFor(ctx, UCDN_SCRIPT_HAN, FZ_LANG_zh_Hans, han, 2));
+    utassert(AskedFor(ctx, UCDN_SCRIPT_HAN, FZ_LANG_zh_Hant, han, 3));
+    utassert(AskedFor(ctx, UCDN_SCRIPT_HAN, FZ_LANG_UNSET, droid, 0));
+    utassert(AskedFor(ctx, UCDN_SCRIPT_HANGUL, FZ_LANG_UNSET, droid, 0));
+
+    // fonts mupdf leaves out of its table by default for size
+    utassert(AskedFor(ctx, UCDN_SCRIPT_TANGUT, FZ_LANG_UNSET, StrL("NotoSerifTangut-Regular.otf"), 0));
+    utassert(AskedFor(ctx, UCDN_SCRIPT_SIGNWRITING, FZ_LANG_UNSET, StrL("NotoSansSignWriting-Regular.otf"), 0));
+
+    gHaveSourceHan = false;
+    utassert(AskedFor(ctx, UCDN_SCRIPT_HAN, FZ_LANG_ja, droid, 0));
+    gHaveSourceHan = true;
+
+    InstallEmbeddedFontLoader();
+    fz_drop_context(ctx);
+}
+
+// a downloaded font must match the sha1 prefix in its file name
+static void FontMatchesFileNameTest() {
+    Str abc = StrL("abc"); // sha1 a9993e364706816aba3e25717850c26c9cd0d89d
+    utassert(FontMatchesFileName(StrL("Font-a999.ttf"), abc));
+    utassert(FontMatchesFileName(StrL("Font-Regular-A9993E36.otf"), abc));
+    utassert(!FontMatchesFileName(StrL("Font-a998.ttf"), abc));
+    utassert(!FontMatchesFileName(StrL("Font-Regular-a9993e.cff"), StrL("<html>")));
+    // nothing to check against
+    utassert(FontMatchesFileName(StrL("Font-Regular.otf"), abc));
+    utassert(FontMatchesFileName(StrL("Font.ttf"), abc));
+}
+
 #if OS_LINUX || OS_DARWIN
 static void PlatformSystemFontTest() {
     fz_context* ctx = fz_new_context(nullptr, nullptr, FZ_STORE_UNLIMITED);
@@ -170,137 +251,6 @@ static void SystemFontNamesTest() {
 }
 #endif
 
-#if OS_WIN
-static void ParseCommandLineTest() {
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), L"SumatraPDF.exe -install -no-desktop-shortcut", i);
-        utassert(i.install);
-        utassert(i.noDesktopShortcut);
-        utassert(0 == len(i.fileNames));
-    }
-
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), L"SumatraPDF.exe -start-perf-log -log-perf-file c:\\tmp\\perf.txt foo.pdf", i);
-        utassert(i.startPerfLog);
-        utassert(str::Eq(i.perfLogFile, StrL("c:\\tmp\\perf.txt")));
-        utassert(1 == len(i.fileNames));
-    }
-
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), L"SumatraPDF.exe -bench foo.pdf", i);
-        utassert(2 == len(i.pathsToBenchmark));
-        utassert(str::Eq(StrL("foo.pdf"), i.pathsToBenchmark[0]));
-        utassert(len(i.pathsToBenchmark[1]) == 0);
-    }
-
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), L"SumatraPDF.exe -bench foo.pdf -fwdsearch-width 5", i);
-        utassert(len(i.globalPrefArgs) == 2);
-        Str s = i.globalPrefArgs[0];
-        utassert(str::Eq(s, StrL("-fwdsearch-width")));
-        s = i.globalPrefArgs[1];
-        utassert(str::Eq(s, StrL("5")));
-        utassert(2 == len(i.pathsToBenchmark));
-        utassert(str::Eq(StrL("foo.pdf"), i.pathsToBenchmark[0]));
-        utassert(len(i.pathsToBenchmark[1]) == 0);
-    }
-
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), L"SumatraPDF.exe -bench bar.pdf loadonly", i);
-        utassert(2 == len(i.pathsToBenchmark));
-        utassert(str::Eq(StrL("bar.pdf"), i.pathsToBenchmark[0]));
-        utassert(str::Eq(StrL("loadonly"), i.pathsToBenchmark[1]));
-    }
-
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), L"SumatraPDF.exe -bench bar.pdf 1 -set-color-range 0x123456 #abCDef", i);
-        utassert(len(i.globalPrefArgs) == 3);
-        utassert(2 == len(i.pathsToBenchmark));
-        utassert(str::Eq(StrL("bar.pdf"), i.pathsToBenchmark[0]));
-        utassert(str::Eq(StrL("1"), i.pathsToBenchmark[1]));
-    }
-
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), L"SumatraPDF.exe -bench bar.pdf 1-5,3   -bench some.pdf 1,3,8-34", i);
-        utassert(4 == len(i.pathsToBenchmark));
-        utassert(str::Eq(StrL("bar.pdf"), i.pathsToBenchmark[0]));
-        utassert(str::Eq(StrL("1-5,3"), i.pathsToBenchmark[1]));
-        utassert(str::Eq(StrL("some.pdf"), i.pathsToBenchmark[2]));
-        utassert(str::Eq(StrL("1,3,8-34"), i.pathsToBenchmark[3]));
-    }
-
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), L"SumatraPDF.exe -presentation -bgcolor 0xaa0c13 foo.pdf -invert-colors bar.pdf", i);
-        utassert(true == i.enterPresentation);
-        utassert(true == i.invertColors);
-        utassert(2 == len(i.fileNames));
-        utassert(0 == i.fileNames.Find(StrL("foo.pdf")));
-        utassert(1 == i.fileNames.Find(StrL("bar.pdf")));
-    }
-
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), L"SumatraPDF.exe -bg-color 0xaa0c13 -invertcolors rosanna.pdf", i);
-        utassert(true == i.invertColors);
-        utassert(1 == len(i.fileNames));
-        utassert(0 == i.fileNames.Find(StrL("rosanna.pdf")));
-    }
-
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), LR"(SumatraPDF.exe "foo \" bar \\.pdf" un\"quoted.pdf)", i);
-        utassert(2 == len(i.fileNames));
-        utassert(0 == i.fileNames.Find(StrL(R"(foo " bar \\.pdf)")));
-        utassert(1 == i.fileNames.Find(StrL(R"(un"quoted.pdf)")));
-    }
-
-    {
-        Flags i;
-        ParseFlags(
-            GetPermArena(),
-            L"SumatraPDF.exe -page 37 -view continuousfacing -zoom fitcontent -scroll 45,1234         -reuse-instance",
-            i);
-        utassert(0 == len(i.fileNames));
-        utassert(i.pageNumber == 37);
-        utassert(i.startView == DisplayMode::ContinuousFacing);
-        utassert(i.startZoom == kZoomFitContent);
-        utassert(i.startScroll.x == 45 && i.startScroll.y == 1234);
-    }
-
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), LR"(SumatraPDF.exe -view "single page" -zoom 237.45 -scroll -21,-1)", i);
-        utassert(0 == len(i.fileNames));
-        utassert(i.startView == DisplayMode::SinglePage);
-        utassert(i.startZoom == 237.45f);
-        utassert(i.startScroll.x == -21 && i.startScroll.y == -1);
-    }
-
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), L"SumatraPDF.exe -zoom 35%", i);
-        utassert(0 == len(i.fileNames));
-        utassert(i.startZoom == 35.f);
-    }
-
-    {
-        Flags i;
-        ParseFlags(GetPermArena(), L"SumatraPDF.exe -zoom fit-content", i);
-        utassert(i.startZoom == kZoomFitContent);
-        utassert(0 == len(i.fileNames));
-    }
-}
-
-#endif
-
 static void PageAspectViewTest() {
     DisplayMode mode = DisplayMode::Automatic;
     float zoom = kInvalidZoom;
@@ -315,13 +265,20 @@ static void PageAspectViewTest() {
 
 void SumatraPDF_UnitTests() {
     RestrictedUseConfigTest();
+    ControlFrameActionTest();
+    OpenDdeCmdTest();
+    UpdateCheckDecisionTest();
     CachedObjects_UnitTests();
     CommandPaletteModel_UnitTests();
     ImageReader_UnitTests();
     utassert(RenderCache_UnitTestCookieUnlocked());
+    utassert(RenderCache_UnitTestFullOfOneVisiblePage());
+    utassert(RenderCache_UnitTestFullOfOldZoom());
 #if OS_POSIX && !OS_WASM
     AIChatProcessTest();
 #endif
+    BuiltinFontTableTest();
+    FontMatchesFileNameTest();
 #if OS_LINUX || OS_DARWIN
     PlatformSystemFontTest();
 #endif
@@ -332,7 +289,9 @@ void SumatraPDF_UnitTests() {
     PageAspectViewTest();
     parseCommandsTest();
     colorTest();
+    PngSizeTest();
     BenchRangeTest();
+    HexViewTest();
 #if OS_WIN
     ParseCommandLineTest();
     ParseFileArgsTest();

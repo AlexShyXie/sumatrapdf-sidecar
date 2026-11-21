@@ -17,7 +17,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import { deflateRawSync, deflateSync, inflateSync } from "node:zlib";
+import { deflateRawSync, deflateSync, inflateRawSync, inflateSync } from "node:zlib";
 import { IS_MAC, IS_WIN } from "./host.ts";
 import { ensureModifierKeysUp, enumWindows, getWindowPid, getWindowText, hasInteractiveDesktop } from "./winapi.ts";
 
@@ -507,6 +507,36 @@ export function tmpPath(name: string): string {
   return join(TMP_DIR, name);
 }
 
+// Test files too big or too private for the repo (see agents.md) live in OneDrive.
+export const ONEDRIVE_DIR = IS_WIN
+  ? join(process.env.USERPROFILE || "C:\\Users\\kjk", "OneDrive")
+  : "/Users/kjk/OneDrive";
+
+// <OneDrive>/<relPath> with this platform's separators; relPath uses "/"
+export function oneDrivePath(relPath: string): string {
+  return join(ONEDRIVE_DIR, ...relPath.split("/"));
+}
+
+// Copies <OneDrive>/<relPath> to dst, which the test then opens: a OneDrive file
+// can be a cloud placeholder, and opening one blocks until it downloads. False,
+// after a warning, when it couldn't: the caller stops the test (or the part of
+// it that needs the file).
+export function copyFromOneDrive(relPath: string, dst: string): boolean {
+  const src = oneDrivePath(relPath);
+  if (!existsSync(src)) {
+    console.log(`  warning: ${src} isn't there (a test file from OneDrive)`);
+    return false;
+  }
+  try {
+    mkdirSync(dirname(dst), { recursive: true });
+    copyFileSync(src, dst);
+  } catch (e) {
+    console.log(`  warning: couldn't copy ${src}: ${(e as Error).message}`);
+    return false;
+  }
+  return true;
+}
+
 export function crc32(buf: Uint8Array): number {
   let c = 0xffffffff;
   for (const b of buf) {
@@ -562,6 +592,29 @@ export function writeStoredZip(path: string, files: { name: string; data: Buffer
 }
 
 export type ZipEntry = { name: string; data: Uint8Array; store?: boolean };
+
+// Entries of a zip with stored or deflated members, via its central directory.
+export function readZip(zip: Buffer): ZipEntry[] {
+  const eocd = zip.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  if (eocd < 0) throw new Error("readZip: no end of central directory");
+  const count = zip.readUInt16LE(eocd + 10);
+  let p = zip.readUInt32LE(eocd + 16);
+  const entries: ZipEntry[] = [];
+  for (let i = 0; i < count; i++) {
+    const method = zip.readUInt16LE(p + 10);
+    const size = zip.readUInt32LE(p + 20);
+    const nameLen = zip.readUInt16LE(p + 28);
+    const extraLen = zip.readUInt16LE(p + 30);
+    const commentLen = zip.readUInt16LE(p + 32);
+    const local = zip.readUInt32LE(p + 42);
+    const name = zip.toString("utf8", p + 46, p + 46 + nameLen);
+    const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
+    const body = zip.subarray(start, start + size);
+    entries.push({ name, data: method === 0 ? new Uint8Array(body) : new Uint8Array(inflateRawSync(body)) });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
 
 // Zip with deflated entries; `store` keeps one uncompressed (an EPUB mimetype).
 export function makeZip(entries: ZipEntry[]): Buffer {
@@ -873,8 +926,23 @@ function checkInteractiveDesktop(): void {
   process.exit(1);
 }
 
+// the test scripts are type checked with tsc
+function checkTsc(): void {
+  if (Bun.which("tsc")) {
+    return;
+  }
+  const install = IS_MAC
+    ? "brew install typescript"
+    : IS_WIN
+      ? "npm install -g typescript   (needs Node.js: winget install OpenJS.NodeJS)"
+      : "npm install -g typescript";
+  console.error(`\n❌ tsc (the TypeScript compiler) isn't on PATH. Install it with:\n     ${install}`);
+  process.exit(1);
+}
+
 export async function runSuiteMain(testit: (opts: SuiteOptions) => Promise<void>): Promise<void> {
   const silent = isSilentArg();
+  checkTsc();
   checkInteractiveDesktop();
   // an exe named with -exe is the one to test, so don't build over it
   if (!process.argv.includes("--no-build") && !EXE_FROM_ARGV) {
@@ -920,6 +988,7 @@ export function buildApp(opts?: { silent?: boolean }): void {
 // builds (unless --no-build), runs testit(), exits 0 on pass / 1 on failure.
 export async function runStandalone(testit: () => void | Promise<void>, name?: string): Promise<void> {
   const label = name ?? (process.argv[1] ?? "test").replace(/\\/g, "/").split("/").pop()!.replace(/\.ts$/, "");
+  checkTsc();
   // a single test is worth running locked (most don't touch the cursor), but
   // say so, or a cursor-driven failure reads as a bug in the code
   if (!hasInteractiveDesktop()) {
@@ -951,14 +1020,20 @@ function paethPredictor(a: number, b: number, c: number): number {
   return pb <= pc ? b : c;
 }
 
-// Minimal PNG reader: 8-bit RGB or RGBA, no interlace (what the app and
-// captureWindowToPng write).
+// Minimal PNG reader: gray, gray + alpha, RGB, RGBA and palette images at the
+// bit depths an encoder may pick for them (1-8; ng's PngOptimizer writes a
+// 2-color page as 1- or 2-bit palette), no interlace. The result is always
+// RGB, or RGBA when the image has alpha, so callers see 3 or 4 components.
 export function loadPng(path: string): PngImage {
   const buf = readFileSync(path);
   let off = 8;
   let w = 0;
   let h = 0;
   let colorType = 0;
+  let bitDepth = 8;
+  let interlace = 0;
+  let palette: Buffer | null = null;
+  let paletteAlpha: Buffer | null = null;
   const idat: Buffer[] = [];
   while (off + 8 <= buf.length) {
     const n = buf.readUInt32BE(off);
@@ -967,7 +1042,13 @@ export function loadPng(path: string): PngImage {
     if (type === "IHDR") {
       w = data.readUInt32BE(0);
       h = data.readUInt32BE(4);
+      bitDepth = data[8]!;
       colorType = data[9]!;
+      interlace = data[12]!;
+    } else if (type === "PLTE") {
+      palette = data;
+    } else if (type === "tRNS" && colorType === 3) {
+      paletteAlpha = data;
     } else if (type === "IDAT") {
       idat.push(data);
     } else if (type === "IEND") {
@@ -975,22 +1056,28 @@ export function loadPng(path: string): PngImage {
     }
     off += 12 + n;
   }
-  const nComp = colorType === 6 ? 4 : colorType === 2 ? 3 : 0;
-  if (!nComp || w <= 0 || h <= 0) {
-    throw new Error(`loadPng: unsupported png ${path} ct=${colorType} ${w}x${h}`);
+  // samples per pixel as stored
+  const samplesForType: Record<number, number> = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+  const samples = samplesForType[colorType] ?? 0;
+  const depthOk = bitDepth === 8 || ((colorType === 0 || colorType === 3) && [1, 2, 4].includes(bitDepth));
+  if (!samples || !depthOk || interlace !== 0 || w <= 0 || h <= 0 || (colorType === 3 && !palette)) {
+    throw new Error(`loadPng: unsupported png ${path} ct=${colorType} depth=${bitDepth} ${w}x${h}`);
   }
+
+  // undo the row filters, on bytes
   const raw = inflateSync(Buffer.concat(idat));
-  const stride = w * nComp;
-  const data = new Uint8Array(h * stride);
+  const bpp = Math.max(1, (samples * bitDepth) >> 3);
+  const stride = Math.ceil((w * samples * bitDepth) / 8);
+  const rows = new Uint8Array(h * stride);
   let src = 0;
   for (let y = 0; y < h; y++) {
     const filter = raw[src++]!;
     const row = y * stride;
     const prev = (y - 1) * stride;
     for (let x = 0; x < stride; x++) {
-      const left = x >= nComp ? data[row + x - nComp]! : 0;
-      const up = y > 0 ? data[prev + x]! : 0;
-      const ul = y > 0 && x >= nComp ? data[prev + x - nComp]! : 0;
+      const left = x >= bpp ? rows[row + x - bpp]! : 0;
+      const up = y > 0 ? rows[prev + x]! : 0;
+      const ul = y > 0 && x >= bpp ? rows[prev + x - bpp]! : 0;
       const v = raw[src++]!;
       let recon = v;
       if (filter === 1) {
@@ -1004,7 +1091,47 @@ export function loadPng(path: string): PngImage {
       } else if (filter !== 0) {
         throw new Error(`loadPng: png filter ${filter}`);
       }
-      data[row + x] = recon;
+      rows[row + x] = recon;
+    }
+  }
+
+  // sample i of a row, scaled to 0..255 for gray (palette indexes stay as is)
+  const maxSample = (1 << bitDepth) - 1;
+  const sampleAt = (row: number, i: number): number => {
+    if (bitDepth === 8) {
+      return rows[row + i]!;
+    }
+    const bit = i * bitDepth;
+    const byte = rows[row + (bit >> 3)]!;
+    return (byte >> (8 - bitDepth - (bit & 7))) & maxSample;
+  };
+  const hasAlpha = colorType === 4 || colorType === 6 || (colorType === 3 && paletteAlpha !== null);
+  const nComp = hasAlpha ? 4 : 3;
+  const data = new Uint8Array(w * h * nComp);
+  for (let y = 0; y < h; y++) {
+    const row = y * stride;
+    for (let x = 0; x < w; x++) {
+      const o = (y * w + x) * nComp;
+      const s = x * samples;
+      if (colorType === 3) {
+        const idx = sampleAt(row, s);
+        data[o] = palette![idx * 3]!;
+        data[o + 1] = palette![idx * 3 + 1]!;
+        data[o + 2] = palette![idx * 3 + 2]!;
+        if (hasAlpha) {
+          data[o + 3] = idx < paletteAlpha!.length ? paletteAlpha![idx]! : 255;
+        }
+      } else if (colorType === 0 || colorType === 4) {
+        const g = Math.round((sampleAt(row, s) * 255) / maxSample);
+        data[o] = data[o + 1] = data[o + 2] = g;
+        if (hasAlpha) {
+          data[o + 3] = sampleAt(row, s + 1);
+        }
+      } else {
+        for (let c = 0; c < samples; c++) {
+          data[o + c] = sampleAt(row, s + c);
+        }
+      }
     }
   }
   return { w, h, nComp, data };

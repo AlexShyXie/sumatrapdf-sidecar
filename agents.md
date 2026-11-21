@@ -126,7 +126,7 @@ bun, g++/clang++, pkg-config and development packages for X11, Cairo, Pango,
 GDK Pixbuf, GLib and OpenSSL. WSL Ubuntu needs bun in `~/.bun/bin` and:
 
 ```sh
-sudo apt install build-essential pkg-config libx11-dev libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libglib2.0-dev libssl-dev
+sudo apt install build-essential pkg-config libx11-dev libxcursor-dev libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libglib2.0-dev libssl-dev
 ```
 
 WSLg needs a working `DISPLAY` to run the GUI. macOS needs bun and Xcode
@@ -143,7 +143,8 @@ settings in OPFS `/settings` (mirrored in MEMFS); fonts are embedded. Wasm embed
 (help opens the website) and stores the embedded archive uncompressed
 (`MakeLZSA -store`): the web server compresses the `.wasm`. Wasm has no pthreads:
 `StartThread()` runs inline and render loops drain in main-thread slices.
-Console targets use Node and NODERAWFS.
+Console targets use Node and NODERAWFS. A page embedding the app can take over
+browser operations through `window.sumatraHost`; see `docs/wasm-host-api.md`.
 
 Ng unit tests are the `test_util` target:
 `bun cmd/ng-build.ts -dbg test_util -run -- -for-ai`.
@@ -161,11 +162,14 @@ and the build passes it as defines (`SUMATRA_VER`, `GIT_COMMIT_ID`) to
 `currentVersion`, `BuiltOnDate()` (from `__DATE__`) and `gitCommidId`. `src/ng/Version.h` is ng's own. The macOS release script is
 `build-ng-mac.ts` in `../hack/sumatrapdf/build`: it uploads the app and its
 `.dSYM` to R2 `software/sumatrapdfng/mac/<ver>/`. The Linux release script
-is `build-ng-linux.ts` there: it builds a `.deb` per Ubuntu release (22.04,
-24.04, 26.04) in containers (`wslc` on Windows, Apple `container` on macOS,
-docker on Linux; images cached in `~/data/sumatra-build`) by running
-`cmd/ng-deb.ts` in each, and uploads them with their `.debug` symbols to
-`software/sumatrapdfng/linux/<ver>/`. The package's desktop entry, MIME
+is `build-ng-linux.ts` there: it starts the manual
+`.github/workflows/ng-linux-release.yml` workflow for the pushed master
+commit, waits for it, downloads its artifacts and uploads them with their
+`.debug` symbols, an `index.html` and the update-check file to
+`software/sumatrapdfng/linux/<ver>/`. The workflow runs `cmd/ng-linux-ci.sh`
+in a distro container per package: `cmd/ng-deb.ts` (Ubuntu, Debian),
+`cmd/ng-rpm.ts` (Fedora), `cmd/ng-tar.ts` (portable), for x86_64 and arm64, and
+`cmd/ng-arch.ts` (Arch Linux, x86_64). The package's desktop entry, MIME
 types and icons live in `src/ng/linux/`; `cmd/update-linux-icons.ts`
 regenerates the icons from the Windows artwork.
 
@@ -180,11 +184,13 @@ builds and `-for-testing` runs don't upload.
 
 Use `cmd/ng-gen-commands.ts` and `cmd/ng-gen-settings.ts` for ng generated
 files. `ng-gen-embedded.ts` generates ignored `src/ng/EmbeddedData*.cpp`;
-`ng-gen-translations.ts` completes the checked-in translation snapshot into
-`.work/ng/translations.txt`. The manual uses the original website checkout
+Translations come from `bun cmd/trans-dl.ts`, which writes
+`.work/translations.txt` from apptranslator and needs the maintainer's
+`TRANS_UPLOAD_SECRET`; without it the file is empty and the build is
+English only, by design. The manual uses the original website checkout
 and `.work/docs` staging; CI skips it when that checkout is absent.
 
-Standard Windows CI builds ng x64 release. Daily Windows CI builds debug
+Standard Windows CI builds ng x64 release and runs its unit tests. Daily Windows CI builds debug
 and release; Linux/macOS daily CI builds ng and runs unit tests. Linux also
 checks rendering/printing and hosts the separate Wasm CI job.
 
@@ -358,7 +364,7 @@ To add a new cmd-line flag:
 
 ## User docs (www/docs)
 
-User docs live in the sumatra-website repo, in `../hack/webapps/sumatra-website/www/docs` (called `www/docs` below); it is the source of truth. `bun cmd/gen-docs.ts` copies the pages reachable from `SumatraPDF-documentation.md` into `.work/docs` for the in-app manual; without a website checkout (CI) it skips and the exe ships without the manual. `cmd/gen-settings.ts` and `cmd/gen-js-reference-md.ts` write their generated pages there. Commit doc changes in the website repo.
+User docs live in the sumatra-website repo, in `../hack/webapps/sumatra-website/www/docs` (called `www/docs` below); it is the source of truth. `bun cmd/gen-docs.ts` copies the pages reachable from `SumatraPDF-documentation.md` into `.work/docs` for the in-app manual; without a website checkout (CI) it skips and the exe ships without the manual. `cmd/gen-settings.ts` and `cmd/gen-js-reference-md.ts` write their generated pages there. Commit doc changes in the website repo, with `sumatra-website:` prepended to the commit message (`sumatra-website: document CAJ files`).
 
 PDF example scripts live only in `sumatra-website/www/docs/scripts`. Edit and commit them in the website repo; do not keep copies in `docs/scripts` here. `cmd/gen-pdf-scripts.ts` bundles them into `.work/scripts.js` for embedding, and `cmd/gen-docs.ts` stages the scripts listed in `Tool-run-javascript-examples.md` into `.work/docs/scripts`. Without the website checkout, builds omit both the manual and example scripts.
 
@@ -383,7 +389,7 @@ When documenting a release (usually the **next** section at the top):
 - New `-print-settings` tokens belong under **New command-line arguments** (e.g. `-print-settings` tokens: `stretch`, `center`, …).
 - Command **changes** (renames, removals, new arguments on existing commands, shortcut rebinding) stay in the main bullets, not in **New commands**.
 - Removed flags can be noted in the main bullets; do not list them under **New command-line arguments**.
-- **Embedded app data (`IDR_EMBEDDED_PAK`):** everything the exe embeds is one LzSA archive, staged and packed by the VS / ninja prebuild `cmd/pack-embedded-prebuild.cmd <staging dir> <archive> [file[:name] ...]` (cmd + `MakeLZSA.exe` only, no bun). It copies `.work/translations.txt`, `ext/marked.min.js`, `ext/mermaid.min.js` and the in-app manual from `.work/docs/` (gen-docs output; skipped with a note when missing) into the staging dir and packs it (in-archive names are relative to the staging dir). `SumatraPDF-static` stages `out/<cfg>/embedded-static/` and packs `out/<cfg>/embedded-static.lzsa`; `SumatraPDF` stages `out/<cfg>/embedded/` and packs `out/<cfg>/embedded.lzsa` = staging + `libsumatrapdf.dll`, `PdfFilter.dll`, `PdfPreview.dll`, `sumatrapdf-tool.exe` (the installer payload, passed as extra files). `src/SumatraPDF.rc` gets the archive path via the `EMBEDDED_PAK` resource define set in `premake5.lua` (and `cmd/ninja.ts`) and errors without it. `MakeLZSA.exe out.lzsa <dir> [file[:name] ...]` packs a directory plus extra files. `bun cmd/build.ts` (and `cmd/run-unit-tests.ts`, `cmd/dbg.ts`, the CI / daily builds) runs gen-docs before building, so a rebuilt exe always embeds the current manual; only a raw msbuild / ninja invocation packs whatever `.work/docs` holds. gen-docs writes to `.work/docs.tmp` and swaps it in, so a concurrent prebuild never sees a missing or half-written manual. The ninja build re-packs the archive on every invocation (`cmd/ninja.ts` adds an always-dirty pack edge with `restat`; the premake prebuild stamp alone ran once per clean build and left a stale archive). The app renders markdown on demand in WebView2 via `docs/gen_docs.render.js` and markdown-it.
+- **Embedded app data (`IDR_EMBEDDED_PAK`):** everything the exe embeds is one LzSA archive, staged and packed by the VS / ninja prebuild `cmd/pack-embedded-prebuild.cmd <staging dir> <archive> [file[:name] ...]` (cmd + `MakeLZSA.exe` only, no bun). It copies `.work/translations.txt`, `ext/marked.min.js`, `ext/pele.min.js` and the in-app manual from `.work/docs/` (gen-docs output; skipped with a note when missing) into the staging dir and packs it (in-archive names are relative to the staging dir). `SumatraPDF-static` stages `out/<cfg>/embedded-static/` and packs `out/<cfg>/embedded-static.lzsa`; `SumatraPDF` stages `out/<cfg>/embedded/` and packs `out/<cfg>/embedded.lzsa` = staging + `libsumatrapdf.dll`, `PdfFilter.dll`, `PdfPreview.dll`, `sumatrapdf-tool.exe` (the installer payload, passed as extra files). `src/SumatraPDF.rc` gets the archive path via the `EMBEDDED_PAK` resource define set in `premake5.lua` (and `cmd/ninja.ts`) and errors without it. `MakeLZSA.exe out.lzsa <dir> [file[:name] ...]` packs a directory plus extra files. `bun cmd/build.ts` (and `cmd/run-unit-tests.ts`, `cmd/dbg.ts`, the CI / daily builds) runs gen-docs before building, so a rebuilt exe always embeds the current manual; only a raw msbuild / ninja invocation packs whatever `.work/docs` holds. gen-docs writes to `.work/docs.tmp` and swaps it in, so a concurrent prebuild never sees a missing or half-written manual. The ninja build re-packs the archive on every invocation (`cmd/ninja.ts` adds an always-dirty pack edge with `restat`; the premake prebuild stamp alone ran once per clean build and left a stale archive). The app renders markdown on demand in WebView2 via `docs/gen_docs.render.js` and markdown-it.
 
 ## Bug reproduction / test files
 

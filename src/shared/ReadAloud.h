@@ -31,6 +31,13 @@ bool TtsIsAvailable();
 bool TtsSpeakUtf8(Str text);
 bool TtsQueueUtf8(Str text);
 bool TtsDidStartQueued();
+
+// reads and clears a flag
+inline bool TtsTakeFlag(bool* flag) {
+    bool v = *flag;
+    *flag = false;
+    return v;
+}
 void TtsStop();
 void TtsRelease();
 
@@ -45,8 +52,10 @@ void TtsProcessEvents();
 
 Vec<TtsVoiceInfo> TtsGetVoices();
 void TtsFreeVoices(Vec<TtsVoiceInfo>& voices);
+void TtsSortVoicesByLanguage(Vec<TtsVoiceInfo>& voices);
 
 bool TtsSetVoiceById(Str voiceId);
+bool TtsIsInitialized();
 Str TtsGetVoiceId();
 
 void TtsSetSpeed(float speed);
@@ -57,8 +66,8 @@ bool TtsTakeEngineCrash();
 bool TtsEngineCrashed();
 bool TtsTestEngineCrash();
 void TtsTestPumpOnNextSpeak();
-#if defined(SUMATRA_NG)
 bool ApplyReadAloudVoiceFromSettings();
+#if defined(SUMATRA_NG)
 void ReadAloudFreeVoiceCache();
 #endif
 
@@ -85,9 +94,6 @@ struct ReadAloudHighlightMap {
 };
 
 void ReadAloudHighlightFree(ReadAloudHighlightMap* map);
-
-bool ReadAloudHighlightBuildFromPage(EngineBase* engine, int pageNo, ReadAloudHighlightMap* map,
-                                     str::Builder& cleanedOut);
 
 bool ReadAloudHighlightBuildFromTextSelection(TextSelection* ts, ReadAloudHighlightMap* map, str::Builder& cleanedOut);
 
@@ -127,6 +133,16 @@ int ReadAloudWordEndUtf8(Str text, int pos);
 bool ReadAloudByteLocHasRect(const ReadAloudByteLoc& loc);
 Rect ReadAloudByteLocToRect(const ReadAloudByteLoc& loc);
 void ReadAloudClampVisual(ReadAloudHighlightMap* map, int wordStartAbs, int wordEndAbs, int* startAbs, int* endAbs);
+
+// glyphs underlined as one stroke: a line of horizontal text or a column of
+// vertical text, in page coordinates
+struct ReadAloudRun {
+    Location pageLoc;
+    RectF bbox;
+    bool vertical = false;
+};
+
+void ReadAloudCollectRuns(ReadAloudHighlightMap* map, int startAbs, int endAbs, Vec<ReadAloudRun>& out);
 void ReadAloudAppendUnderlines(DisplayModel* dm, Rect canvasRc, ReadAloudHighlightMap* map, int startAbs, int endAbs,
                                int minThick, int thickDiv, Vec<Rect>& out);
 
@@ -142,7 +158,6 @@ void ReadAloudPlaybackBarTick(MainWindow* win);
 
 void ReadAloudPlaybackPauseOrResume();
 void ReadAloudPlaybackStop();
-void ReadAloudPlaybackCycleSpeed(int dir);
 void ReadAloudPlaybackBarDestroy(MainWindow* win);
 TempStr ReadAloudPlaybackBarStateTemp(int* exitCodeOut);
 #if defined(SUMATRA_NG)
@@ -202,7 +217,6 @@ bool HandleReadAloudMenuCommand(MainWindow* win, int cmdId);
 #if !defined(SUMATRA_NG)
 void SetReadAloudAppSubmenu(HMENU menu);
 HMENU GetReadAloudAppSubmenu();
-bool IsReadAloudAppSubmenu(HMENU menu);
 void SetReadAloudContextSubmenu(HMENU menu);
 bool IsReadAloudContextSubmenu(HMENU menu);
 HMENU GetReadAloudContextSubmenu();

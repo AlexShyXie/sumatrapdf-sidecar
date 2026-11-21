@@ -22,7 +22,7 @@
 #include "EngineAll.h"
 
 extern "C" {
-// public domain d3des, in ext/msdes
+// d3des, in ext/msdes
 #include <d3des.h>
 
 // the LZX decompressor inside ext/chmdec/chm.c
@@ -397,6 +397,7 @@ struct LitFile {
     Vec<LitEntry> entries;
     StrVec sectionNames;
     Str sectionData[kLitMaxSections]; // decoded caches, owned
+    bool sectionDecoding[kLitMaxSections] = {};
     Vec<LitManifestItem> manifest;
     int drmLevel = 0;
     u8 bookKey[8] = {};
@@ -584,13 +585,10 @@ static bool LitParseSectionNames(LitFile* lit) {
 }
 
 static void LitDesDecrypt(u8* dst, const u8* src, int n, const u8 key[8]) {
-    u8 k[8];
-    memcpy(k, key, 8);
-    deskey(k, DE1);
+    DesKey dk;
+    deskey(&dk, key, DE1);
     for (int off = 0; off + 8 <= n; off += 8) {
-        u8 in[8];
-        memcpy(in, src + off, 8);
-        des(in, dst + off);
+        des(&dk, src + off, dst + off);
     }
 }
 
@@ -741,6 +739,14 @@ Str LitFile::GetSection(int section) {
     if (!str::IsNull(sectionData[section])) {
         return sectionData[section];
     }
+    // a section's transform data can't be in that same section (#6569)
+    if (sectionDecoding[section]) {
+        return {};
+    }
+    sectionDecoding[section] = true;
+    defer {
+        sectionDecoding[section] = false;
+    };
     Str name = sectionNames.At(section);
     TempStr base = fmt("::DataSpace/Storage/%s", name);
     Str transform = GetFile(fmt("%s/Transform/List", Str(base)));
@@ -764,10 +770,13 @@ Str LitFile::GetSection(int section) {
             int n = len(view);
             int nPadded = RoundUp(n, 8);
             u8* dec = AllocArray<u8>(nPadded);
-            u8* src = AllocArray<u8>(nPadded);
+            AutoFree<u8> src(AllocArray<u8>(nPadded));
+            if (!dec || !src.Get()) {
+                Free(nullptr, dec);
+                return {};
+            }
             memcpy(src, view.s, (size_t)n);
             LitDesDecrypt(dec, src, nPadded, bookKey);
-            Free(nullptr, src);
             next = Str((char*)dec, n);
         } else if (str::Eq(guid, Str(kLzxGuid))) {
             Str resetTable = GetFile(fmt("%s/Transform/%s/InstanceData/ResetTable", Str(base), Str(kLzxGuid)));
@@ -816,11 +825,7 @@ static TempStr LitNormPathTemp(Str path) {
 
 constexpr int kLitManifestGroups = 4;
 
-static bool LitParseManifest(LitFile* lit) {
-    Str raw = lit->GetFile(StrL("/manifest"));
-    if (str::IsNull(raw)) {
-        return false;
-    }
+static void LitReadManifestItems(LitFile* lit, Str raw) {
     int pos = 0;
     while (pos < len(raw)) {
         int slen = (u8)raw.s[pos++];
@@ -837,7 +842,7 @@ static bool LitParseManifest(LitFile* lit) {
             }
             for (int i = 0; i < nFiles; i++) {
                 if (len(raw) < 5 || pos > len(raw) - 5) {
-                    return len(lit->manifest) > 0;
+                    return;
                 }
                 pos += 4; // offset, unused
                 LitManifestItem item;
@@ -845,7 +850,7 @@ static bool LitParseManifest(LitFile* lit) {
                 TempStr path = LitSizedStringTemp(raw, &pos, false);
                 LitSizedStringTemp(raw, &pos, true); // consume unused MIME type
                 if (len(item.internal) == 0 || len(path) == 0) {
-                    return len(lit->manifest) > 0;
+                    return;
                 }
                 item.isSpine = (state == 0);
                 // normalize the original path: windows separators, drive
@@ -859,6 +864,16 @@ static bool LitParseManifest(LitFile* lit) {
             }
         }
     }
+}
+
+// A manifest cut short still gets its paths fixed up below: an item whose path
+// normalized to nothing crashed packaging it (#6569)
+static bool LitParseManifest(LitFile* lit) {
+    Str raw = lit->GetFile(StrL("/manifest"));
+    if (str::IsNull(raw)) {
+        return false;
+    }
+    LitReadManifestItems(lit, raw);
     // Strip complete directories shared by all items.
     if (len(lit->manifest) > 1) {
         Str first = lit->manifest[0].path;
@@ -883,6 +898,25 @@ static bool LitParseManifest(LitFile* lit) {
         }
     }
     return len(lit->manifest) > 0;
+}
+
+// Manifest paths are url-encoded and mupdf decodes the OPF's hrefs: "a %26 b.htm" is looked up as "a & b.htm"
+static TempStr LitZipNameTemp(Str path) {
+    TempStr res = str::DupTemp(path);
+    int n = 0;
+    for (int i = 0; i < len(path); i++) {
+        char c = path.s[i];
+        int hi = (c == '%' && i + 2 < len(path)) ? str::HexDigitVal(path.s[i + 1]) : -1;
+        int lo = hi >= 0 ? str::HexDigitVal(path.s[i + 2]) : -1;
+        if (lo >= 0) {
+            c = (char)((hi << 4) | lo);
+            i += 2;
+        }
+        res.s[n++] = c;
+    }
+    res.s[n] = 0;
+    res.len = n;
+    return res;
 }
 
 static LitManifestItem* LitFindManifest(LitFile* lit, Str internal) {
@@ -1058,7 +1092,7 @@ static void LitEmitTextChar(str::Builder& out, int c) {
 }
 
 // port of calibre's UnBinary.binary_to_text state machine
-static bool LitBinaryToText(UnBinaryCtx* ctx, int depth) {
+static bool LitBinaryToText(UnBinaryCtx* ctx, int depth, Str parent) {
     if (depth > 128) {
         return false;
     }
@@ -1071,6 +1105,7 @@ static bool LitBinaryToText(UnBinaryCtx* ctx, int depth) {
     int count = 0;
     bool inCensorship = false;
     bool isGoingdown = false;
+    bool hasStrayText = false;
     bool tagIsAtom = false;
     int tag = 0;
     Str tagName;
@@ -1088,6 +1123,8 @@ static bool LitBinaryToText(UnBinaryCtx* ctx, int depth) {
                     state = 1;
                 } else {
                     LitEmitTextChar(out, c);
+                    // only a lost opening tag leaves text directly in dc-metadata
+                    hasStrayText = hasStrayText || (c > ' ' && !ctx->isHtml && str::Eq(parent, StrL("dc-metadata")));
                 }
                 break;
             case 1: // get flags
@@ -1104,11 +1141,12 @@ static bool LitBinaryToText(UnBinaryCtx* ctx, int depth) {
                     tag = c;
                     out.Append(StrL("<"));
                     isGoingdown = !(flags & kLitFlagClosing);
+                    // also for a custom tag: its attributes aren't in the atom table
+                    tagIsAtom = false;
                     if (tag == 0x8000) {
                         state = 6;
                         break;
                     }
-                    tagIsAtom = false;
                     const char* name = nullptr;
                     if (flags & kLitFlagAtom) {
                         if (!ctx->atoms || tag < 1 || tag > len(ctx->atoms->tags)) {
@@ -1122,6 +1160,12 @@ static bool LitBinaryToText(UnBinaryCtx* ctx, int depth) {
                     tagName = name ? Str(name) : fmt("x-lit-tag-%d", tag);
                     out.Append(Str(tagName));
                 } else if (flags & kLitFlagClosing) {
+                    if (hasStrayText) {
+                        // this closes the lost tag, not the parent
+                        hasStrayText = false;
+                        state = 0;
+                        break;
+                    }
                     if (depth == 0) {
                         return false;
                     }
@@ -1138,7 +1182,7 @@ static bool LitBinaryToText(UnBinaryCtx* ctx, int depth) {
                     } else {
                         out.Append(StrL(">"));
                         // recursively emit children until the closing token
-                        if (!LitBinaryToText(ctx, depth + 1)) {
+                        if (!LitBinaryToText(ctx, depth + 1, tagName)) {
                             return false;
                         }
                         if (len(tagName) == 0) {
@@ -1327,7 +1371,7 @@ static Str LitUnBinary(LitFile* lit, Str bin, Str path, bool isHtml, LitAtoms* a
     ctx.atoms = atoms;
     int lastSlash = str::LastIndexOfChar(path, '/');
     ctx.dir = lastSlash >= 0 ? Str(path.s, lastSlash) : StrL("");
-    if (!LitBinaryToText(&ctx, 0)) {
+    if (!LitBinaryToText(&ctx, 0, {})) {
         return {};
     }
     Str raw = ToStr(ctx.out);
@@ -1389,6 +1433,8 @@ Str LitToEpubConvert(Str litData) {
 
     str::Builder zipData;
     ZipCreator zc(zipData);
+    // read back right away, compressing would only cost time
+    zc.storeOnly = true;
     bool ok = zc.AddFileData(StrL("mimetype"), StrL("application/epub+zip"));
     ok &= zc.AddFileData(StrL("META-INF/container.xml"), Str(kContainerXml));
     {
@@ -1424,7 +1470,7 @@ Str LitToEpubConvert(Str litData) {
                 continue;
             }
         }
-        ok &= zc.AddFileData(item.path, data);
+        ok &= zc.AddFileData(LitZipNameTemp(item.path), data);
         nAdded++;
     }
     if (!ok || nAdded == 0) {
@@ -1456,6 +1502,214 @@ EngineBase* CreateEngineLitFromFile(Str path, PasswordUI* pwdUI) {
 }
 
 #if IS_DEBUG
+struct LitDesThreadData {
+    Str src;
+    Str want;
+    u8 key[8] = {};
+    bool ok = true;
+};
+
+static void LitDesThread(LitDesThreadData* d) {
+    constexpr int kRounds = 300;
+    int n = len(d->src);
+    u8* out = AllocArray<u8>(n);
+    for (int i = 0; i < kRounds && d->ok; i++) {
+        LitDesDecrypt(out, (const u8*)d->src.s, n, d->key);
+        d->ok = MemEq(out, d->want.s, n);
+    }
+    Free(nullptr, out);
+}
+
+// expected is the output of unmodified d3des; not standard DES because of its SP tables
+bool LitDoc_UnitTestDes() {
+    const u8 key[8] = {0x13, 0x34, 0x57, 0x79, 0x9B, 0xBC, 0xDF, 0xF1};
+    const u8 src[8] = {0x85, 0xE8, 0x13, 0x54, 0x0F, 0x0A, 0xB4, 0x05};
+    const u8 want[8] = {0xDE, 0x72, 0xC5, 0x07, 0xA3, 0xB0, 0x33, 0x8C};
+    u8 got[8];
+    LitDesDecrypt(got, src, sizeof(got), key);
+    return MemEq(got, want, sizeof(got));
+}
+
+// books loading at the same time decrypt with different keys
+bool LitDoc_UnitTestDesThreads() {
+    constexpr int kThreads = 4;
+    constexpr int kSize = 4096;
+    u8* src = AllocArray<u8>(kSize);
+    for (int i = 0; i < kSize; i++) {
+        src[i] = (u8)(i * 7);
+    }
+    LitDesThreadData data[kThreads];
+    u8* wants[kThreads];
+    for (int t = 0; t < kThreads; t++) {
+        LitDesThreadData& d = data[t];
+        memset(d.key, 0x11 * (t + 1), sizeof(d.key));
+        wants[t] = AllocArray<u8>(kSize);
+        LitDesDecrypt(wants[t], src, kSize, d.key);
+        d.src = Str((char*)src, kSize);
+        d.want = Str((char*)wants[t], kSize);
+    }
+    ThreadHandle threads[kThreads];
+    for (int t = 0; t < kThreads; t++) {
+        threads[t] = StartThread(MkFunc0(LitDesThread, &data[t]), StrL("LitDesTest"));
+    }
+    bool ok = true;
+    for (int t = 0; t < kThreads; t++) {
+        JoinThread(&threads[t], 60 * 1000);
+        ok = ok && data[t].ok;
+        Free(nullptr, wants[t]);
+    }
+    Free(nullptr, src);
+    return ok;
+}
+
+// LZX bits go MSB first into little-endian 16-bit words
+struct LzxBitWriter {
+    u8 d[256] = {};
+    int off = 0;
+    u32 word = 0;
+    int nBits = 0;
+
+    void Put(u32 v, int n) {
+        for (int i = n - 1; i >= 0; i--) {
+            word = (word << 1) | ((v >> i) & 1);
+            nBits++;
+            if (nBits == 16) {
+                d[off++] = (u8)word;
+                d[off++] = (u8)(word >> 8);
+                word = 0;
+                nBits = 0;
+            }
+        }
+    }
+    void Flush() {
+        if (nBits > 0) {
+            Put(0, 16 - nBits);
+        }
+    }
+    // pretree where symbols 15..18 have 2-bit codes, in that order
+    void Pretree() {
+        for (int sym = 0; sym < 20; sym++) {
+            Put(sym >= 15 && sym <= 18 ? 2 : 0, 4);
+        }
+    }
+    void ZeroLens(int n) {
+        while (n >= 20) {
+            int run = std::min(n, 51);
+            Put(3, 2); // symbol 18
+            Put(run - 20, 5);
+            n -= run;
+        }
+        if (n > 0) {
+            Put(2, 2); // symbol 17
+            Put(n - 4, 4);
+        }
+    }
+};
+
+// A match running past the frame end: its tail is the start of the next frame.
+// "ab" + a 6-byte match of "b" + "ab", with frames of 4 and 6 bytes.
+bool LitDoc_UnitTestLzxOverrun() {
+    constexpr int kWindowBits = 15;
+    constexpr u32 kBlockVerbatim = 1;
+    constexpr u32 kBlockLen = 10;
+    constexpr u32 kCodeA = 2, kCodeB = 3; // main tree: 'a' and 'b' are 2 bits
+    constexpr u32 kCodeMatch = 0;         // symbol 260: 1 bit, R0 (offset 1), length 6
+
+    LzxBitWriter f1;
+    f1.Put(0, 1); // no E8 translation
+    f1.Put(kBlockVerbatim, 3);
+    f1.Put(0, 16);
+    f1.Put(kBlockLen, 8);
+    f1.Pretree();
+    f1.ZeroLens('a');
+    f1.Put(0, 2); // 'a': length 0 - 15 + 17 = 2
+    f1.Put(0, 2); // 'b'
+    f1.ZeroLens(256 - 'b' - 1);
+    f1.Pretree();
+    f1.ZeroLens(4);
+    f1.Put(1, 2); // symbol 260: length 0 - 16 + 17 = 1
+    f1.ZeroLens(496 - 261);
+    f1.Pretree();
+    f1.ZeroLens(249); // no length tree
+    f1.Put(kCodeA, 2);
+    f1.Put(kCodeB, 2);
+    f1.Put(kCodeMatch, 1);
+    f1.Flush();
+
+    LzxBitWriter f2;
+    f2.Put(kCodeA, 2);
+    f2.Put(kCodeB, 2);
+    f2.Flush();
+
+    struct LZXstate* lzx = LZXinit(kWindowBits);
+    if (!lzx) {
+        return false;
+    }
+    AutoCall teardown(LZXteardown, lzx);
+
+    char out[6];
+    if (LZXdecompress(lzx, f1.d, (u8*)out, f1.off, 4) != kLzxOk || !MemEq(out, "abbb", 4)) {
+        return false;
+    }
+    if (LZXdecompress(lzx, f2.d, (u8*)out, f2.off, 6) != kLzxOk || !MemEq(out, "bbbbab", 6)) {
+        return false;
+    }
+    return true;
+}
+
+// <dc-metadata> holding text whose opening tag is missing, so its close token is one too many
+bool LitDoc_UnitTestOpfStrayClose() {
+    constexpr int kTagPackage = 1, kTagMetadata = 0x14, kTagDcMetadata = 0x15, kTagTitle = 2, kTagManifest = 0x10;
+    str::Builder b;
+    auto open = [&b](int tag) {
+        b.AppendChar(0);
+        b.AppendChar(1);
+        b.AppendChar((char)tag);
+        b.AppendChar(0);
+    };
+    auto close = [&b]() {
+        b.AppendChar(0);
+        b.AppendChar(2);
+        b.AppendChar(0);
+    };
+    open(kTagPackage);
+    open(kTagMetadata);
+    open(kTagDcMetadata);
+    open(kTagTitle);
+    b.Append(StrL("T"));
+    close();
+    b.Append(StrL(" PENGUIN"));
+    close(); // stray
+    close(); // dc-metadata
+    close(); // metadata
+    open(kTagManifest);
+    close();
+    close(); // package
+
+    LitFile lit;
+    Str opf = LitUnBinary(&lit, ToStr(b), StrL("content.opf"), false, nullptr);
+    bool ok = str::EndsWith(opf, StrL("</dc-metadata></metadata><manifest></manifest></package>"));
+    str::Free(opf);
+    return ok;
+}
+
+bool LitDoc_UnitTestZipName() {
+    const Str cases[][2] = {
+        {StrL("Robots %26 Empire.htm"), StrL("Robots & Empire.htm")},
+        {StrL("%C4%99.htm"), StrL("\xc4\x99.htm")},
+        {StrL("plain.htm"), StrL("plain.htm")},
+        {StrL("100%.htm"), StrL("100%.htm")},
+        {StrL("a%2"), StrL("a%2")},
+        {StrL("a%zz.htm"), StrL("a%zz.htm")},
+    };
+    for (const auto& c : cases) {
+        if (!str::Eq(LitZipNameTemp(c[0]), c[1])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool LitDoc_UnitTestManifest() {
     const Str cases[][4] = {
         {StrL("same/a.html"), StrL("same/b.html"), StrL("a.html"), StrL("b.html")},

@@ -1680,6 +1680,15 @@ hash_color(const char *data)
 	return make_color(r, g, b, a);
 }
 
+/* SumatraPDF: an invalid color is ignored, not black: background-color:whi hid the text */
+static int
+is_hex_color(const char *data)
+{
+	size_t n = hexlen(data);
+
+	return data[n] == 0 && (n == 3 || n == 4 || n == 6 || n == 8);
+}
+
 static fz_css_color
 color_from_value(fz_css_value *value, fz_css_color initial)
 {
@@ -1689,7 +1698,7 @@ color_from_value(fz_css_value *value, fz_css_color initial)
 	if (value->type == CSS_HASH)
 	{
 hex_color:
-		return hash_color(value->data);
+		return is_hex_color(value->data) ? hash_color(value->data) : initial;
 	}
 
 	if (value->type == '(' && !strcmp(value->data, "rgb"))
@@ -1735,13 +1744,17 @@ fz_css_color
 fz_css_color_from_string(const char *str)
 {
 	const fz_css_color *named;
+	fz_css_color transparent = { 0, 0, 0, 0 };
 
 	if (*str == '#')
-		return hash_color(str+1);
-	named = lookup_named_color(str);
-	if (named)
-		return *named;
-	return hash_color(str);
+		str++;
+	else
+	{
+		named = lookup_named_color(str);
+		if (named)
+			return *named;
+	}
+	return is_hex_color(str) ? hash_color(str) : transparent;
 }
 
 static fz_css_color
@@ -1971,6 +1984,126 @@ background_position_from_property(fz_css_match *match, fz_css_style *style)
 	style->background_position[1] = y ? background_position_edge(y) : make_number(50, N_PERCENT);
 }
 
+/* SumatraPDF: the n-th argument of a transform function, skipping commas. */
+static fz_css_value *
+transform_arg(fz_css_value *fn, int n)
+{
+	fz_css_value *v;
+	for (v = fn->args; v; v = v->next)
+	{
+		if (v->type == ',')
+			continue;
+		if (n-- == 0)
+			return v;
+	}
+	return NULL;
+}
+
+/* A length in layout units; percentages need the box size, so they count as 0. */
+static float
+transform_length(fz_css_value *v)
+{
+	fz_css_number n;
+	if (!v)
+		return 0;
+	n = number_from_value(v, 0, N_LENGTH);
+	return n.unit == N_LENGTH || n.unit == N_NUMBER ? n.value : 0;
+}
+
+static float
+transform_angle(fz_css_value *v)
+{
+	char *end;
+	float a;
+	if (!v)
+		return 0;
+	a = fz_css_strtof(v->data, &end);
+	if (!strcmp(end, "rad"))
+		return a;
+	if (!strcmp(end, "grad"))
+		return a * (float)M_PI / 200;
+	if (!strcmp(end, "turn"))
+		return a * 2 * (float)M_PI;
+	return a * (float)M_PI / 180;
+}
+
+/* transform: a list of 2D functions applied right to left, e.g.
+ * "rotate(0deg) scale(0.05)" (#1293). 3D functions make it fall back to none. */
+static void
+transform_from_property(fz_css_match *match, fz_css_style *style)
+{
+	fz_css_value *fn = value_from_property(match, PRO_TRANSFORM);
+	fz_matrix m = fz_identity;
+
+	style->has_transform = 0;
+	style->transform_origin[0] = make_number(50, N_PERCENT);
+	style->transform_origin[1] = make_number(50, N_PERCENT);
+
+	for (; fn; fn = fn->next)
+	{
+		const char *name = fn->data;
+		fz_css_value *a0 = transform_arg(fn, 0);
+		fz_css_value *a1 = transform_arg(fn, 1);
+		fz_matrix t;
+
+		if (fn->type != '(')
+			return;
+
+		if (!strcmp(name, "scale"))
+		{
+			float sx = a0 ? fz_css_strtof(a0->data, NULL) : 1;
+			t = fz_scale(sx, a1 ? fz_css_strtof(a1->data, NULL) : sx);
+		}
+		else if (!strcmp(name, "scaleX"))
+			t = fz_scale(a0 ? fz_css_strtof(a0->data, NULL) : 1, 1);
+		else if (!strcmp(name, "scaleY"))
+			t = fz_scale(1, a0 ? fz_css_strtof(a0->data, NULL) : 1);
+		else if (!strcmp(name, "translate"))
+			t = fz_translate(transform_length(a0), transform_length(a1));
+		else if (!strcmp(name, "translateX"))
+			t = fz_translate(transform_length(a0), 0);
+		else if (!strcmp(name, "translateY"))
+			t = fz_translate(0, transform_length(a0));
+		else if (!strcmp(name, "rotate"))
+			t = fz_rotate(transform_angle(a0) * 180 / (float)M_PI);
+		else if (!strcmp(name, "matrix"))
+		{
+			float v[6];
+			int i;
+			for (i = 0; i < 6; i++)
+			{
+				fz_css_value *a = transform_arg(fn, i);
+				v[i] = a ? fz_css_strtof(a->data, NULL) : 0;
+			}
+			t = fz_make_matrix(v[0], v[1], v[2], v[3], v[4], v[5]);
+		}
+		else
+			return;
+
+		/* the last function applies to the box first */
+		m = fz_concat(t, m);
+	}
+
+	if (m.a == 1 && m.b == 0 && m.c == 0 && m.d == 1 && m.e == 0 && m.f == 0)
+		return;
+
+	style->has_transform = 1;
+	style->transform[0] = m.a;
+	style->transform[1] = m.b;
+	style->transform[2] = m.c;
+	style->transform[3] = m.d;
+	style->transform[4] = m.e;
+	style->transform[5] = m.f;
+
+	fn = value_from_property(match, PRO_TRANSFORM_ORIGIN);
+	if (fn && is_background_position_value(fn))
+	{
+		style->transform_origin[0] = background_position_edge(fn);
+		if (fn->next && is_background_position_value(fn->next))
+			style->transform_origin[1] = background_position_edge(fn->next);
+	}
+}
+
 void
 fz_default_css_style(fz_context *ctx, fz_css_style *style)
 {
@@ -2152,6 +2285,7 @@ fz_apply_css_style(fz_context *ctx, fz_html_font_set *set, fz_css_style *style, 
 	style->background_repeat = background_repeat_from_property(match);
 	background_size_from_property(match, style);
 	background_position_from_property(match, style);
+	transform_from_property(match, style);
 
 	style->border_spacing = number_from_property(match, PRO_BORDER_SPACING, 0, N_LENGTH);
 
@@ -2196,7 +2330,11 @@ fz_apply_css_style(fz_context *ctx, fz_html_font_set *set, fz_css_style *style, 
 const char *
 fz_get_css_match_content(fz_css_match *match)
 {
-	return string_from_property(match, PRO_CONTENT, NULL);
+	/* only a string: counter() and the like are unsupported, keywords mean no content */
+	fz_css_value *value = value_from_property(match, PRO_CONTENT);
+	if (!value || value->type != CSS_STRING)
+		return NULL;
+	return value->data;
 }
 
 void

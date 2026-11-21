@@ -10,10 +10,25 @@
 
 void fz_set_builtin_font_loader(__unused fz_builtin_font_loader loader) {}
 
-// this tool links the loader but not mupdf, where fonts_map.c defines it
+// this tool links the loader but not mupdf, where fonts_map.c defines these
 extern "C" const char* sumatra_lookup_font_url(const char*) {
     return nullptr;
 }
+
+extern "C" int sumatra_font_count(void) {
+    return 0;
+}
+
+extern "C" const char* sumatra_font_at(int, const char**, int*) {
+    return nullptr;
+}
+
+#if OS_LINUX || OS_DARWIN
+extern "C" unsigned char* sumatra_system_font_data_for_rune(unsigned int, int* size) {
+    *size = 0;
+    return nullptr;
+}
+#endif
 
 int main(int argc, char** argv) {
     if (argc != 3) {

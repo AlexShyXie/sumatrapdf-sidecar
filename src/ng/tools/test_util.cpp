@@ -9,7 +9,6 @@
 // must be last due to assert() over-write
 #include "base/tests/UtAssert.h"
 
-extern void AppendStoreTest();
 extern void ArchiveTest();
 extern void BaseUtilTest();
 extern void ByteOrderTests();
@@ -17,6 +16,7 @@ extern void CryptoUtilTest();
 extern void CssParser_UnitTests();
 extern void DictTest();
 extern void DirRemoveAllTest();
+extern void UncExistsTest();
 extern void FileUtilTest();
 extern void GuessFileTypeTest();
 extern void JsonTest();
@@ -30,10 +30,10 @@ extern bool AnnotSearch_UnitTests();
 extern void ChapterTable_UnitTests();
 extern void MobiDoc_UnitTests();
 extern void LitDoc_UnitTests();
+extern void RtfDoc_UnitTests();
 extern void PdfSync_UnitTests();
 extern void TextSelection_UnitTests();
 extern void PagePosition_UnitTests();
-extern void CommandPaletteModel_UnitTests();
 extern void SumatraPDF_UnitTests();
 extern void DocumentLayout_UnitTests();
 extern void RenderScale_UnitTests();
@@ -45,7 +45,6 @@ extern void TipMarkup_UnitTests();
 extern void ReadAloudHighlight_UnitTests();
 extern void RefHoverTest();
 extern void AppSettingsTest();
-extern void SimpleLogTest();
 extern bool ShortcutParse_UnitTestShiftedPunct();
 extern bool ShortcutParse_UnitTestGpuiStroke();
 extern bool ShortcutParse_UnitTestAccelTable();
@@ -53,11 +52,16 @@ extern bool MarkdownModel_UnitTestBrowserNavigationUrl();
 extern bool MarkdownToc_UnitTestHtmlLinks();
 extern bool MarkdownToc_UnitTestHtmlHeadings();
 extern bool MarkdownToc_UnitTestMermaid();
+extern bool MarkdownToc_UnitTestHighlightWikilinks();
 #if IS_DEBUG
 extern bool PdfDarkModeImageStats_UnitTest();
 extern bool EbookDoc_UnitTestLoading();
+extern bool EbookDoc_UnitTestLinearNo();
+extern bool EbookDoc_UnitTestUtf16BeTwice();
 bool GumboHtmlParser_UnitTest();
 bool DisplayMode_UnitTestZoom();
+bool Translations_UnitTestUnescape();
+bool Translations_UnitTestLocale();
 extern bool Accelerators_UnitTestFolderNavIsSafe();
 extern bool NavFiles_UnitTestHidden();
 #if !OS_WIN
@@ -94,13 +98,6 @@ TempStr TestDocPathTemp(Str relPath) {
 }
 
 #if OS_WIN
-static void PrintStdout(Str s) {
-    if (str::IsNull(s)) {
-        return;
-    }
-    printf("%.*s", s.len, s.s);
-}
-
 static LONG WINAPI ForAiCrashHandler(EXCEPTION_POINTERS* exceptionInfo) {
     printf("test_util crash\n");
     str::Builder s;
@@ -142,7 +139,6 @@ int main(int argc, char** argv) {
     }
 #endif
 
-    AppendStoreTest();
     ArchiveTest();
     BaseUtilTest();
     ByteOrderTests();
@@ -150,6 +146,7 @@ int main(int argc, char** argv) {
     CssParser_UnitTests();
     DictTest();
     DirRemoveAllTest();
+    UncExistsTest();
     FileUtilTest();
     GuessFileTypeTest();
     JsonTest();
@@ -163,6 +160,7 @@ int main(int argc, char** argv) {
     ChapterTable_UnitTests();
     MobiDoc_UnitTests();
     LitDoc_UnitTests();
+    RtfDoc_UnitTests();
     PdfSync_UnitTests();
     TextSelection_UnitTests();
     PagePosition_UnitTests();
@@ -177,7 +175,6 @@ int main(int argc, char** argv) {
     ReadAloudHighlight_UnitTests();
     RefHoverTest();
     AppSettingsTest();
-    SimpleLogTest();
     utassert(ShortcutParse_UnitTestShiftedPunct());
     utassert(ShortcutParse_UnitTestGpuiStroke());
     utassert(ShortcutParse_UnitTestAccelTable());
@@ -185,12 +182,17 @@ int main(int argc, char** argv) {
     utassert(MarkdownToc_UnitTestHtmlLinks());
     utassert(MarkdownToc_UnitTestHtmlHeadings());
     utassert(MarkdownToc_UnitTestMermaid());
+    utassert(MarkdownToc_UnitTestHighlightWikilinks());
 #if IS_DEBUG
     utassert(PdfDarkModeImageStats_UnitTest());
     utassert(Accelerators_UnitTestFolderNavIsSafe());
     utassert(EbookDoc_UnitTestLoading());
+    utassert(EbookDoc_UnitTestLinearNo());
+    utassert(EbookDoc_UnitTestUtf16BeTwice());
     utassert(GumboHtmlParser_UnitTest());
     utassert(DisplayMode_UnitTestZoom());
+    utassert(Translations_UnitTestUnescape());
+    utassert(Translations_UnitTestLocale());
     utassert(NavFiles_UnitTestHidden());
 #if !OS_WIN
     utassert(MeasurementSystem_UnitTests());

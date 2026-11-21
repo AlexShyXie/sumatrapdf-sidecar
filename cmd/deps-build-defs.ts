@@ -537,7 +537,19 @@ export const mupdf: LibDef = {
   files: [
     // our additions to mupdf (not patches): see src/mupdf/README.md
     { dir: "src/mupdf", patterns: ["mupdf_load_system_font.c"] },
-    { dir: "src/shared/mupdf", patterns: ["fonts_map.c", "noto_sumatra.c", "pkcs7-windows.c", "load-jxl.cpp"] },
+    {
+      dir: "src/shared/mupdf",
+      patterns: [
+        "fonts_map.c",
+        "noto_sumatra.c",
+        "pkcs7-windows.c",
+        "load-jxl.cpp",
+        "ofd.c",
+        "ofd-seal.c",
+        "ofd-crypto.c",
+        "ofd-decrypt.c",
+      ],
+    },
     { dir: "ext/mupdf/source/cbz", patterns: ["mucbz.c", "muimg.c"] },
     {
       dir: "ext/mupdf/source/fitz",

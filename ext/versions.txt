@@ -1,14 +1,16 @@
 Project         Version    Date
 ----------------------------------
-mupdf           1.28.5     2026-09-24
-  https://github.com/ArtifexSoftware/mupdf/releases/tag/1.28.5
+mupdf           1.28.6     2026-10-29
+  https://github.com/ArtifexSoftware/mupdf/releases/tag/1.28.6
   our changes to the vendored tree are recorded in ext/patches/ (see its README)
 
 tesseract       5.5.2      2026-10-14
   https://github.com/tesseract-ocr/tesseract
   mupdf thirdparty submodule (Artifex fork), commit ad0f76d971946512a62c933f490c8111877eddaa
   OCR for the mupdf tools (draw -F ocr.*). Only the LSTM engine and the
-  files mupdf's platform/win32/libtesseract.vcxproj compiles; headers of those
+  files mupdf's platform/win32/libtesseract.vcxproj compiles, plus
+  src/arch/dotproductneon.cpp (the vcxproj omits it; arm64 simddetect.cpp
+  calls DotProductNEON because __aarch64__ implies NEON). Headers of those
   dirs plus include/tesseract. Needs eng.traineddata from tessdata_fast at run time.
   One edit: ccutil.cpp calls GetModuleFileNameA (we build with UNICODE)
 
@@ -39,9 +41,9 @@ mujs           1.3.10
 bzip2           1.0.8      2019-07-21
   https://www.sourceware.org/bzip2/
 
-chmdec          dist       2026-10-02
+chmdec          dist       2026-11-19
   https://github.com/kjk/chmdec
-  commit 19d91e5c1b362fa8be6f6e30a02b49b1167e7823
+  commit cbefd45bf52f0aba11608099e7f3c5c21d81336e
   amalgamated dist/chm.c + dist/chm.h only (was ext/libchm)
 
 freetype        2.14.3
@@ -61,15 +63,15 @@ jbig2dec        0.20
   https://github.com/ArtifexSoftware/jbig2dec/commits/artifex
   amalgamated into ext/a-jbig2dec by cmd/amalgam.ts -jbig2dec, see ext/a-jbig2dec/version.txt
 
-libjpeg-turbo   3.1.4.1    2026-03-27
+libjpeg-turbo   3.2.1      2026-10-27
   https://github.com/libjpeg-turbo/libjpeg-turbo/tags
-  https://github.com/libjpeg-turbo/libjpeg-turbo/releases/tag/3.1.4.1
+  https://github.com/libjpeg-turbo/libjpeg-turbo/releases/tag/3.2.1
   vendored src/ + simd/ (x86/x86-64 NASM); jconfig.h, jconfigint.h, jversion.h
   hand-generated (v8 API). See ext/libjpeg-turbo/src/jconfig.h
 
-djvudec         main       2026-08-01
+djvudec         main       2026-11-08
   https://github.com/kjk/djvudec
-  commit c8bf1b3e6704fd99d6feaba8d8ebc417e013bdb8
+  commit d0625e738913da8a293d585720219733110454f9
   amalgamated dist/djvu.c + dist/djvu.h only
 
 libwebp         1.6.0      2025-06-30
@@ -92,9 +94,9 @@ MinHook         master     20201-01-1
 openjpeg        2.5.4      (post-release dev snapshot)
   mupdf thirdparty submodule, commit 957029eb875eee1118743f200cb86da9d8289de2
 
-brotli          1.2.0
+brotli          1.2.1
   https://github.com/google/brotli
-  mupdf thirdparty submodule, commit 2523f3314501aa5c90e561922b2e668b3ccee26e
+  mupdf thirdparty submodule, commit 05d2263409056fde56805e9cdabd2d31a1f1d427
   amalgamated into ext/a-brotli by cmd/amalgam.ts -brotli, see ext/a-brotli/version.txt
 
 cmark-gfm       0.29.0.gfm.13
@@ -120,13 +122,13 @@ zlib-ng         2.0.6      2021-12-24
 extract         trunk
   https://github.com/ArtifexSoftware/extract
 
-dav1d           1.5.4      2026-07-14
+dav1d           1.5.5      2026-11-17
   https://code.videolan.org/videolan/dav1d
-  https://code.videolan.org/videolan/dav1d/-/tags/1.5.4
+  https://code.videolan.org/videolan/dav1d/-/tags/1.5.5
 
-heicdec         dist       2026-07-28
+heicdec         dist       2026-10-27
   https://github.com/kjk/heicdec
-  commit c0aa68eb43de852706069755b0132ac2ec951dc2
+  commit 39e23d350ce0a3518b8c045f8135e98e02e79c72
   amalgamated dist/heic.c + dist/heic.h only
   HEVC pure-C; AV1 via dav1d; unci via zlib/brotli when present.
   Build flags: HEIC_HAVE_DAV1D, HEIC_HAVE_ZLIB, HEIC_HAVE_BROTLI.
@@ -136,11 +138,16 @@ darkmodelib     0.76.0     2026-08-23
   https://github.com/ozone10/win32-darkmodelib
   https://github.com/ozone10/win32-darkmodelib/commit/25298e8a92ed0fac8e17b3e6878df5bbd7a5d699
 
-jxldec          dist       2026-10-04
+jxldec          dist       2026-10-22
   https://github.com/kjk/jxldec
   commit d71b246bfe099adff25eea5b6c6b9526f5f25282
   amalgamated dist/jxl.c + dist/jxl.h only
   Replaces libjxl + highway + skcms for JPEG XL decode.
+
+microlighter    2.2.0      2026-09-11
+  https://github.com/davatron5000/microlighter
+  syntax highlighting of markdown code blocks (CSS Custom Highlight API)
+  ext/microlighter.min.js: core + all grammars bundled by cmd/update-microlighter.ts
 
 zopfli         1.0.3+     2024-04-11
   https://github.com/google/zopfli

@@ -24,6 +24,7 @@
 #include "DisplayModel.h"
 #include "Theme.h"
 #include "FindBar.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "MainWindow.h"
 #include "Canvas.h"
@@ -143,7 +144,7 @@ static void SyncSpeedLabel(ReadingAutoScrollBar* bar) {
 
 static void OnSpeedSliderDrag(ReadingAutoScrollBar* bar) {
     int idx = limitValue(bar->speedSlider->value, 0, SpeedCount() - 1);
-    SetSpeed(kSpeeds[idx]);
+    SetSpeed(SessionTab(WinFromBar(bar)), kSpeeds[idx]);
     SyncSpeedLabel(bar);
     HwndInvalidate(bar->hwnd);
 }
@@ -211,7 +212,7 @@ void ReadingAutoScrollBar::BuildLayout() {
     speedSlider = new VirtSlider();
     speedSlider->minVal = 0;
     speedSlider->maxVal = SpeedCount() - 1;
-    speedSlider->value = ClosestSpeedIdx(CurrentSpeed());
+    speedSlider->value = ClosestSpeedIdx(CurrentSpeed(SessionTab(WinFromBar(this))));
     speedSlider->onValueChanged = MkFunc0(OnSpeedSliderDrag, this);
     speedSlider->onValueCommitted = MkFunc0(OnSpeedSliderCommit, this);
     speedSlider->onGetTooltip = MkFunc1(OnSpeedSliderTooltip, this);
@@ -258,10 +259,10 @@ void ReadingAutoScrollBar::BuildLayout() {
 
 void ReadingAutoScrollBar::SyncLabels() {
     WindowTab* tab = SessionTab(WinFromBar(this));
-    bool paused = tab && (tab->autoScroll.paused || tab->autoScroll.atEnd);
+    bool paused = tab && tab->autoScroll.IsStopped();
     btnPause->SetText(paused ? Tr("Resume") : Tr("Pause"));
     if (speedSlider && !speedSlider->IsAdjusting()) {
-        speedSlider->SetValue(ClosestSpeedIdx(CurrentSpeed()), false);
+        speedSlider->SetValue(ClosestSpeedIdx(CurrentSpeed(tab)), false);
     }
     SyncSpeedLabel(this);
     status->SetText(StatusTextTemp(tab));
@@ -326,24 +327,12 @@ void ReadingAutoScrollBar::UpdateLayout(bool forceLayout) {
 }
 
 void ReadingAutoScrollBar::OnPaint(WindowBase::PaintEvent* ev) {
-    Rect rc = HwndClientRect(hwnd);
-    Color colBg = ThemeNotificationsBackgroundColor();
-    Color colBorder = kColGray;
     SyncColors();
-    Gfx* gfx = GfxCreateWithDoubleBuffer(this, ev->hdc);
-    gfx->FillRect(rc, colBg);
-    if (vroot) {
-        vroot->Paint(gfx, rc);
-    }
-    gfx->DrawRect(rc, colBorder);
-    delete gfx;
+    PaintBorderedBar(this, ev->hdc, ThemeNotificationsBackgroundColor(), kColGray);
 }
 
 static void BarOnWindowMoved(ReadingAutoScrollBar* bar, MainWindow*) {
-    if (!bar->hwnd || !HwndIsVisible(bar->hwnd)) {
-        return;
-    }
-    bar->UpdateLayout();
+    RelayoutIfVisible(bar);
 }
 
 ReadingAutoScrollBar* BarEnsure(MainWindow* win) {
@@ -435,8 +424,9 @@ TempStr ReadingAutoScrollBarStateTemp(int* exitCodeOut) {
     Rect reverse = bar->btnReverse->bounds;
     Rect speed = bar->speedSlider->bounds;
     out.Append(fmt("OK visible=1 paused=%d atEnd=%d dir=%d speed=%d scrollY=%d page=%d pages=%d hwnd=%d\n",
-                   (int)tab->autoScroll.paused, (int)tab->autoScroll.atEnd, tab->autoScroll.dir,
-                   (int)lroundf(CurrentSpeed()), scrollY, page, pages, (int)(uintptr_t)bar->hwnd));
+                   (int)tab->autoScroll.IsStopped(), (int)(tab->autoScroll.stop == AutoScrollStop::AtEnd),
+                   tab->autoScroll.dir, (int)lroundf(CurrentSpeed(tab)), scrollY, page, pages,
+                   (int)(uintptr_t)bar->hwnd));
     out.Append(fmt("pause=%d,%d,%d,%d\n", pause.x, pause.y, pause.dx, pause.dy));
     out.Append(fmt("stop=%d,%d,%d,%d\n", stop.x, stop.y, stop.dx, stop.dy));
     out.Append(fmt("reverse=%d,%d,%d,%d\n", reverse.x, reverse.y, reverse.dx, reverse.dy));

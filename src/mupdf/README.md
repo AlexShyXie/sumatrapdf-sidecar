@@ -23,10 +23,20 @@ so the tools we patch inside `ext/mupdf` include them by bare name
 
 - `load-jxl.cpp` / `load-jxl.h` - JPEG XL metadata and pixel decoding through
   jxldec for MuPDF images and PDF `/JXLDecode` streams
-- `zxing-eci.cpp` - builds zxing-cpp's `ECI.cpp` under a name that does not
-  collide with zint's `eci.c` in the `zxing` lib (mupdf's `eci_dedup.cpp`)
+- `zxing-eci.cpp` (in `src/shared/mupdf`) - builds zxing-cpp's `ECI.cpp` under a
+  name that does not collide with zint's `eci.c` in the `zxing` lib (mupdf's
+  `eci_dedup.cpp`)
 
 _Changes_ to mupdf itself still go into `ext/mupdf` in place and get recorded as
 a patch in `ext/patches/` (see its README). Put code here only when it is
 entirely ours: a whole new file that mupdf's build does not know about. Shared
 additions live in `src/shared/mupdf`.
+
+## OFD
+
+`src/shared/mupdf/ofd.c` is a MuPDF document handler for OFD (GB/T 33190),
+registered by `EngineMupdf`. It builds a display list per page; a package's
+documents are one page sequence. `ofd-seal.c` reads and checks SES / GB/T 35275
+signatures and certificate chains with the SM2 / SM3 / SM4 code in
+`ofd-crypto.c`; `ofd-decrypt.c` opens password-encrypted packages. Tests: `tests/issue-1909.ts`; sample corpus:
+`tests/ad-hoc-ofd-corpus.ts`.

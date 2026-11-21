@@ -36,6 +36,10 @@ TempStr GetSumatraDataDirTemp() {
     return {};
 }
 
+TempStr GetConverterDataDirTemp() {
+    return {};
+}
+
 bool IsStressTesting() {
     return false;
 }
@@ -75,6 +79,11 @@ void SetCurrentLanguageAndRefreshUI(Str langCode) {
     SetCurrentLang(langCode);
 }
 
+#if !OS_WIN
+// AppShell.cpp (gpui) asks the OS; the tools go by $LANG alone
+void GetSystemPreferredLocales(StrVec&) {}
+#endif
+
 void UpdateDocumentColors() {}
 
 void UpdateFixedPageScrollbarsVisibility() {}
@@ -98,14 +107,6 @@ SeqStrings gToolbarPositionNames = "top\0bottom\0";
 // ng: bodies copied from orig SumatraPDF.cpp; the model asks for them, the
 // window that owns the render cache and the scrollbars comes in step 6
 RenderCache* gRenderCache;
-
-int ScrollbarModeFromPrefs() {
-    int idx = SeqStrIndexIS(gScrollbarModeNames, gSettings->scrollbars);
-    if (idx < 0) {
-        idx = kScrollbarWindows;
-    }
-    return idx;
-}
 
 bool ScrollbarsAreHidden() {
     return ScrollbarModeFromPrefs() == kScrollbarHidden;
@@ -151,6 +152,7 @@ void HomePageInvalidateLayoutCache() {}
 
 struct FileState;
 void HomePageThumbnailChanged(FileState*) {}
+void SetThumbnailFromImage(Str, Str) {}
 
 // SumatraPDFCommon.cpp, which only the app builds
 void OnThumbnailsTypeChanged() {}
@@ -178,7 +180,7 @@ namespace gpui {
 struct PaintCtx;
 }
 
-bool CanvasDrawTile(gpui::PaintCtx*, BitmapCacheEntry*, Rect, Rect) {
+bool CanvasDrawTile(gpui::PaintCtx*, BitmapCacheEntry*, Rect, Rect, bool) {
     return false;
 }
 
@@ -204,6 +206,10 @@ bool HasKnownExternalViewerForCmd(int) {
 }
 
 bool CanViewWithKnownExternalViewer(WindowTab*, int) {
+    return false;
+}
+
+bool CanSendAsEmailAttachment(WindowTab*) {
     return false;
 }
 

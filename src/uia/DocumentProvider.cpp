@@ -4,6 +4,7 @@
 #include "base/Base.h"
 #include "base/Win.h"
 #include <uiautomationcore.h>
+#include <uiautomationcoreapi.h>
 
 #include "gui/UIModels.h"
 
@@ -14,6 +15,7 @@
 #include "TextSelection.h"
 #include "base/File.h"
 #include "uia/Constants.h"
+#include "uia/Common.h"
 #include "uia/PageProvider.h"
 #include "uia/Provider.h"
 #include "uia/TextRange.h"
@@ -68,6 +70,8 @@ void SumatraUIAutomationDocumentProvider::FreeDocument() {
 
     released = true;
     dm = nullptr;
+    // clients may keep this provider after the root (which doesn't ref-count us) is gone
+    root = nullptr;
 
     SumatraUIAutomationPageProvider* it = child_first;
     while (it) {
@@ -105,11 +109,6 @@ SumatraUIAutomationPageProvider* SumatraUIAutomationDocumentProvider::GetFirstPa
     return child_first;
 }
 
-SumatraUIAutomationPageProvider* SumatraUIAutomationDocumentProvider::GetLastPage() {
-    ReportIf(!IsDocumentLoaded());
-    return child_last;
-}
-
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::QueryInterface(REFIID riid, void** ppv) {
     static const QITAB qit[] = {QITABENT(SumatraUIAutomationDocumentProvider, IRawElementProviderSimple),
                                 QITABENT(SumatraUIAutomationDocumentProvider, IRawElementProviderFragment),
@@ -124,12 +123,7 @@ ULONG STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::AddRef() {
 }
 
 ULONG STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::Release() {
-    LONG res = InterlockedDecrement(&refCount);
-    ReportIf(res < 0);
-    if (0 == res) {
-        delete this;
-    }
-    return res;
+    return ComRelease(&refCount, [this] { delete this; });
 }
 
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::Navigate(enum NavigateDirection direction,
@@ -153,9 +147,16 @@ HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::Navigate(enum Nav
         } else {
             *pRetVal = child_last;
         }
-        (*pRetVal)->AddRef();
+        // a document with no pages has no children
+        if (*pRetVal) {
+            (*pRetVal)->AddRef();
+        }
         return S_OK;
     } else if (direction == NavigateDirection_Parent) {
+        if (!root) {
+            *pRetVal = nullptr;
+            return UIA_E_ELEMENTNOTAVAILABLE;
+        }
         *pRetVal = root;
         (*pRetVal)->AddRef();
         return S_OK;
@@ -186,13 +187,7 @@ HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::GetRuntimeId(SAFE
 }
 
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::GetEmbeddedFragmentRoots(SAFEARRAY** pRetVal) {
-    if (pRetVal == nullptr) {
-        return E_POINTER;
-    }
-
-    // no other roots => return nullptr
-    *pRetVal = nullptr;
-    return S_OK;
+    return UiaReturnNull(pRetVal);
 }
 
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::SetFocus() {
@@ -200,20 +195,12 @@ HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::SetFocus() {
 }
 
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::get_BoundingRectangle(struct UiaRect* pRetVal) {
-    // share area with the canvas uia provider
-    return root->get_BoundingRectangle(pRetVal);
+    return UiaRootRect(root, pRetVal);
 }
 
 HRESULT STDMETHODCALLTYPE
 SumatraUIAutomationDocumentProvider::get_FragmentRoot(IRawElementProviderFragmentRoot** pRetVal) {
-    if (pRetVal == nullptr) {
-        return E_POINTER;
-    }
-
-    // return the root node
-    *pRetVal = root;
-    root->AddRef();
-    return S_OK;
+    return UiaRootFragmentRoot(root, pRetVal);
 }
 
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::GetPatternProvider(PATTERNID patternId,
@@ -278,20 +265,11 @@ HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::GetPropertyValue(
 
 HRESULT STDMETHODCALLTYPE
 SumatraUIAutomationDocumentProvider::get_HostRawElementProvider(IRawElementProviderSimple** pRetVal) {
-    if (pRetVal == nullptr) {
-        return E_POINTER;
-    }
-    *pRetVal = nullptr;
-    return S_OK;
+    return UiaReturnNull(pRetVal);
 }
 
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::get_ProviderOptions(ProviderOptions* pRetVal) {
-    if (pRetVal == nullptr) {
-        return E_POINTER;
-    }
-    // see SumatraUIAutomationProvider::get_ProviderOptions
-    *pRetVal = ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading;
-    return S_OK;
+    return UiaProviderOptions(pRetVal);
 }
 
 HRESULT STDMETHODCALLTYPE SumatraUIAutomationDocumentProvider::GetSelection(SAFEARRAY** pRetVal) {

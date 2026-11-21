@@ -33,15 +33,11 @@
 #include "PdfTools.h"
 #include "gui/AppShell.h"
 #include "gui/ToolWindow.h"
-#include "gui/OleDragDrop.h"
-#include "gui/NativeCursors.h"
-#include "gui/TouchGestures.h"
 #include "HomePage.h"
 #include "SumatraConfig.h"
 #include "RefHover.h"
 #include "gui/DocCanvas.h"
 #include "AnnotEditToolbar.h"
-#include "SelectTextKeyboard.h"
 
 #if OS_WIN
 
@@ -374,11 +370,8 @@ static void OpenDroppedFilesNow(DroppedFiles* d) {
     delete d;
 }
 
-// orig's OnDropFiles. `ptDrop` is in client pixels. Returns false when the
-// drop is refused. `dragFinish` is false for an HDROP that an IDataObject
-// owns (OLE drop), and then the files are opened once Drop() returned, so
-// the drag source isn't kept waiting.
-bool AppShellOnDropFiles(HWND hwnd, HDROP hdrop, POINT ptDrop, bool inClient, bool dragFinish) {
+// orig's OnDropFiles, for WM_DROPFILES. `ptDrop` is in client pixels.
+static void AppShellOnDropFiles(HWND hwnd, HDROP hdrop, POINT ptDrop, bool inClient) {
     int n = (int)DragQueryFileW(hdrop, (UINT)-1, nullptr, 0);
     // client pixels; the Merge PDF grid wants window dips
     float scale = (float)DpiGetForHwnd(hwnd) / 96.f;
@@ -398,9 +391,7 @@ bool AppShellOnDropFiles(HWND hwnd, HDROP hdrop, POINT ptDrop, bool inClient, bo
             VecAppend(paths, str::Dup(path));
         }
     }
-    if (dragFinish) {
-        DragFinish(hdrop);
-    }
+    DragFinish(hdrop);
     logf("AppShellOnDropFiles: %d file(s)\n", paths.len);
     // a tool window's drop (the Merge PDF window) is its main window's
     DropHost host = ToolWindowOwnsHwnd(hwnd) ? DropHost::ToolWindow : DropHost::Frame;
@@ -424,7 +415,7 @@ bool AppShellOnDropFiles(HWND hwnd, HDROP hdrop, POINT ptDrop, bool inClient, bo
         for (Str s : paths) {
             str::Free(s);
         }
-        return false;
+        return;
     }
     auto* d = new DroppedFiles();
     d->win = win;
@@ -434,110 +425,16 @@ bool AppShellOnDropFiles(HWND hwnd, HDROP hdrop, POINT ptDrop, bool inClient, bo
     d->pt = ptDips;
     d->inClient = inClient;
     d->host = host;
-    if (dragFinish) {
-        OpenDroppedFilesNow(d);
-    } else {
-        uitask::Post(MkFunc0<DroppedFiles>(OpenDroppedFilesNow, d), "OpenDroppedFiles");
-    }
-    return true;
+    OpenDroppedFilesNow(d);
 }
 
 static void OnDropFiles(HWND hwnd, HDROP hdrop) {
     POINT ptDrop{};
     bool inClient = DragQueryPoint(hdrop, &ptDrop);
-    AppShellOnDropFiles(hwnd, hdrop, ptDrop, inClient, true);
-}
-
-// ng: gpui has no cursor from an image. When the canvas wants one of orig's
-// bitmap cursors (the drag hand, the laser dot, a placement cursor) it asks
-// gpui for a stand-in kind and this puts the real cursor in its place.
-static HCURSOR NativeCursorWanted(HWND hwnd) {
-    MainWindow* win = WinOf(hwnd);
-    if (!win || !AppShellNativeCursorActive(win)) {
-        return nullptr;
-    }
-    return NativeCursorGet(win->nativeCursor);
-}
-
-TempStr NativeCursorTestTemp(MainWindow* win, Str bmpPath) {
-    HWND hwnd = AppShellNativeHwnd(win);
-    if (!hwnd) {
-        return StrL("ERR no-window");
-    }
-    HCURSOR cur = NativeCursorWanted(hwnd);
-    LRESULT handled = SendMessageW(hwnd, WM_SETCURSOR, (WPARAM)hwnd, MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
-    int dx = 0;
-    int dy = 0;
-    int hotX = 0;
-    int hotY = 0;
-    ICONINFO ii{};
-    if (cur && GetIconInfo(cur, &ii)) {
-        BITMAP bm{};
-        GetObject(ii.hbmColor ? ii.hbmColor : ii.hbmMask, sizeof(bm), &bm);
-        dx = bm.bmWidth;
-        dy = ii.hbmColor ? bm.bmHeight : bm.bmHeight / 2;
-        hotX = (int)ii.xHotspot;
-        hotY = (int)ii.yHotspot;
-        DeleteObject(ii.hbmColor);
-        DeleteObject(ii.hbmMask);
-    }
-    if (cur && dx > 0 && dy > 0 && len(bmpPath) > 0) {
-        BITMAPINFO bmi{};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = dx;
-        bmi.bmiHeader.biHeight = -dy;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        void* bits = nullptr;
-        HDC hdc = CreateCompatibleDC(nullptr);
-        HBITMAP dib = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        if (dib && bits) {
-            HGDIOBJ prev = SelectObject(hdc, dib);
-            // on a mid gray, so that black, white and translucent parts all show
-            RECT rc{0, 0, dx, dy};
-            HBRUSH br = CreateSolidBrush(RGB(0xa0, 0xa0, 0xa0));
-            FillRect(hdc, &rc, br);
-            DeleteObject(br);
-            DrawIconEx(hdc, 0, 0, cur, dx, dy, 0, nullptr, DI_NORMAL);
-            GdiFlush();
-            BITMAPFILEHEADER fh{};
-            fh.bfType = 0x4d42;
-            fh.bfOffBits = sizeof(fh) + sizeof(BITMAPINFOHEADER);
-            fh.bfSize = fh.bfOffBits + (DWORD)(dx * dy * 4);
-            str::Builder data;
-            data.Append(Str((char*)&fh, (int)sizeof(fh)));
-            data.Append(Str((char*)&bmi.bmiHeader, (int)sizeof(BITMAPINFOHEADER)));
-            data.Append(Str((char*)bits, dx * dy * 4));
-            file::WriteFile(bmpPath, ToStrTemp(data));
-            SelectObject(hdc, prev);
-        }
-        DeleteObject(dib);
-        DeleteDC(hdc);
-    }
-    return fmt("OK native=%d active=%d handled=%d size=%dx%d hot=%d,%d", (int)win->nativeCursor, cur ? 1 : 0,
-               (int)handled, dx, dy, hotX, hotY);
-}
-
-void AppShellApplyNativeCursor(MainWindow* win) {
-    HWND hwnd = AppShellNativeHwnd(win);
-    if (!hwnd || !AppShellNativeCursorActive(win)) {
-        return;
-    }
-    POINT pt{};
-    GetCursorPos(&pt);
-    if (WindowFromPoint(pt) != hwnd) {
-        return;
-    }
-    if (HCURSOR cur = NativeCursorGet(win->nativeCursor)) {
-        SetCursor(cur);
-    }
+    AppShellOnDropFiles(hwnd, hdrop, ptDrop, inClient);
 }
 
 float CanvasScale(MainWindow* win);
-bool FreeTextInPlaceSetText(MainWindow* win, const WCHAR* text);
-bool CommandPaletteSetText(MainWindow* win, const WCHAR* text);
-bool FreeTextInPlaceCommitOnChar(MainWindow* win, int ch);
 
 // orig's SumatraPDF.h. Posted to the canvas; ng has no canvas child.
 constexpr int kSbHalfPageUp = WM_USER + 102;
@@ -613,306 +510,6 @@ static void PresentScroll(MainWindow* win, HWND hwnd) {
     }
 }
 
-// A posted click carries MK_* in wParam. gpui asks GetKeyState, which
-// SendMessage does not update, so Ctrl+click never entered Edit PDF.
-struct PostedKeyBits {
-    BYTE before[256]{};
-    bool changed = false;
-};
-
-static PostedKeyBits ApplyPostedMouseMods(WPARAM wp) {
-    PostedKeyBits bits;
-    bool wantCtrl = (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) != 0 && !IsCtrlPressed();
-    bool wantShift = (GET_KEYSTATE_WPARAM(wp) & MK_SHIFT) != 0 && !IsShiftPressed();
-    if (!wantCtrl && !wantShift) {
-        return bits;
-    }
-    if (!GetKeyboardState(bits.before)) {
-        return bits;
-    }
-    BYTE state[256];
-    memcpy(state, bits.before, sizeof(state));
-    if (wantCtrl) {
-        state[VK_CONTROL] |= 0x80;
-        state[VK_LCONTROL] |= 0x80;
-    }
-    if (wantShift) {
-        state[VK_SHIFT] |= 0x80;
-        state[VK_LSHIFT] |= 0x80;
-    }
-    if (SetKeyboardState(state)) {
-        bits.changed = true;
-    }
-    return bits;
-}
-
-static void RestorePostedMouseMods(PostedKeyBits& bits) {
-    if (!bits.changed) {
-        return;
-    }
-    SetKeyboardState(bits.before);
-    bits.changed = false;
-}
-
-// GetPixel cannot read the frame: it is a flip swapchain created with
-// WS_EX_NOREDIRECTIONBITMAP. Tests sample SUMATRA_PDF_CANVAS. This owned
-// popup is a real GDI window, so the sample sees the page.
-static const WCHAR* kPixelMirrorClass = L"SUMATRA_PDF_CANVAS";
-
-struct PixelMirror {
-    HWND frame = nullptr;
-    HWND hwnd = nullptr;
-    HBITMAP dib = nullptr;
-};
-
-static Vec<PixelMirror> gPixelMirrors;
-static bool gPixelMirrorBusy = false;
-
-static LRESULT CALLBACK PixelMirrorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
-
-static PixelMirror* PixelMirrorForFrame(HWND frame) {
-    for (PixelMirror& m : gPixelMirrors) {
-        if (m.frame == frame) {
-            return &m;
-        }
-    }
-    return nullptr;
-}
-
-HWND TestingCanvasHwnd(HWND frame) {
-    PixelMirror* m = PixelMirrorForFrame(frame);
-    return m ? m->hwnd : nullptr;
-}
-
-static PixelMirror* PixelMirrorForHwnd(HWND hwnd) {
-    for (PixelMirror& m : gPixelMirrors) {
-        if (m.hwnd == hwnd) {
-            return &m;
-        }
-    }
-    return nullptr;
-}
-
-static bool MirrorInputMsg(UINT msg) {
-    switch (msg) {
-        case WM_MOUSEMOVE:
-        case WM_LBUTTONDOWN:
-        case WM_LBUTTONUP:
-        case WM_LBUTTONDBLCLK:
-        case WM_RBUTTONDOWN:
-        case WM_RBUTTONUP:
-        case WM_RBUTTONDBLCLK:
-        case WM_MBUTTONDOWN:
-        case WM_MBUTTONUP:
-        case WM_MBUTTONDBLCLK:
-        case WM_XBUTTONDOWN:
-        case WM_XBUTTONUP:
-        case WM_XBUTTONDBLCLK:
-        case WM_MOUSEWHEEL:
-        case WM_MOUSEHWHEEL:
-        case WM_CONTEXTMENU:
-        case WM_VSCROLL:
-        case WM_HSCROLL:
-        case WM_KEYDOWN:
-        case WM_KEYUP:
-        case WM_CHAR:
-        case WM_SYSKEYDOWN:
-        case WM_SYSKEYUP:
-        case WM_SYSCHAR:
-            return true;
-    }
-    return false;
-}
-
-static void RegisterPixelMirrorClass() {
-    static bool registered = false;
-    if (registered) {
-        return;
-    }
-    WNDCLASSEXW wc{sizeof(wc)};
-    wc.lpfnWndProc = PixelMirrorProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = kPixelMirrorClass;
-    registered = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
-}
-
-static void BlitDib(HWND hwnd, HBITMAP dib, int w, int h) {
-    HDC dc = GetWindowDC(hwnd);
-    if (!dc) {
-        return;
-    }
-    HDC mem = CreateCompatibleDC(dc);
-    HGDIOBJ old = SelectObject(mem, dib);
-    BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, old);
-    DeleteDC(mem);
-    ReleaseDC(hwnd, dc);
-}
-
-static void PlacePixelMirror(PixelMirror* m) {
-    if (!m || !m->hwnd || !IsWindow(m->frame)) {
-        return;
-    }
-    RECT rc{};
-    GetClientRect(m->frame, &rc);
-    POINT origin{0, 0};
-    ClientToScreen(m->frame, &origin);
-    // leave z-order alone: an owned popup already sits above its frame, and
-    // raising it here would cover a dialog opened after it
-    SetWindowPos(m->hwnd, nullptr, origin.x, origin.y, rc.right - rc.left, rc.bottom - rc.top,
-                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
-}
-
-// PrintWindow of the frame, then into the popup. The popup is hidden for the
-// capture so it is not what the frame's thumbnail shows.
-static void UpdatePixelMirror(HWND frame) {
-    if (!gForTesting || gPixelMirrorBusy) {
-        return;
-    }
-    PixelMirror* m = PixelMirrorForFrame(frame);
-    if (!m || !m->hwnd) {
-        return;
-    }
-    RECT rc{};
-    GetClientRect(frame, &rc);
-    int w = rc.right - rc.left;
-    int h = rc.bottom - rc.top;
-    if (w <= 0 || h <= 0) {
-        return;
-    }
-
-    gPixelMirrorBusy = true;
-    PlacePixelMirror(m);
-    SetWindowPos(m->hwnd, nullptr, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
-
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HDC screen = GetDC(frame);
-    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    bool ok = false;
-    if (dib) {
-        HDC mem = CreateCompatibleDC(screen);
-        HGDIOBJ old = SelectObject(mem, dib);
-        ok = PrintWindow(frame, mem, PW_CLIENTONLY | PW_RENDERFULLCONTENT) != FALSE;
-        SelectObject(mem, old);
-        DeleteDC(mem);
-    }
-    ReleaseDC(frame, screen);
-
-    if (!ok) {
-        if (dib) {
-            DeleteObject(dib);
-        }
-        PlacePixelMirror(m);
-        gPixelMirrorBusy = false;
-        return;
-    }
-    if (m->dib) {
-        DeleteObject(m->dib);
-    }
-    m->dib = dib;
-    PlacePixelMirror(m);
-    BlitDib(m->hwnd, dib, w, h);
-    gPixelMirrorBusy = false;
-}
-
-static void EnsurePixelMirror(HWND frame) {
-    if (!gForTesting || !frame || PixelMirrorForFrame(frame)) {
-        return;
-    }
-    RegisterPixelMirrorClass();
-    PixelMirror m;
-    m.frame = frame;
-    m.hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_NOPARENTNOTIFY, kPixelMirrorClass, L"",
-                             WS_POPUP, 0, 0, 0, 0, frame, nullptr, GetModuleHandleW(nullptr), frame);
-    if (!m.hwnd) {
-        return;
-    }
-    VecAppend(gPixelMirrors, m);
-    UpdatePixelMirror(frame);
-}
-
-static void ForgetPixelMirror(HWND frame) {
-    for (int i = 0; i < len(gPixelMirrors); i++) {
-        if (gPixelMirrors[i].frame != frame) {
-            continue;
-        }
-        HWND hwnd = gPixelMirrors[i].hwnd;
-        HBITMAP dib = gPixelMirrors[i].dib;
-        gPixelMirrors[i].hwnd = nullptr;
-        gPixelMirrors[i].dib = nullptr;
-        gPixelMirrors[i].frame = nullptr;
-        if (dib) {
-            DeleteObject(dib);
-        }
-        if (hwnd) {
-            DestroyWindow(hwnd);
-        }
-        VecRemoveAt(gPixelMirrors, i);
-        return;
-    }
-}
-
-static LRESULT CALLBACK PixelMirrorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_NCCREATE) {
-        auto* cs = (CREATESTRUCTW*)lp;
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-    HWND frame = (HWND)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    if (msg == WM_ERASEBKGND) {
-        return 1;
-    }
-    if (msg == WM_PAINT) {
-        PAINTSTRUCT ps{};
-        HDC dc = BeginPaint(hwnd, &ps);
-        PixelMirror* m = PixelMirrorForHwnd(hwnd);
-        if (m && m->dib && dc) {
-            BITMAP bm{};
-            if (GetObject(m->dib, sizeof(bm), &bm) == sizeof(bm)) {
-                HDC mem = CreateCompatibleDC(dc);
-                HGDIOBJ old = SelectObject(mem, m->dib);
-                BitBlt(dc, 0, 0, bm.bmWidth, bm.bmHeight, mem, 0, 0, SRCCOPY);
-                SelectObject(mem, old);
-                DeleteDC(mem);
-            }
-        }
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    if (msg == WM_MOUSEACTIVATE) {
-        return MA_NOACTIVATE;
-    }
-    if (msg == WM_SETFOCUS) {
-        if (frame) {
-            SetFocus(frame);
-        }
-        return 0;
-    }
-    if (msg == WM_NCDESTROY) {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-        return 0;
-    }
-    if (frame && MirrorInputMsg(msg)) {
-        return SendMessageW(frame, msg, wp, lp);
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-static LRESULT DefSubclassWithPostedMods(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    PostedKeyBits bits = ApplyPostedMouseMods(wp);
-    LRESULT res = DefSubclassProc(hwnd, msg, wp, lp);
-    RestorePostedMouseMods(bits);
-    return res;
-}
-
 static LRESULT CALLBACK ShellSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
     switch (msg) {
         case WM_NCCALCSIZE:
@@ -947,32 +544,6 @@ static LRESULT CALLBACK ShellSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                 return 0;
             }
             break;
-        case WM_SETCURSOR:
-            if (LOWORD(lp) == HTCLIENT) {
-                if (HCURSOR cur = NativeCursorWanted(hwnd)) {
-                    SetCursor(cur);
-                    return TRUE;
-                }
-            }
-            break;
-        case WM_MOUSEMOVE: {
-            // gpui sets the cursor itself from inside the mouse move when the
-            // kind under the pointer changed
-            LRESULT res = DefSubclassWithPostedMods(hwnd, msg, wp, lp);
-            if (HCURSOR cur = NativeCursorWanted(hwnd)) {
-                SetCursor(cur);
-            }
-            return res;
-        }
-        case WM_GESTURENOTIFY:
-        case WM_GESTURE:
-            // orig's OnGesture: pinch zoom, pan, flick, rotate, taps on a document
-            if (MainWindow* win = WinOf(hwnd)) {
-                if (TouchGesturesOnMessage(win, hwnd, msg, lp)) {
-                    return 0;
-                }
-            }
-            break;
         case WM_DROPFILES:
             OnDropFiles(hwnd, (HDROP)wp);
             return 0;
@@ -983,38 +554,22 @@ static LRESULT CALLBACK ShellSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
             break;
         case WM_MOUSEWHEEL:
         case WM_MOUSEHWHEEL:
-            // the home page scrolls from a wheel posted at the frame, including
-            // when the cursor is not over the thumbnails
             if (MainWindow* win = WinOf(hwnd)) {
                 // CloseWindow is tearing the document down. Drop the wheel.
                 if (win->isBeingClosed) {
                     return 0;
                 }
-                if (msg == WM_MOUSEWHEEL && win->IsCurrentTabAbout()) {
-                    HomePageOnMouseWheel(win, GET_WHEEL_DELTA_WPARAM(wp));
-                    return 0;
-                }
-                // posted wheels carry MK_* in the message. gpui reads GetKeyState,
-                // which a test's PostMessage does not set.
-                POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-                ScreenToClient(hwnd, &pt);
-                int delta = GET_WHEEL_DELTA_WPARAM(wp);
-                bool isCtrl = ((GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) != 0) || IsCtrlPressed();
-                bool isShift = ((GET_KEYSTATE_WPARAM(wp) & MK_SHIFT) != 0) || IsShiftPressed();
-                if (RefHoverTakePostedWheel(win, msg == WM_MOUSEHWHEEL, delta, isCtrl, isShift, pt.x, pt.y)) {
-                    return 0;
-                }
                 if (ForwardBrowserMsg(win, msg, wp, lp)) {
                     return 0;
                 }
-                // lParam is screen coords. A message aimed at the window rather
-                // than a point (tests post 0) is outside the client; orig's
-                // canvas window still scrolls.
+                // over the caption or a border: orig's frame passes it to the canvas
+                POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                ScreenToClient(hwnd, &pt);
                 RECT rc{};
                 GetClientRect(hwnd, &rc);
-                bool inside = pt.x >= 0 && pt.y >= 0 && pt.x < rc.right && pt.y < rc.bottom;
-                if (!inside && msg == WM_MOUSEWHEEL && win->AsFixed()) {
-                    DocCanvasPostedWheel(win, delta, isCtrl, isShift);
+                if (!PtInRect(&rc, pt) && msg == WM_MOUSEWHEEL && win->AsFixed()) {
+                    DocCanvasFrameWheel(win, GET_WHEEL_DELTA_WPARAM(wp), IsCtrlPressed(), IsShiftPressed(),
+                                        IsAltPressed());
                     return 0;
                 }
             }
@@ -1037,29 +592,6 @@ static LRESULT CALLBACK ShellSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         case WM_KEYUP:
             if (MainWindow* win = WinOf(hwnd)) {
                 if (ForwardBrowserMsg(win, msg, wp, lp)) {
-                    return 0;
-                }
-            }
-            break;
-        case WM_SETTEXT:
-            if (MainWindow* win = WinOf(hwnd)) {
-                if (FreeTextInPlaceSetText(win, (const WCHAR*)lp)) {
-                    return TRUE;
-                }
-                if (CommandPaletteSetText(win, (const WCHAR*)lp)) {
-                    return TRUE;
-                }
-            }
-            break;
-        case WM_CHAR:
-            if (MainWindow* win = WinOf(hwnd)) {
-                if (FreeTextInPlaceCommitOnChar(win, (int)wp)) {
-                    return 0;
-                }
-                // a posted WM_CHAR (the keyboard-selection test types 'v')
-                // never becomes a gpui keydown. Handling it there as well
-                // would toggle visual mode twice for a real key.
-                if (SelectTextWithKeyboardOnChar(win, (int)wp)) {
                     return 0;
                 }
             }
@@ -1174,17 +706,9 @@ static LRESULT CALLBACK ShellSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                 // gpui has laid the frame out for its new size
                 LRESULT res = DefSubclassProc(hwnd, msg, wp, lp);
                 ToolWindowsFollow(win);
-                if (PixelMirror* m = PixelMirrorForFrame(hwnd)) {
-                    PlacePixelMirror(m);
-                }
                 return res;
             }
             break;
-        case WM_PAINT: {
-            LRESULT res = DefSubclassProc(hwnd, msg, wp, lp);
-            UpdatePixelMirror(hwnd);
-            return res;
-        }
         case WM_KILLFOCUS:
             // no new focus: the on-screen keyboard. Keep the contents editor.
             if ((HWND)wp == nullptr) {
@@ -1197,29 +721,13 @@ static LRESULT CALLBACK ShellSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
             }
             break;
         case WM_DESTROY:
-            ForgetPixelMirror(hwnd);
             GlobalHotkeysOnDestroy(hwnd);
-            RevokeCanvasDropTarget(hwnd);
             break;
         case WM_CONTEXTMENU:
-            if (MainWindow* win = WinOf(hwnd)) {
-                DocCanvasOnWmContextMenu(win, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            if (AppShellOnWmContextMenu(WinOf(hwnd), GET_X_LPARAM(lp), GET_Y_LPARAM(lp))) {
                 return 0;
             }
             break;
-        case WM_LBUTTONDOWN:
-        case WM_LBUTTONUP:
-        case WM_LBUTTONDBLCLK:
-        case WM_RBUTTONDOWN:
-        case WM_RBUTTONUP:
-        case WM_RBUTTONDBLCLK:
-        case WM_MBUTTONDOWN:
-        case WM_MBUTTONUP:
-        case WM_MBUTTONDBLCLK:
-        case WM_XBUTTONDOWN:
-        case WM_XBUTTONUP:
-        case WM_XBUTTONDBLCLK:
-            return DefSubclassWithPostedMods(hwnd, msg, wp, lp);
         default:
             break;
     }
@@ -1299,6 +807,30 @@ void AppShellToggleDpiOverride() {
     }
 }
 
+constexpr UINT_PTR kToolCmdSubclassId = 2;
+
+static LRESULT CALLBACK ToolCmdSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_COMMAND && HIWORD(wp) == 0 && LOWORD(wp) > 0) {
+        // tests send the palette Ctrl+A / Ctrl+C that way
+        MainWindow* win = ToolWindowOwnerFromHwnd(hwnd);
+        if (IsMainWindowValid(win)) {
+            ExecuteCmd(win, (int)LOWORD(wp));
+            return 0;
+        }
+    }
+    if (msg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, ToolCmdSubclass, kToolCmdSubclassId);
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+// orig: a command id sent at a tool window runs on its owner
+void AppShellClaimToolHwnd(HWND hwnd) {
+    if (hwnd) {
+        SetWindowSubclass(hwnd, ToolCmdSubclass, kToolCmdSubclassId, 0);
+    }
+}
+
 void AppShellEnableFileDrop(MainWindow* win) {
     HWND hwnd = nullptr;
     EnumThreadWindows(GetCurrentThreadId(), FindGpuiWnd, (LPARAM)&hwnd);
@@ -1308,12 +840,9 @@ void AppShellEnableFileDrop(MainWindow* win) {
     }
     NativeWin nw{hwnd, win};
     VecAppend(gNativeWins, nw);
-    // WM_DROPFILES, for when the OLE registration below fails
+    // WM_DROPFILES, for when gpui's OLE drop target could not be registered
     DragAcceptFiles(hwnd, TRUE);
-    // orig's CanvasDropTarget: files, image URLs, and where a dragged file is
-    RegisterCanvasDropTarget(hwnd);
     SetWindowSubclass(hwnd, ShellSubclass, 1, 0);
-    EnsurePixelMirror(hwnd);
     RegisterGlobalHotkeys(hwnd);
     // SAPI posts its word-boundary / end-of-stream events to a window
     TtsSetNotifyWindow(hwnd, kWmTtsEvent, 0, 0);
@@ -1377,16 +906,12 @@ void AppShellForgetNativeHwnd(MainWindow* win) {
         HWND hwnd = gNativeWins[i].hwnd;
         VecRemoveAt(gNativeWins, i);
         GlobalHotkeysOnDestroy(hwnd);
-        RevokeCanvasDropTarget(hwnd);
-        TouchGesturesForget(win);
     }
 }
 
 #else
 
 void AppShellEnableFileDrop(MainWindow*) {}
-
-void AppShellApplyNativeCursor(MainWindow*) {}
 
 void AppShellFrameChanged(MainWindow*) {}
 

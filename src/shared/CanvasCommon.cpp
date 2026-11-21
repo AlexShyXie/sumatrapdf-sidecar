@@ -15,6 +15,7 @@
 #include "DisplayModel.h"
 #include "AppSettings.h"
 #include "TextSelection.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
@@ -31,6 +32,8 @@
 // things out during a presentation and off again afterwards, and an app that
 // started up with the mouse cursor replaced by a red dot would look broken.
 bool gLaserPointer = false;
+// toggled by CmdToggleInverseSearch: a click no longer does inverse search
+bool gDisableInteractiveInverseSearch = false;
 
 bool IsLaserPointerActive() {
     return gLaserPointer;
@@ -366,4 +369,18 @@ bool IsFullPageImage(DisplayModel* dm, IPageElement* el, int pageNo) {
     RectF imgRc = el->GetRect();
     float imgArea = imgRc.dx * imgRc.dy;
     return imgArea >= 0.8f * pageArea;
+}
+
+// accumulates wheel travel; 1 to turn to the previous page, -1 to the next, 0 to stay
+int WheelPageTurnDir(MainWindow* win, int delta, int turnDelta) {
+    win->wheelAccumDelta += delta;
+    if (win->wheelAccumDelta >= turnDelta) {
+        win->wheelAccumDelta -= turnDelta;
+        return 1;
+    }
+    if (win->wheelAccumDelta <= -turnDelta) {
+        win->wheelAccumDelta += turnDelta;
+        return -1;
+    }
+    return 0;
 }

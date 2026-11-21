@@ -90,8 +90,6 @@ struct Flags {
     // installer: starts the install immediately and launches the app at end
     bool fastInstall = false;
     bool invertColors = false;
-    bool regress = false;
-    bool tester = false;
     // -new-window: each file in its own new window (not a tab of an existing one)
     bool inNewWindow = false;
     // -new-window-tabs: one new window, all files as tabs in that window
@@ -106,9 +104,7 @@ struct Flags {
     bool quickLookAgent = false;
     bool testRenderPage = false;
     bool testExtractPage = false;
-    bool testApp = false;
     bool testPlugin = false;
-    bool testPreview = false;
     bool dumpExif = false;  // -dump-exif
     bool dumpChm = false;   // -dump-chm
     bool unitTests = false; // -unit-tests (debug builds only)
@@ -121,6 +117,7 @@ struct Flags {
     bool uninstall = false;
     bool withFilter = false;
     bool withPreview = false;
+    bool withThumbnails = false;
     bool noDesktopShortcut = false;
     bool justExtractFiles = false;
     bool log = false;
@@ -130,7 +127,6 @@ struct Flags {
     // -html-backend ie|webview2: force the embedded browser hosting CHM /
     // markdown. Empty (the default) picks WebView2 when it's installed.
     Str htmlBackend;
-    Str installRegRoot;
     Str perfLogFile;           // -log-perf-file <path>
     bool startPerfLog = false; // -start-perf-log (profile builds)
 
@@ -147,3 +143,4 @@ void ShowPrintersDialog(bool consoleOnly = false);
 bool IsValidPageRange(Str ranges);
 bool IsBenchPagesInfo(Str s);
 bool ParsePageRanges(Str ranges, Vec<PageRange>& result);
+TempStr OpenDdeCmdTemp(Str fullPath, const Flags& i, bool isFirstWin, u32 newWindow);

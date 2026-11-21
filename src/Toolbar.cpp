@@ -27,6 +27,7 @@
 #include "AnnotPlacement.h"
 #include "Notifications.h"
 #include "Canvas.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "resource.h"
 #include "Commands.h"
@@ -276,7 +277,7 @@ static void SetPdfAnnotationsToolbarVisible(MainWindow* win, bool visible) {
     }
     tb->annotationRow->SetVisibility(want);
     SetToolbarButtonCheckedState(win, CmdToggleEditPDF, visible);
-    ToolbarSetHeight(win, tb->rowDy * (visible ? 2 : 1));
+    ToolbarSetHeight(win, ToolbarDyForWidth(win, HwndClientRect(win->hwndToolbar).dx));
     tb->host->Relayout();
     tb->host->Invalidate(true);
     if (visible) {
@@ -411,8 +412,10 @@ void ToolbarUpdateStateForWindow(MainWindow* win, bool setButtonsVisibility) {
             }
             // update tooltip before SetTabDirty (which rebuilds tooltips via LayoutTabs).
             // Must use MakeTabTooltipTemp (path+size); path-only overwrote size here.
+            // Only when the dirty flag changes: the tooltip stats the file, and
+            // this runs on every page change
             TabInfo* ti = win->tabsCtrl->GetTab(i);
-            if (ti && tab && tab->filePath) {
+            if (ti && tab && tab->filePath && (dirty != ti->isDirty || len(ti->tooltip) == 0)) {
                 TempStr tooltip = MakeTabTooltipTemp(tab->filePath, dirty);
                 str::ReplaceWithCopy(&ti->tooltip, tooltip);
             }
@@ -472,6 +475,9 @@ void SetPdfAnnotationsToolbarEnabled(MainWindow* win, bool enabled) {
     ScheduleRepaint(win, 0);
 }
 
+// space left and right of the toolbar's button rows
+constexpr int kToolbarRowPadX = 4;
+
 // natural width of the toolbar content (buttons + page box); the find bar
 // floats separately so the page-total label is the rightmost element
 static int ToolbarNaturalWidth(MainWindow* win) {
@@ -480,11 +486,19 @@ static int ToolbarNaturalWidth(MainWindow* win) {
     if (!host || !host->layout) {
         return 0;
     }
-    int dx = host->layout->MinIntrinsicWidth(tb->rowDy);
+    int dx = 0;
+    Wrap* row = tb->buttonRow;
+    int n = row ? row->LayoutChildCount() : 0;
+    for (int i = 0; i < n; i++) {
+        ILayout* child = row->LayoutChildAt(i);
+        if (child && child->GetVisibility() != Visibility::Collapse) {
+            dx += child->MinIntrinsicWidth(tb->rowDy);
+        }
+    }
     if (dx <= 0) {
         dx = tb->rowDy * 8;
     }
-    return dx + DpiScale(12);
+    return dx + 2 * DpiScale(kToolbarRowPadX);
 }
 
 // when the overlay toolbar sits at the bottom, lift it above the horizontal
@@ -511,6 +525,10 @@ static Rect OverlayToolbarRect(MainWindow* win) {
     int h = ToolbarHost(win)->ScreenRect().dy;
     int x = canvas.x + ((canvas.dx - natW) / 2);
     int y = canvas.y;
+    // below a revealed hidden caption (#6537)
+    if (win->captionOverlayShown) {
+        y = std::max(y, win->captionRect.y + win->captionRect.dy);
+    }
     if (ToolbarAtBottom()) {
         y = canvas.y + canvas.dy - h - OverlayToolbarBottomScrollbarOffset();
     }
@@ -952,6 +970,7 @@ TempStr ToolbarButtonsResultTemp(int* exitCodeOut) {
         }
         out.Append(fmt("idx=%d cmd=%d hidden=%d rect=%d,%d,%d,%d text=%s\n", i, w ? w->id : 0, hidden ? 1 : 0, r.x, r.y,
                        r.x + r.dx, r.y + r.dy, text));
+        out.Append(fmt("button-enabled idx=%d enabled=%d text=%s\n", i, w && w->IsEnabled() ? 1 : 0, text));
         if (w && w->tooltip) {
             out.Append(fmt("tool=%d uid=%d rect=%d,%d,%d,%d\n", toolIdx, w->id, r.x, r.y, r.x + r.dx, r.y + r.dy));
             toolIdx++;
@@ -1150,7 +1169,7 @@ static void OnHoverRowClicked(MainWindow* win, VirtMouseEvent* ev) {
     int cmdId = w->id;
     // the click is being handled by the drop-down's own window, so it can only
     // be torn down once that returns
-    uitask::Post(MkFunc0(PostedHideHoverDropdown, win), "HideToolbarHoverDropdown");
+    PostForWindow(win, PostedHideHoverDropdown, "HideToolbarHoverDropdown");
     ToolbarPostCommand(win, cmdId);
 }
 
@@ -1837,13 +1856,6 @@ static bool IsAnnotColorCmd(int cmdId) {
     return false;
 }
 
-// the color the button's next annotation is made in
-static Color AnnotCurrentColor(int cmdId) {
-    ParsedColor* setting = AnnotPresetColorSetting(cmdId);
-    Color col = setting ? GetParsedColor(*setting, kColorUnset) : kColorUnset;
-    return col != kColorUnset ? col : AnnotDefaultColor(cmdId);
-}
-
 void AnnotPresetColors(int cmdId, Vec<Color>& out) {
     if (Str* list = AnnotPresetColorList(cmdId)) {
         ParseColorList(*list, out, 0);
@@ -1909,7 +1921,7 @@ static void OnAnnotColorClicked(MainWindow* win, VirtMouseEvent* ev) {
         // with text selected, picking a color is also a request to mark it up
         ToolbarPostCommand(win, sw->id);
     }
-    uitask::Post(MkFunc0(PostedHideHoverDropdown, win), "HideToolbarHoverDropdown");
+    PostForWindow(win, PostedHideHoverDropdown, "HideToolbarHoverDropdown");
 }
 
 static void OnAnnotColorsEditClicked(MainWindow* win, VirtMouseEvent* ev) {
@@ -1918,7 +1930,7 @@ static void OnAnnotColorsEditClicked(MainWindow* win, VirtMouseEvent* ev) {
         return;
     }
     int cmdId = w->id;
-    uitask::Post(MkFunc0(PostedHideHoverDropdown, win), "HideToolbarHoverDropdown");
+    PostForWindow(win, PostedHideHoverDropdown, "HideToolbarHoverDropdown");
 
     auto* target = new AnnotColorsTarget();
     target->cmdId = cmdId;
@@ -1926,7 +1938,7 @@ static void OnAnnotColorsEditClicked(MainWindow* win, VirtMouseEvent* ev) {
     auto* args = new ChangeColorsArgs();
     args->win = win;
     args->title = Tr("Annotation Colors");
-    args->color = AnnotCurrentColor(cmdId);
+    args->color = AnnotColorForCmd(cmdId);
     args->withOpacity = true;
     AnnotPresetColors(cmdId, args->colors);
     args->onClose = MkFunc1(AnnotColorsPicked, target);
@@ -2107,7 +2119,7 @@ struct InkThicknessSlider : VirtSlider {
     // the width as a number, under the slider; a sibling like the preview
     VirtText* valueText = nullptr;
     Str text; // owned; what the -dbg-control dump shows for the slider
-    // where the width goes when let go. Without one it's the setting the ink
+    // where the width goes as it changes. Without one it's the setting the ink
     // button makes its strokes with
     Func1<int> onThickness;
     // committed by letting go of a drag, so the mouse capture is about to be
@@ -2125,19 +2137,18 @@ struct InkThicknessSlider : VirtSlider {
             valueText->SetText(fmt("%d", value));
             valueText->Invalidate();
         }
-        if (!onThickness.IsValid() && gSettings) {
+        // the annotation follows the drag; its handler skips unchanged values
+        if (onThickness.IsValid()) {
+            onThickness.Call(value);
+        } else if (gSettings) {
             gSettings->annotations.inkBorderWidth = value;
         }
     }
-    // rewriting an annotation is too slow to do on every step of a drag, so
-    // the width lands when the slider is let go
     void OnCommitted() {
         // a mouse-up commits while still adjusting, a wheel step doesn't
         releasingMouse = IsAdjusting();
         OnChanged();
-        if (onThickness.IsValid()) {
-            onThickness.Call(value);
-        } else {
+        if (!onThickness.IsValid()) {
             ScheduleSaveSettings();
         }
     }
@@ -2221,7 +2232,7 @@ static void BuildAnnotColorsHoverMenu(MainWindow* win, ToolbarHoverBuildEvent* e
     if (!tb || !setting) {
         return;
     }
-    Color current = AnnotCurrentColor(ev->cmdId);
+    Color current = AnnotColorForCmd(ev->cmdId);
     EnsureAnnotPresetColor(ev->cmdId, current);
     // ink is the one annotation whose width is a choice too
     InkThicknessSlider* slider = nullptr;
@@ -2401,7 +2412,7 @@ void ShowAnnotColorPopup(MainWindow* win, Rect anchor, Color current, bool withN
 }
 
 // A number picked with a slider: a label, the slider, and the value under it.
-// onValue gets the value when the slider is let go.
+// onValue gets the value on every step of a drag.
 void ShowAnnotSliderPopup(MainWindow* win, Rect anchor, Str label, int value, int minVal, int maxVal,
                           const Func1<int>& onValue) {
     ToolbarVirt* tb = win ? win->toolbarVirt : nullptr;
@@ -2545,6 +2556,8 @@ static VirtCtrl* MakeToolbarSeparator(int rowDy) {
     return sep;
 }
 
+static Edit* ToolbarCreateLocationEdit(MainWindow* win, PlatformFont* font, int iconDy);
+
 // (re)build the tree of virtual controls the toolbar is made of, one per button
 static void BuildToolbarLayout(MainWindow* win) {
     PopulateToolbarLayout();
@@ -2554,6 +2567,7 @@ static void BuildToolbarLayout(MainWindow* win) {
     VecReset(tb->items);
     VecReset(tb->annotationItems);
     tb->annotationRow = nullptr;
+    tb->buttonRow = nullptr;
     tb->pageLabel = nullptr;
     tb->pageLabel2 = nullptr;
     tb->pageTotal = nullptr;
@@ -2567,9 +2581,10 @@ static void BuildToolbarLayout(MainWindow* win) {
     Color fg = TbTextColor();
     Color dis = TbDisabledColor();
 
-    auto* box = new HBox();
+    auto* box = new Wrap();
     box->alignCross = CrossAxisAlign::CrossCenter;
     box->rtl = IsUIRtl();
+    tb->buttonRow = box;
 
     int n = TotalButtonsCount();
     for (int i = 0; i < n; i++) {
@@ -2589,7 +2604,7 @@ static void BuildToolbarLayout(MainWindow* win) {
             box->AddChild(label);
 
             // chapter box: [chapterEdit] / N, hidden unless HasChapters()
-            Edit* chapterEdit = ToolbarCreateChapterEdit(win, tb->platformFont, tb->iconSize);
+            Edit* chapterEdit = ToolbarCreateLocationEdit(win, tb->platformFont, tb->iconSize);
             chapterEdit->SetVisibility(Visibility::Collapse);
             win->chapterEdit = chapterEdit;
             box->AddChild(chapterEdit);
@@ -2613,7 +2628,7 @@ static void BuildToolbarLayout(MainWindow* win) {
             tb->pageLabel2 = label2;
             box->AddChild(label2);
 
-            Edit* pageEdit = ToolbarCreatePageEdit(win, tb->platformFont, tb->iconSize);
+            Edit* pageEdit = ToolbarCreateLocationEdit(win, tb->platformFont, tb->iconSize);
             win->pageEdit = pageEdit;
             box->AddChild(pageEdit);
 
@@ -2684,11 +2699,6 @@ static void BuildToolbarLayout(MainWindow* win) {
         annotationBox->AddChild(w);
     }
 
-    auto* mainRow = new HBox();
-    mainRow->alignCross = CrossAxisAlign::CrossCenter;
-    mainRow->gap = DpiScale(kButtonSpacingX);
-    mainRow->AddChild(box, 1);
-
     SetToolbarHoverDropdown(win, CmdSaveAnnotations, MkFunc1(BuildSaveHoverMenu, win));
     // one strip for the two of them, so it doesn't jump when the mouse crosses
     // from one to the other
@@ -2701,8 +2711,9 @@ static void BuildToolbarLayout(MainWindow* win) {
 
     auto* root = new VBox();
     root->alignCross = CrossAxisAlign::Stretch;
-    root->AddChild(new Padding(mainRow, Insets{0, DpiScale(4), 0, DpiScale(4)}));
-    tb->annotationRow = new Padding(annotationBox, Insets{0, DpiScale(4), 0, DpiScale(4)});
+    int padX = DpiScale(kToolbarRowPadX);
+    root->AddChild(new Padding(box, Insets{0, padX, 0, padX}));
+    tb->annotationRow = new Padding(annotationBox, Insets{0, padX, 0, padX});
     tb->annotationRow->SetVisibility(Visibility::Collapse);
     root->AddChild(tb->annotationRow);
     tb->host->SetLayout(root);
@@ -2859,6 +2870,22 @@ void ToolbarPostCommand(MainWindow* win, int cmdId) {
     HwndPostCommand(win->hwndFrame, cmdId, commandPoint);
 }
 
+// Height of the toolbar dx wide: as many rows as the buttons wrap onto, plus
+// the Edit PDF row when it's shown.
+int ToolbarDyForWidth(MainWindow* win, int dx) {
+    ToolbarVirt* tb = win ? win->toolbarVirt : nullptr;
+    if (!tb || !tb->buttonRow || dx <= 0) {
+        return tb ? tb->rowDy : 0;
+    }
+    // the Padding around the buttons
+    int rowDx = std::max(dx - DpiScale(8), 1);
+    int dy = std::max(tb->buttonRow->MinIntrinsicHeight(rowDx), tb->rowDy);
+    if (tb->annotationRow && tb->annotationRow->GetVisibility() != Visibility::Collapse) {
+        dy += tb->rowDy;
+    }
+    return dy;
+}
+
 void ToolbarSetHeight(MainWindow* win, int dy) {
     HWND hwnd = win ? win->hwndToolbar : nullptr;
     if (!hwnd || dy <= 0) {
@@ -2917,12 +2944,8 @@ static void OnLocationEditChar(MainWindow* win, Edit::CharEvent* ev) {
     }
 }
 
-static int PageEditPadL() {
-    return UiEdgeDx();
-}
-
 static int PageEditPadR() {
-    return PageEditPadL() + DpiScale(4);
+    return UiEdgeDx() + DpiScale(4);
 }
 
 static Edit* ToolbarCreateLocationEdit(MainWindow* win, PlatformFont* font, int iconDy) {
@@ -2939,7 +2962,7 @@ static Edit* ToolbarCreateLocationEdit(MainWindow* win, PlatformFont* font, int 
     // the box is as tall as the icons, so without this the digits would sit at
     // its top instead of on the same line as "Page:" and "/ N"
     args.centerTextVert = true;
-    args.marginLeft = PageEditPadL();
+    args.marginLeft = UiEdgeDx();
     args.marginRight = PageEditPadR();
     auto* e = new Edit();
     e->SetColors(TbTextColor(), ThemeWindowControlBackgroundColor());
@@ -2955,14 +2978,6 @@ static Edit* ToolbarCreateLocationEdit(MainWindow* win, PlatformFont* font, int 
     e->idealDy = iconDy;
     e->onChar = MkFunc1(OnLocationEditChar, win);
     return e;
-}
-
-Edit* ToolbarCreatePageEdit(MainWindow* win, PlatformFont* font, int iconDy) {
-    return ToolbarCreateLocationEdit(win, font, iconDy);
-}
-
-Edit* ToolbarCreateChapterEdit(MainWindow* win, PlatformFont* font, int iconDy) {
-    return ToolbarCreateLocationEdit(win, font, iconDy);
 }
 
 // no document: the find edit does nothing, so don't offer a text cursor

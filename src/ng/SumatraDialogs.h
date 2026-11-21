@@ -57,6 +57,7 @@ constexpr int MbRetYes = 6;
 constexpr int MbRetNo = 7;
 
 void MsgBox(MainWindow* win, Str text, Str caption, uint flags, Func1<int> onResult = {});
+void NativeMsgBoxSetEnabled(bool enabled);
 // ng: a message box raised while a tool window of `win` is the active window
 // is drawn in that window (gui/ToolWindow.cpp asks for it and gives it keys)
 struct ToolWindow;
@@ -77,8 +78,8 @@ void MessageBoxWarning(MainWindow* win, Str msg, Str title = {});
 
 // --- the dialogs ------------------------------------------------------------
 
-// ng: gpui has no save-file prompt. On Windows this is orig's GetSaveFileNameW
-// (gui/NativeFileDlg_win.cpp); elsewhere the port's own dialog
+// ng: on Windows gpui's save prompt with orig's GetSaveFileNameW fields
+// (gui/NativeFileDlg.cpp); elsewhere the port's own dialog
 struct SavePathArgs {
     MainWindow* win = nullptr;
     Str title;       // owned
@@ -102,20 +103,28 @@ struct SavePathArgs {
 // takes ownership of args
 void ShowSavePathDialog(SavePathArgs* args);
 void CloseSavePathDialog();
+void CloseSavePathDialogFor(MainWindow* win);
 bool IsSavePathDialogVisible();
 // -dbg-control's stand-in for picking a name in the dialog ({} is Cancel)
-bool TestFinishSavePathDialog(Str path);
+void SetTestSavePath(Str path);
 gpui::El* SavePathDialogBuild(MainWindow* win, gpui::Ctx* cx);
 
 void ShowGoToPageDialog(MainWindow* win);
 void CloseGoToPageDialog();
 bool IsGoToPageDialogVisible();
 gpui::El* GoToPageDialogBuild(MainWindow* win, gpui::Ctx* cx);
+void CloseRenameStripGroupDialog();
+bool IsRenameStripGroupDialogVisible();
+gpui::El* RenameStripGroupDialogBuild(MainWindow* win, gpui::Ctx* cx);
 
 void ShowAddFavoriteDialog(MainWindow* win, Str filePath, int pageNo, Str pageLabel, Str name);
+void ShowEditFavoritesDialog(MainWindow* win);
 void CloseAddFavoriteDialog();
 bool IsAddFavoriteDialogVisible();
 gpui::El* AddFavoriteDialogBuild(MainWindow* win, gpui::Ctx* cx);
+void CloseOpenFromUrlDialog();
+bool IsOpenFromUrlDialogVisible();
+gpui::El* OpenFromUrlDialogBuild(MainWindow* win, gpui::Ctx* cx);
 
 // what the user typed in the password dialog; only valid during the callback
 struct PasswordDialogResult {
@@ -129,6 +138,16 @@ void ShowGetPasswordDialog(MainWindow* win, Str fileName, bool canRemember, Func
 void CloseGetPasswordDialog();
 bool IsGetPasswordDialogVisible();
 gpui::El* GetPasswordDialogBuild(MainWindow* win, gpui::Ctx* cx);
+
+struct Caj2pdfDownloadDialogResult {
+    bool download = false;
+    bool dontAskAgain = false;
+};
+
+void ShowCaj2pdfDownloadDialog(MainWindow* win, Func1<Caj2pdfDownloadDialogResult*> onDone);
+void CloseCaj2pdfDownloadDialog();
+bool IsCaj2pdfDownloadDialogVisible();
+gpui::El* Caj2pdfDownloadDialogBuild(MainWindow* win, gpui::Ctx* cx);
 
 void ShowCustomZoomDialog(MainWindow* win);
 bool CustomZoomMoveSelection(int dir);
@@ -185,6 +204,11 @@ void CloseChangeColorDialog();
 bool IsChangeColorDialogVisible();
 gpui::El* ChangeColorDialogBuild(MainWindow* win, gpui::Ctx* cx);
 
+void ShowBrightnessContrastDialog(MainWindow* win);
+void CloseBrightnessContrastDialog();
+bool IsBrightnessContrastDialogVisible();
+gpui::El* BrightnessContrastDialogBuild(MainWindow* win, gpui::Ctx* cx);
+
 void ShowInverseSearchDialog(MainWindow* win);
 void CloseInverseSearchDialog();
 bool IsInverseSearchDialogVisible();
@@ -222,6 +246,7 @@ void CloseSignDocumentDialog(MainWindow* win);
 bool IsSignDocumentDialogVisible();
 TempStr SignDocumentPlacementTemp();
 TempStr SignDocumentChecksTemp();
+TempStr SignDocumentUseCertFileTemp();
 gpui::El* SignDocumentDialogBuild(MainWindow* win, gpui::Ctx* cx);
 // the dialog hid itself and the next click / drag on the page places the
 // signature (issue #5967)
@@ -240,7 +265,7 @@ TempStr PageGridStateTemp();
 bool ShowPageGrid();
 void TogglePageGrid();
 void SetShowPageGrid(bool);
-void RedrawPageGridWindows();
+void RedrawAllWindows();
 struct DisplayModel;
 namespace gpui {
 struct PaintCtx;
@@ -306,11 +331,6 @@ struct Print_Advanced_Data {
           extraRotation(extraRotation) {}
 };
 
-#if OS_WIN
-// dlgTemplate owns the in-memory DLGTEMPLATE and must outlive the property
-// sheet, as orig's RTL template does
-HPROPSHEETPAGE CreatePrintAdvancedPropSheet(Print_Advanced_Data* data, ScopedMem<DLGTEMPLATE>& dlgTemplate);
-#endif
 void ShowPDFScriptDialog(MainWindow* win);
 void ClosePDFScriptDialog();
 bool IsPDFScriptDialogVisible();

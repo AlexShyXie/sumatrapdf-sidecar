@@ -25,6 +25,7 @@
 #include "EngineAll.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Tabs.h"
 #include "Translations.h"
@@ -32,6 +33,7 @@
 #include "gui/AppShell.h"
 #include "gui/DialogWidgets.h"
 #include "gui/ToolWindow.h"
+#include "shared/PdfToolsCommon.h"
 #include "TabGroupsManage.h"
 #include "AppHelpersCommon.h"
 
@@ -43,6 +45,8 @@ struct TabGroupsDlg {
     TabGroupDialogMode mode = TabGroupDialogMode::Save;
     int sel = -1;
     gpui::InputState* editName = nullptr;
+    // Save: the group follows the window's tabs
+    bool autoSync = false;
     bool wantFocus = false;
     float scrollY = 0;
     // orig's window, where the platform can have one; null: a dialog in the
@@ -114,6 +118,7 @@ struct TabGroupsView {
     static void OnDelete(TabGroupsView* self, gp::Ctx* cx, const gp::ClickEvent*);
     static void OnInput(TabGroupsView* self, gp::Ctx* cx, const gp::InputEvent* ev);
     static void OnScroll(TabGroupsView* self, gp::Ctx* cx, const gp::ScrollEvent* ev);
+    static void OnAutoSync(TabGroupsView* self, gp::Ctx* cx, const gp::ClickEvent*);
 };
 
 static gp::Entity<TabGroupsView> gTabGroupsView;
@@ -147,7 +152,7 @@ static void CloseCurrentDlg() {
         ToolWindowClose(gTg->tw);
         gTg->tw = nullptr;
     } else if (win && win->gpuiWin && gTg->editName) {
-        gp::InputBlur(gTg->editName, win->gpuiWin->app, win->gpuiWin);
+        InputBlurWhereFocused(gTg->editName, win->gpuiWin);
     }
     delete gTg->editName;
     gTg->editName = nullptr;
@@ -179,6 +184,7 @@ void ShowTabGroupsDialog(MainWindow* win, TabGroupDialogMode mode) {
     gTg->win = win;
     gTg->mode = mode;
     gTg->sel = -1;
+    gTg->autoSync = false;
     gTg->scrollY = 0;
     gTg->visible = true;
     if (mode == TabGroupDialogMode::Save) {
@@ -213,21 +219,11 @@ static void SaveTabGroup(MainWindow* win) {
 
     auto* group = AllocStruct<TabGroup>();
     group->name = str::Dup(name);
-    group->tabFiles = new Vec<TabFile*>();
-
-    for (WindowTab* tab : win->Tabs()) {
-        if (tab->IsAboutTab()) {
-            continue;
-        }
-        if (len(tab->filePath) == 0) {
-            continue;
-        }
-        auto* tf = AllocStruct<TabFile>();
-        str::ReplaceWithCopy(&tf->path, tab->filePath);
-        VecAppend(*group->tabFiles, tf);
-    }
-    logf("SaveTabGroup: '%s', %d tabs\n", name, GroupTabCount(group));
+    group->autoSync = gTg->autoSync;
+    SetTabGroupFiles(group, win);
+    logf("SaveTabGroup: '%s', %d tabs, autoSync %d\n", name, GroupTabCount(group), (int)group->autoSync);
     VecAppend(*Groups(), group);
+    LinkTabGroup(win, group);
     ScheduleSaveSettings();
     CloseCurrentDlg();
     InvalidateTabGroupWindows();
@@ -245,16 +241,11 @@ static void OpenTabGroup(MainWindow* win) {
     if (!group->tabFiles || len(*group->tabFiles) == 0) {
         return;
     }
-    bool hasFiles = false;
-    for (WindowTab* tab : win->Tabs()) {
-        if (!tab->IsAboutTab()) {
-            hasFiles = true;
-            break;
-        }
-    }
-    logf("OpenTabGroup: '%s', %d tabs, new window %d\n", group->name, GroupTabCount(group), hasFiles ? 1 : 0);
+    // wasm has one window, so the group joins the tabs already there
+    bool newWindow = !OS_WASM && HasOpenedDocuments(win);
+    logf("OpenTabGroup: '%s', %d tabs, new window %d\n", group->name, GroupTabCount(group), newWindow ? 1 : 0);
     CloseCurrentDlg();
-    MainWindow* targetWin = hasFiles ? CreateAndShowMainWindow(nullptr) : win;
+    MainWindow* targetWin = newWindow ? CreateAndShowMainWindow(nullptr) : win;
     if (!targetWin) {
         return;
     }
@@ -263,6 +254,9 @@ static void OpenTabGroup(MainWindow* win) {
             continue;
         }
         LoadDocument(targetWin, tf->path);
+    }
+    if (IsMainWindowValid(targetWin)) {
+        LinkTabGroup(targetWin, group);
     }
 }
 
@@ -307,6 +301,13 @@ void TabGroupsView::OnScroll(TabGroupsView*, gp::Ctx* cx, const gp::ScrollEvent*
     AppShellInvalidate(gTg->win);
 }
 
+void TabGroupsView::OnAutoSync(TabGroupsView*, gp::Ctx* cx, const gp::ClickEvent*) {
+    UseDlgOf(cx);
+    gTg->autoSync = !gTg->autoSync;
+    gp::Notify(cx);
+    AppShellInvalidate(gTg->win);
+}
+
 void TabGroupsView::OnDelete(TabGroupsView*, gp::Ctx* cx, const gp::ClickEvent*) {
     UseDlgOf(cx);
     DeleteTabGroup();
@@ -346,18 +347,12 @@ void TabGroupsView::OnInput(TabGroupsView*, gp::Ctx* cx, const gp::InputEvent* e
 
 // --- a window of its own (Windows) ------------------------------------------
 
-// orig's sizes at 96 dpi: a 400 x 350 window; 8 around and between; a 23 high
-// edit, 19 high rows in the 12 px app font, 25 high buttons 7 apart
+// orig's layout: the name (Save only), the saved groups, the footer, hairlines
+// between; a 400 x 350 window whose list takes what the rest leaves
 constexpr int kTgWinDx = 400;
 constexpr int kTgWinDy = 350;
-constexpr float kTgPad = 8;
-constexpr float kTgEditDy = 23;
-constexpr float kTgRowDy = 19;
-constexpr float kTgBtnDy = 25;
-constexpr float kTgBtnPadDx = 12;
-constexpr float kTgBtnGap = 7;
-constexpr float kTgFontPx = 12;
-constexpr float kTgScrollbarDx = 16;
+// the list's height in the frame's card
+constexpr float kTgCardListDy = 240;
 
 static Str TabGroupsSaveTitle() {
     return Tr("Save Tab Group");
@@ -374,42 +369,30 @@ static void TabGroupsSelect(int sel) {
     }
     gTg->sel = std::clamp(sel, 0, n - 1);
     if (gTg->listViewDy > 0) {
-        gTg->scrollY = DialogScrollToRow(gTg->scrollY, gTg->sel, n, kTgRowDy, gTg->listViewDy);
+        gTg->scrollY = DialogScrollToRow(gTg->scrollY, gTg->sel, n, kDlgListRowDy, gTg->listViewDy);
     }
     AppShellInvalidate(gTg->win);
 }
 
-static gp::El* TabGroupsToolBuild(MainWindow*, gp::Ctx* cx) {
-    UseDlgOf(cx);
-    if (!gTg->visible || !gTg->tw || ToolWindowGpui(gTg->tw) != cx->win) {
-        return nullptr;
-    }
-    if (!gTabGroupsView.IsValid()) {
-        gTabGroupsView = gp::EntityNewState<TabGroupsView>(cx->app);
-    }
-    const gp::Theme& th = gp::ThemeNow(cx->app);
+// the name (Save only), the groups in a list `listDy` high, the footer
+static gp::El* TabGroupsColumn(gp::Ctx* cx, float listDy) {
     bool isSave = gTg->mode == TabGroupDialogMode::Save;
-    float font = kTgFontPx * ToolWindowSetUiFontPx(cx, kTgFontPx);
-    gp::WinSize ws = gp::WindowSize(cx->win);
-
-    gp::El* col = gp::Div(cx->a)->FlexCol()->W(gp::kFill)->Flex1()->MinH(0)->Pad(kTgPad);
-    float listDy = ws.dipH - 2 * kTgPad - kTgPad - kTgBtnDy;
+    gp::El* col = gp::Div(cx->a)->FlexCol()->W(gp::kFill)->Bg(ToGpui(ThemeWindowControlBackgroundColor()));
     if (isSave && gTg->editName) {
         gTg->editName->onChange = gp::ListenTo(gTabGroupsView, &TabGroupsView::OnInput);
+        col->Child(DlgLine(cx, {}, 0, StrL("tabgroup-name"), gTg->editName, DlgField::Plain));
+        gp::El* check = DlgAccelEl(cx, gpc::Checkbox::New(cx, GStrL("tabgroup-autosync"))->Checked(gTg->autoSync),
+                                   Tr("&Keep the group in sync with this window's tabs"),
+                                   gp::ListenTo(gTabGroupsView, &TabGroupsView::OnAutoSync));
         col->Child(gp::Div(cx->a)
                        ->FlexRow()
                        ->ItemsCenter()
-                       ->W(gp::kFill)
-                       ->H(kTgEditDy + kTgPad)
-                       ->PadB(kTgPad)
+                       ->H(kToolDlgRowDy)
                        ->Shrink0()
-                       ->Child(gpc::Input::New(cx, GStrL("tabgroup-name"), gTg->editName)
-                                   ->WithSize(gp::UiSize::Small)
-                                   ->W(gp::kFill)
-                                   ->IntoEl()));
-        listDy -= kTgEditDy + kTgPad;
+                       ->PadX(kToolDlgPadDx)
+                       ->Child(check->Font(kToolDlgTextFontPx)));
+        col->Child(DlgHairline(cx));
     }
-    listDy = std::max(listDy, kTgRowDy);
     gTg->listViewDy = listDy;
 
     Vec<TabGroup*>* groups = Groups();
@@ -422,62 +405,44 @@ static gp::El* TabGroupsToolBuild(MainWindow*, gp::Ctx* cx) {
                        ->ScrollY(gTg->scrollY)
                        ->ScrollFromPath()
                        ->OnScroll(gp::ListenTo(gTabGroupsView, &TabGroupsView::OnScroll));
-    gp::Rgba countFg = ToGpui(AccentColor(ThemeWindowTextColor(), 80));
-    // gpui's scrollbar is drawn over the rows' right end
-    bool scrolls = (float)len(*groups) * kTgRowDy > listDy;
     for (int i = 0; i < len(*groups); i++) {
         TabGroup* g = (*groups)[i];
-        gp::El* row = gp::Div(cx->a)
-                          ->FlexRow()
-                          ->W(gp::kFill)
-                          ->H(kTgRowDy)
-                          ->Shrink0()
-                          ->ItemsCenter()
-                          ->PadL(4)
-                          ->PadR(scrolls ? kTgScrollbarDx : 4)
-                          ->PathClick(GpuiDup(cx->a, fmt("tabgroup-row-%d", i)))
-                          ->OnClick(gp::ListenTo(gTabGroupsView, &TabGroupsView::OnRowClick, (intptr_t)i));
-        if (i == gTg->sel) {
-            row->Bg(ToGpui(AccentColor(ThemeWindowControlBackgroundColor(), 30)));
-        }
-        row->Child(
-            gp::TextEl(cx->a, GpuiDup(cx->a, g->name))->Font(font)->Fg(th.foreground)->Flex1()->MinW(0)->Truncate());
-        TempStr count = fmt("%d tabs", GroupTabCount(g));
-        row->Child(gp::TextEl(cx->a, GpuiDup(cx->a, count))->Font(font)->Fg(countFg)->Shrink0());
-        list->Child(row);
+        list->Child(DlgListRow(cx, fmt("tabgroup-row-%d", i), g->name, i == gTg->sel,
+                               gp::ListenTo(gTabGroupsView, &TabGroupsView::OnRowClick, (intptr_t)i),
+                               TabGroupInfoTemp(g)));
     }
-    col->Child(list);
+    col->Child(DlgListBox(cx, list));
 
-    auto button = [&](gp::Str id, Str label, gp::Listener onClick, bool isDefault, bool disabled) {
-        gpc::Button* b = gpc::Button::New(cx, id)->Label(ToGpui(label))->Disabled(disabled)->OnClick(onClick);
-        if (isDefault) {
-            b->Primary();
-        }
-        return b->IntoEl()->H(kTgBtnDy)->PadX(kTgBtnPadDx)->Shrink0();
-    };
-    gp::El* buttons = gp::Div(cx->a)
-                          ->FlexRow()
-                          ->JustifyEnd()
-                          ->ItemsCenter()
-                          ->W(gp::kFill)
-                          ->H(kTgPad + kTgBtnDy)
-                          ->PadT(kTgPad)
-                          ->Gap(kTgBtnGap)
-                          ->Shrink0();
-    buttons->Child(button(GStrL("tabgroup-cancel"), Tr("Cancel"),
-                          gp::ListenTo(gTabGroupsView, &TabGroupsView::OnCancel), false, false));
-    buttons->Child(button(GStrL("tabgroup-delete"), Tr("Delete"),
-                          gp::ListenTo(gTabGroupsView, &TabGroupsView::OnDelete), false, gTg->sel < 0));
-    buttons->Child(button(GStrL("tabgroup-ok"), isSave ? Tr("Save") : Tr("Restore"),
-                          gp::ListenTo(gTabGroupsView, &TabGroupsView::OnOk), true, false));
-    col->Child(buttons);
+    gp::El* del = DlgGhostButton(cx, GStrL("tabgroup-delete"), Tr("Delete"),
+                                 gp::ListenTo(gTabGroupsView, &TabGroupsView::OnDelete), gTg->sel < 0);
+    col->Child(DlgFooter(cx, isSave ? Tr("Save") : Tr("Restore"), gp::ListenTo(gTabGroupsView, &TabGroupsView::OnOk),
+                         gp::ListenTo(gTabGroupsView, &TabGroupsView::OnCancel), del));
 
+    // ng: stays armed until the field really is the window's focused input -
+    // the popup the command came from can take the focus back on a later frame
     if (gTg->wantFocus && gTg->editName) {
         gp::InputFocus(gTg->editName, cx->app, cx->win);
         gp::InputSelectAll(gTg->editName, cx->app, cx->win);
         gTg->wantFocus = cx->win->input != gTg->editName;
     }
     return col;
+}
+
+static gp::El* TabGroupsToolBuild(MainWindow*, gp::Ctx* cx) {
+    UseDlgOf(cx);
+    if (!gTg->visible || !gTg->tw || ToolWindowGpui(gTg->tw) != cx->win) {
+        return nullptr;
+    }
+    if (!gTabGroupsView.IsValid()) {
+        gTabGroupsView = gp::EntityNewState<TabGroupsView>(cx->app);
+    }
+    // the list takes what the name, the list's padding and the footer leave
+    float fixedDy = 2 * kToolDlgFilesPadDy + 2 * kToolDlgFootPadDy + kDlgBtnDy;
+    if (gTg->mode == TabGroupDialogMode::Save) {
+        fixedDy += kToolDlgLineDy + kToolDlgRowDy + 1;
+    }
+    float listDy = std::max(gp::WindowSize(cx->win).dipH - fixedDy, kDlgListRowDy);
+    return gp::Div(cx->a)->FlexCol()->W(gp::kFill)->Flex1()->MinH(0)->Child(TabGroupsColumn(cx, listDy));
 }
 
 // orig's closeOnEsc, Enter for the default button, and the list's keys while
@@ -508,7 +473,7 @@ static bool TabGroupsToolOnKey(MainWindow*, gp::Ctx* cx, const gp::KeyEvent* ev)
         return false;
     }
     int n = len(*Groups());
-    int page = std::max((int)(gTg->listViewDy / kTgRowDy) - 1, 1);
+    int page = std::max((int)(gTg->listViewDy / kDlgListRowDy) - 1, 1);
     int sel = gTg->sel;
     switch (ev->vk) {
         case VK_UP:
@@ -591,79 +556,8 @@ gp::El* TabGroupsDialogBuild(MainWindow* win, gp::Ctx* cx) {
     if (!gTabGroupsView.IsValid()) {
         gTabGroupsView = gp::EntityNewState<TabGroupsView>(cx->app);
     }
-    const gp::Theme& th = gp::ThemeNow(cx->app);
     bool isSave = gTg->mode == TabGroupDialogMode::Save;
-
-    gp::El* body = gp::Div(cx->a)->FlexCol()->Gap(8);
-    if (isSave && gTg->editName) {
-        gTg->editName->onChange = gp::ListenTo(gTabGroupsView, &TabGroupsView::OnInput);
-        body->Child(gpc::Input::New(cx, GStrL("tabgroup-name"), gTg->editName)
-                        ->WithSize(gp::UiSize::Small)
-                        ->W(gp::kFill)
-                        ->IntoEl());
-    }
-
-    Vec<TabGroup*>* groups = Groups();
-    gp::El* list = gp::Div(cx->a)
-                       ->Id(GStrL("tabgroup-list"))
-                       ->FlexCol()
-                       ->W(gp::kFill)
-                       ->MinH(120)
-                       ->MaxH(240)
-                       ->ScrollY(gTg->scrollY)
-                       ->ScrollFromPath()
-                       ->OnScroll(gp::ListenTo(gTabGroupsView, &TabGroupsView::OnScroll))
-                       ->Border(1, th.border);
-    for (int i = 0; i < len(*groups); i++) {
-        TabGroup* g = (*groups)[i];
-        gp::El* row = gp::Div(cx->a)
-                          ->FlexRow()
-                          ->W(gp::kFill)
-                          ->H(24)
-                          ->Shrink0()
-                          ->ItemsCenter()
-                          ->PadX(4)
-                          ->PathClick(GpuiDup(cx->a, fmt("tabgroup-row-%d", i)))
-                          ->OnClick(gp::ListenTo(gTabGroupsView, &TabGroupsView::OnRowClick, (intptr_t)i));
-        if (i == gTg->sel) {
-            row->Bg(th.selection);
-        }
-        row->Child(
-            gp::TextEl(cx->a, GpuiDup(cx->a, g->name))->Font(13)->Fg(th.foreground)->Flex1()->MinW(0)->Truncate());
-        TempStr count = fmt("%d tabs", GroupTabCount(g));
-        row->Child(gp::TextEl(cx->a, GpuiDup(cx->a, count))->Font(11)->Fg(th.mutedFg)->Shrink0());
-        list->Child(row);
-    }
-    body->Child(list);
-    body->Child(gpc::Button::New(cx, GStrL("tabgroup-delete"))
-                    ->Label(ToGpui(Tr("Delete")))
-                    ->WithSize(gp::UiSize::Small)
-                    ->Disabled(gTg->sel < 0)
-                    ->OnClick(gp::ListenTo(gTabGroupsView, &TabGroupsView::OnDelete))
-                    ->IntoEl());
-
-    Str title = isSave ? Tr("Save Tab Group") : Tr("Restore Tab Group");
-    Str okText = isSave ? Tr("Save") : Tr("Restore");
     DlgSetDefault(cx, gp::ListenTo(gTabGroupsView, &TabGroupsView::OnOk));
-    gp::El* dlg = gpc::Dialog::New(cx)
-                      ->Open(true)
-                      ->Title(ToGpui(title))
-                      ->Body(body)
-                      ->W(400)
-                      ->OkText(ToGpui(okText))
-                      ->CancelText(ToGpui(Tr("Cancel")))
-                      ->ShowCancel(true)
-                      ->OnOk(gp::ListenTo(gTabGroupsView, &TabGroupsView::OnOk))
-                      ->OnCancel(gp::ListenTo(gTabGroupsView, &TabGroupsView::OnCancel))
-                      ->OnClose(gp::ListenTo(gTabGroupsView, &TabGroupsView::OnCancel))
-                      ->IntoEl(gp::WindowSize(cx->win));
-
-    // ng: stays armed until the field really is the window's focused input -
-    // the popup the command came from can take the focus back on a later frame
-    if (gTg->wantFocus && gTg->editName) {
-        gp::InputFocus(gTg->editName, cx->app, cx->win);
-        gp::InputSelectAll(gTg->editName, cx->app, cx->win);
-        gTg->wantFocus = cx->win->input != gTg->editName;
-    }
-    return dlg;
+    return DlgFrameCard(cx, TabGroupsColumn(cx, kTgCardListDy), isSave ? Tr("Save Tab Group") : Tr("Restore Tab Group"),
+                        kTgWinDx, gp::ListenTo(gTabGroupsView, &TabGroupsView::OnCancel));
 }

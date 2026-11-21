@@ -18,6 +18,7 @@
 #endif
 #if OS_DARWIN
 #include <sys/sysctl.h>
+#include <unistd.h>
 #endif
 
 #include "gui/UIModels.h"
@@ -100,10 +101,6 @@ static bool gUpdateAutoInstall = false;
 // the bottom-left "update available" notification (with the download link)
 static Kind kNotifUpdateAvailable = "notifUpdateAvailable";
 
-static void CurrentFileTime(FILETIME* ft) {
-    GetSystemTimeAsFileTime(ft);
-}
-
 /*
 The format of update information downloaded from the server:
 
@@ -113,70 +110,18 @@ BuiltOn: 2026-08-21
 Installer64: https://www.sumatrapdfreader.org/dl/prerel/14276/SumatraPDF-prerel-64-install.exe
 ...
 
-ng: macOS and Linux have no installer to run, so their info names what the
-browser should open instead:
+ng: Linux has no installer to run, so its info names what the browser should
+open instead:
 
-DownloadPage: https://www.sumatrapdfreader.org/dlng/mac/14276/SumatraPDF-mac-arm64.zip
+DownloadPage: https://www.sumatrapdfreader.org/dlng/linux/26.10.03/...
+
+A mac build replaces itself with the .zip of its architecture and opens the
+.dmg in the browser when it can't (see ParseUpdateInfo):
+
+ZipArm64: https://www.sumatrapdfreader.org/dlng/mac/26.10.03/SumatraPDF-mac-arm64.zip
+ZipArm64Sha256: <hex>
+DmgArm64: https://www.sumatrapdfreader.org/dlng/mac/26.10.03/SumatraPDF-mac-arm64.dmg
 */
-
-static bool ShouldCheckForUpdate(UpdateCheck updateCheckType) {
-    if (gUpdateCheckInProgress) {
-        logf("CheckForUpdate: skipping because gUpdateCheckInProgress\n");
-        return false;
-    }
-
-    if (!HasPermission(Perm::InternetAccess)) {
-        logf("CheckForUpdate: skipping because no internet access\n");
-        return false;
-    }
-
-    if (updateCheckType == UpdateCheck::UserInitiated) {
-        logf("CheckForUpdate: checking, user initiated\n");
-        return true;
-    }
-
-    // don't check if the timestamp or version to skip can't be updated
-    // (mainly in plugin mode, stress testing and restricted settings)
-    if (!HasPermission(Perm::SavePreferences)) {
-        logf("CheckForUpdate: skipping auto check because no prefs access\n");
-        return false;
-    }
-
-    // only applies to automatic update check
-    if (!gSettings->checkForUpdates) {
-        logf("CheckForUpdate: skipping auto check because CheckForUpdates is false\n");
-        return false;
-    }
-
-    // don't check for updates at the first start, so that privacy
-    // sensitive users can disable the update check in time
-    FILETIME never{};
-    if (FileTimeEq(gSettings->timeOfLastUpdateCheck, never)) {
-        logf("CheckForUpdate: skipping auto check, first start (TimeOfLastUpdateCheck not set)\n");
-        return false;
-    }
-
-    // pre-release builds check on every startup (testers want the newest build);
-    // skip the daily/weekly throttle below
-    if (gIsPreReleaseBuild) {
-        logf("CheckForUpdate: checking, pre-release build checks on every startup\n");
-        return true;
-    }
-
-    // only check if at least a day passed since last check
-    FILETIME currentTimeFt;
-    CurrentFileTime(&currentTimeFt);
-    int secsSinceLastUpdate = FileTimeDiffInSecs(currentTimeFt, gSettings->timeOfLastUpdateCheck);
-
-    constexpr int kSecondsInDay = 60 * 60 * 24;
-    constexpr int kSecondsInWeek = 7 * 60 * 60 * 24;
-
-    int secsBetweenChecks = gIsPreReleaseBuild ? kSecondsInWeek : kSecondsInDay;
-    bool checkUpdate = secsSinceLastUpdate > secsBetweenChecks;
-    logf("CheckForUpdate: %s auto check, %d secs since the last one, %d secs between checks\n",
-         checkUpdate ? StrL("doing") : StrL("skipping"), secsSinceLastUpdate, secsBetweenChecks);
-    return checkUpdate;
-}
 
 static void OpenWebPage(Str url) {
     logf("UpdateCheck: opening '%s'\n", url);
@@ -185,31 +130,23 @@ static void OpenWebPage(Str url) {
 
 #if OS_WIN
 
-void StartInstallerAutoUpgrade(Str installerPath) {
+// true when the installer started; only then may we exit for it to replace us
+bool StartInstallerAutoUpgrade(Str installerPath) {
     TempStr expectedSigner = GetExecutableSignerTemp(GetSelfExePathTemp());
     TempStr installerSigner = GetExecutableSignerTemp(installerPath);
     if (len(expectedSigner) == 0 || len(installerSigner) == 0 || !str::Eq(expectedSigner, installerSigner) ||
         !IsPEFileSigned(installerPath)) {
         logf("StartInstallerAutoUpgrade: refusing an update with an untrusted signature\n");
-        return;
+        return false;
     }
-    str::Builder cmd;
-    // ng: orig asks the installer (IsOurExeInstalled()); the installer is step
-    // 17, so "not portable" stands in for "installed"
-    if (!IsRunningInPortableMode()) {
-        // no need for sleep because it shows the installer dialog anyway
-        if (gIsPreReleaseBuild) {
-            cmd.Append(StrL(" -fast-install"));
-        } else {
-            cmd.Append(StrL(" -install"));
-        }
-    } else {
-        // we're asking to over-write over ourselves, so also wait 2 secs to allow
-        // our process to exit
-        cmd.Append(fmt(R"( -sleep-ms 2000 -exit-when-done -update-self-to "%s")", GetSelfExePathTemp()));
+    // orig asks the installer (IsOurExeInstalled()). Here "not portable" means installed.
+    TempStr cmd = InstallerUpgradeArgsTemp(!IsRunningInPortableMode(), gIsPreReleaseBuild, GetSelfExePathTemp());
+    logf("StartInstallerAutoUpgrade: installer cmd: '%s'\n", cmd);
+    bool ok = CreateProcessHelper(installerPath, cmd);
+    if (!ok) {
+        logf("StartInstallerAutoUpgrade: starting the installer failed\n");
     }
-    logf("StartInstallerAutoUpgrade: installer cmd: '%s'\n", ToStr(cmd));
-    CreateProcessHelper(installerPath, ToStr(cmd));
+    return ok;
 }
 
 static void ExitAfterStartingUpdater() {
@@ -217,42 +154,26 @@ static void ExitAfterStartingUpdater() {
     ::ExitProcess(0);
 }
 
-// the assumption is that this is a portable version downloaded to temp directory
-// we should copy ourselves over the existing file, launch ourselves and
-// tell our new copy to delete ourselves
-void UpdateSelfTo(Str dstPath, int sleepMs) {
-    ReportIf(len(dstPath) == 0);
-    if (!file::Exists(dstPath)) {
-        logf("UpdateSelfTo: failed because destination doesn't exist\n");
-        return;
-    }
+#elif OS_DARWIN
 
-    logf("UpdateSelfTo: '%s', sleep for %d ms\n", dstPath, sleepMs);
-    // sleeping for a bit to make sure that the program that launched us
-    // had time to exit so that we can overwrite it
-    SleepInMs(sleepMs);
+// installerPath is the downloaded .zip of SumatraPDF.app
+bool StartInstallerAutoUpgrade(Str installerPath) {
+    return MacInstallUpdateZip(installerPath);
+}
 
-    // OverwriteAtomicRetry(dst, src): copy this process (new build) onto dstPath
-    TempStr srcPath = GetSelfExePathTemp();
-    bool ok = file::OverwriteAtomicRetry(dstPath, srcPath, 20, 250);
-    if (!ok) {
-        logf("UpdateSelfTo: failed to overwrite '%s' with '%s'\n", dstPath, srcPath);
-        return;
-    }
-    logf("UpdateSelfTo: copied self to '%s'\n", dstPath);
-
-    TempStr args = fmt(R"(-sleep-ms 500 -delete-file "%s")", srcPath);
-    CreateProcessHelper(dstPath, args);
+static void ExitAfterStartingUpdater() {
+    // as ExitProcess() on Windows; the relauncher waits for us to be gone
+    _exit(0);
 }
 
 #else
 
 // no installer off Windows: the user is sent to the download page instead
-void StartInstallerAutoUpgrade(Str) {}
+bool StartInstallerAutoUpgrade(Str) {
+    return false;
+}
 
 static void ExitAfterStartingUpdater() {}
-
-void UpdateSelfTo(Str, int) {}
 
 #endif
 
@@ -266,6 +187,7 @@ static void OpenDownloadPage(UpdateInfo* updateInfo) {
 }
 
 static void OnInstallAnswer(UpdateInfo* updateInfo, int res) {
+    gUpdateCheckInProgress = false;
     AutoDelete delInfo(updateInfo);
     Str installerPath = updateInfo->installerPath;
     bool didDownloadInstaller = file::Exists(installerPath);
@@ -282,8 +204,11 @@ static void OnInstallAnswer(UpdateInfo* updateInfo, int res) {
         OpenDownloadPage(updateInfo);
         return;
     }
-    StartInstallerAutoUpgrade(installerPath);
-    ExitAfterStartingUpdater();
+    if (StartInstallerAutoUpgrade(installerPath)) {
+        ExitAfterStartingUpdater();
+    } else {
+        OpenDownloadPage(updateInfo);
+    }
 }
 
 // ng: orig's TaskDialog with "Don't install" / "Install and relaunch" buttons;
@@ -297,8 +222,11 @@ static void NotifyUserOfUpdate(UpdateInfo* updateInfo) {
         ScheduleSaveSettings();
         FlushScheduledSaveSettings();
         if (installerPathAuto && file::Exists(installerPathAuto)) {
-            StartInstallerAutoUpgrade(installerPathAuto);
-            ExitAfterStartingUpdater();
+            if (StartInstallerAutoUpgrade(installerPathAuto)) {
+                ExitAfterStartingUpdater();
+            } else {
+                OpenDownloadPage(updateInfo);
+            }
         } else {
             logf("NotifyUserOfUpdate: auto-install requested but installer not downloaded\n");
             OpenDownloadPage(updateInfo);
@@ -313,6 +241,8 @@ static void NotifyUserOfUpdate(UpdateInfo* updateInfo) {
     TempStr content = fmt("%s\n\n%s", mainInstr, fmt(fmtStr.s, currentVersion, ver));
     logf("NotifyUserOfUpdate: %s -> %s\n", currentVersion, ver);
 
+    // as orig's modal dialog: no other check starts until this is answered
+    gUpdateCheckInProgress = true;
     uint flags = MbYesNo | MbIconInformation;
     MsgBox(updateInfo->win, content, Tr("SumatraPDF Update"), flags,
            MkFunc1<UpdateInfo, int>(OnInstallAnswer, updateInfo));
@@ -386,6 +316,31 @@ static void DownloadUpdateAsync(DownloadUpdateAsyncData* data) {
     } else {
         file::Delete(installerPath);
     }
+#elif OS_DARWIN
+    UpdateInfo* updateInfo = data->updateInfo;
+    TempStr zipPath = MacUpdateZipPathTemp();
+    constexpr int kMaxUpdateDownloadSize = 256 * 1024 * 1024;
+    gp::HttpRsp gr;
+    bool ok = len(zipPath) > 0 && gp::HttpGet(ToGpui(updateInfo->dlURL), &gr) && gr.status == 200 && gr.body.len > 0 &&
+              gr.body.len < kMaxUpdateDownloadSize;
+    Str body = ok ? Str((char*)gr.body.els, gr.body.len) : Str();
+    if (ok && len(updateInfo->dlSha256) > 0) {
+        u8 digest[32];
+        CalcSHA2Digest(body, digest);
+        TempStr got = str::MemToHexTemp(Str((char*)digest, 32));
+        ok = str::EqI(got, updateInfo->dlSha256);
+        if (!ok) {
+            logf("DownloadUpdateAsync: sha256 is %s, expected %s\n", got, updateInfo->dlSha256);
+        }
+    }
+    ok = ok && file::WriteFile(zipPath, body);
+    gp::HttpRspFree(&gr);
+    logf("DownloadUpdateAsync: ok=%d, downloaded '%s' to '%s'\n", (int)ok, updateInfo->dlURL, zipPath);
+    if (ok) {
+        updateInfo->installerPath = str::Dup(zipPath);
+    } else if (len(zipPath) > 0) {
+        file::Delete(zipPath);
+    }
 #endif
 
     // process the rest on ui thread to avoid threading issues
@@ -423,6 +378,12 @@ void DownloadAndInstallPendingUpdate(MainWindow* win) {
     if (!win || !gPendingUpdate) {
         return;
     }
+    // a check or download is running: it offers the update itself. Starting
+    // a second one ran two downloads, and the first to finish installed
+    // without asking
+    if (gUpdateCheckInProgress) {
+        return;
+    }
     UpdateInfo* updateInfo = gPendingUpdate;
     gPendingUpdate = nullptr;
     gUpdateAutoInstall = true;
@@ -449,12 +410,14 @@ void DownloadAndInstallPendingUpdate(MainWindow* win) {
 }
 
 static bool ShouldDownloadUpdate(UpdateInfo* updateInfo) {
-    if (gIsStoreBuild) {
-        // I assume store will take care of updates
+#if OS_DARWIN
+    // a version not built for our architecture (yet)
+    if (len(updateInfo->dlURL) == 0) {
         return false;
     }
-    Str latestVer = updateInfo->latestVer;
-    return CompareProgramVersion(latestVer, currentVersion) > 0;
+#endif
+    // a store build lets the store install updates
+    return ShouldOfferProgramUpdate(updateInfo->latestVer, currentVersion, gIsStoreBuild);
 }
 
 static void OnVisitWebsiteAnswer(int res) {
@@ -483,31 +446,28 @@ static void NotifyUpdateCheckFailed(MainWindow* win, DWORD err) {
     MsgBox(win, content, Tr("SumatraPDF Update"), MbYesNo | MbIconWarning, MkFunc1Void(OnVisitWebsiteAnswer));
 }
 
+#if OS_LINUX
+static void PickLinuxPackage(UpdateInfo* updateInfo, Str data);
+#endif
+
 static DWORD MaybeStartUpdateDownload(MainWindow* win, HttpRsp* rsp, UpdateCheck updateCheckType) {
     Str url = rsp->url;
-
-    if (rsp->error != 0) {
+    str::Builder* data = &rsp->data;
+    UpdateInfoFetch kind = ClassifyUpdateInfoFetch(url, (int)rsp->error, (int)rsp->httpStatusCode, len(*data),
+                                                   updateInfoURLs, dimof(updateInfoURLs));
+    if (kind == UpdateInfoFetch::TransportError) {
         logf("MaybeStartUpdateDownload: http get of '%s' failed with %d\n", url, (int)rsp->error);
         return rsp->error;
     }
-    if (rsp->httpStatusCode != 200) {
+    if (kind == UpdateInfoFetch::BadStatus) {
         logf("MaybeStartUpdateDownload: http get of '%s' failed with code %d\n", url, (int)rsp->httpStatusCode);
         return (DWORD)rsp->httpStatusCode;
     }
-
-    bool isValidURL = false;
-    for (auto updateInfoURL : updateInfoURLs) {
-        if (str::StartsWith(url, updateInfoURL)) {
-            isValidURL = true;
-            break;
-        }
-    }
-    if (!isValidURL) {
+    if (kind == UpdateInfoFetch::UnlistedUrl) {
         logf("MaybeStartUpdateDownload: '%s' is not a valid url\n", url);
         return 1;
     }
-    str::Builder* data = &rsp->data;
-    if (0 == len(*data)) {
+    if (kind == UpdateInfoFetch::EmptyBody) {
         logf("MaybeStartUpdateDownload: empty response from url '%s'\n", url);
         return 2;
     }
@@ -518,6 +478,9 @@ static DWORD MaybeStartUpdateDownload(MainWindow* win, HttpRsp* rsp, UpdateCheck
         return 3;
     }
     updateInfo->win = win;
+#if OS_LINUX
+    PickLinuxPackage(updateInfo, ToStr(*data));
+#endif
 
     if (!ShouldDownloadUpdate(updateInfo)) {
         Str myVer = currentVersion;
@@ -532,6 +495,13 @@ static DWORD MaybeStartUpdateDownload(MainWindow* win, HttpRsp* rsp, UpdateCheck
         delete updateInfo;
         return 0;
     }
+
+#if OS_DARWIN
+    // e.g. run from the disk image: the browser gets the .dmg instead
+    if (!MacCanUpdateSelf()) {
+        str::FreePtr(&updateInfo->dlURL);
+    }
+#endif
 
     if (len(updateInfo->dlURL) == 0) {
         // currently for release builds we don't set this and redirect to a website instead
@@ -580,38 +550,73 @@ static TempStr OsNameTemp() {
     return fmt("mac-%s", Str(ver));
 }
 #elif OS_LINUX
-// The distribution's ID from os-release, e.g. "ubuntu" for ID=ubuntu or ID="ubuntu".
-static TempStr OsNameTemp() {
+// A value from os-release, e.g. "ubuntu" for ID=ubuntu or ID="ubuntu", "" if missing.
+static TempStr OsReleaseValueTemp(Str key) {
     FILE* f = fopen("/etc/os-release", "r");
     if (!f) {
         f = fopen("/usr/lib/os-release", "r");
     }
     if (!f) {
-        return StrL("linux");
+        return {};
     }
-    constexpr Str kKey = StrL("ID=");
-    TempStr res = StrL("linux");
+    TempStr prefix = str::JoinTemp(key, StrL("="));
+    TempStr res{};
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         Str s(line);
-        if (!str::StartsWith(s, kKey)) {
+        if (!str::StartsWith(s, prefix)) {
             continue;
         }
         // keep what is safe in a url; that drops the quotes and the newline
-        str::Builder id;
-        for (int i = len(kKey); i < len(s); i++) {
+        str::Builder v;
+        for (int i = len(prefix); i < len(s); i++) {
             char c = s.s[i];
             if (isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-') {
-                id.AppendChar(c);
+                v.AppendChar(c);
             }
         }
-        if (len(id) > 0) {
-            res = str::DupTemp(ToStr(id));
+        if (len(v) > 0) {
+            res = str::DupTemp(ToStr(v));
         }
         break;
     }
     fclose(f);
     return res;
+}
+
+// The distribution's ID from os-release, e.g. "ubuntu".
+static TempStr OsNameTemp() {
+    TempStr id = OsReleaseValueTemp(StrL("ID"));
+    return len(id) > 0 ? id : StrL("linux");
+}
+
+// Opens this distro's package instead of DownloadPage (the list of all) when
+// the update info has one, e.g. "Package-ubuntu24.04-x86_64: <.deb url>".
+// A rolling release has no VERSION_ID: "Package-arch-x86_64".
+static void PickLinuxPackage(UpdateInfo* updateInfo, Str data) {
+    TempStr id = OsReleaseValueTemp(StrL("ID"));
+    TempStr ver = OsReleaseValueTemp(StrL("VERSION_ID"));
+    if (len(id) == 0) {
+        return;
+    }
+#if defined(__aarch64__)
+    Str arch = StrL("aarch64");
+#else
+    Str arch = StrL("x86_64");
+#endif
+    SquareTreeNode* root = ParseSquareTree(data);
+    if (!root) {
+        return;
+    }
+    AutoDelete delRoot(root);
+    SquareTreeNode* node = root->GetChild(StrL("SumatraPDF"));
+    TempStr key = fmt("Package-%s%s-%s", id, ver, arch);
+    Str url = node ? node->GetValue(key) : Str{};
+    logf("PickLinuxPackage: %s: '%s'\n", key, url);
+    if (len(url) == 0 || !IsTrustedUpdateDlUrl(url)) {
+        return;
+    }
+    str::ReplaceWithCopy(&updateInfo->downloadPage, url);
 }
 #elif !OS_WIN
 static TempStr OsNameTemp() {
@@ -744,6 +749,11 @@ static void UpdateCheckAsync(UpdateCheckAsyncData* data) {
         delete rsp;
         str::Builder url;
         BuildUpdateURL(url, updateInfoURL, updateCheckType);
+#if OS_DARWIN
+        // tells installs apart in the update check stats
+        url.Append(StrL("&id="));
+        url.Append(MacMachineIdHashTemp());
+#endif
         Str uri = ToStr(url);
         rsp = new HttpRsp;
         str::ReplaceWithCopy(&rsp->url, uri);
@@ -761,7 +771,7 @@ static void UpdateCheckAsync(UpdateCheckAsyncData* data) {
 // start auto-update check by downloading auto-update information from url
 // on a background thread and processing the retrieved data on ui thread
 void StartAsyncUpdateCheck(MainWindow* win, UpdateCheck updateCheckType) {
-    if (!ShouldCheckForUpdate(updateCheckType)) {
+    if (!ShouldCheckForUpdate(updateCheckType, gUpdateCheckInProgress)) {
         return;
     }
 
@@ -775,7 +785,7 @@ void StartAsyncUpdateCheck(MainWindow* win, UpdateCheck updateCheckType) {
         args.groupId = kNotifUpdateCheckInProgress;
         ShowNotification(args);
     }
-    CurrentFileTime(&gSettings->timeOfLastUpdateCheck);
+    GetSystemTimeAsFileTime(&gSettings->timeOfLastUpdateCheck);
     gUpdateCheckInProgress = true;
 
     // data freed in UpdateCheckFinish()

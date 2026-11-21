@@ -18,29 +18,6 @@
 #include "MainWindow.h"
 #include "gui/AppShell.h"
 
-// AppKit turns automatic termination back on at the end of launch when it
-// still counts zero windows. Under lldb the app never becomes frontmost, so
-// that quits the process with status 0.
-void AppShellDisableAutoTermination() {
-    NSProcessInfo* info = [NSProcessInfo processInfo];
-    info.automaticTerminationSupportEnabled = NO;
-    [info disableAutomaticTermination:@"SumatraPDF"];
-}
-
-// Backing pixels per point. The canvas is drawn in points, so a tile rendered
-// at GetZoomReal is upscaled on a Retina display.
-float AppShellRenderScale(gpui::Window* win) {
-    NSView* view = (__bridge NSView*)gp::PlatWindowHandle(win);
-    if (!view || !view.window) {
-        return 1;
-    }
-    float scale = (float)view.window.backingScaleFactor;
-    if (!(scale > 0)) {
-        return 1;
-    }
-    return scale;
-}
-
 static StrVec gOpenDocs;
 static bool gOpenDocsReady = false;
 
@@ -71,33 +48,23 @@ static void OpenQueuedDocs() {
     AppShellActivateWindow(win);
 }
 
-@interface SumatraOpenDocs : NSObject
-@end
-
-@implementation SumatraOpenDocs
-- (void)openDocs:(NSAppleEventDescriptor*)event withReply:(NSAppleEventDescriptor*)reply {
-    (void)reply;
-    NSAppleEventDescriptor* docs = [[event paramDescriptorForKeyword:keyDirectObject] coerceToDescriptorType:typeAEList];
-    for (NSInteger i = 1; i <= docs.numberOfItems; i++) {
-        NSString* path = [[docs descriptorAtIndex:i] fileURLValue].path;
-        if (path) {
-            gOpenDocs.Append(Str((char*)path.UTF8String));
+static void OnOpenUrls(gp::App*, const gp::Str* urls, int n) {
+    for (int i = 0; i < n; i++) {
+        if (!gp::StrStartsWith(urls[i], "file://")) {
+            continue;
         }
+        gOpenDocs.Append(FromGpui(wry::PathFromFileUriTemp(urls[i])));
     }
     if (gOpenDocsReady) {
         uitask::Post(MkFunc0Void(OpenQueuedDocs), "OpenQueuedDocs");
     }
 }
-@end
 
-// Finder's "Open With" and `open -a` deliver documents as an Apple event, not
-// in argv. Those arriving before the first window exists wait in gOpenDocs.
-void AppShellHandleOpenDocs() {
-    static SumatraOpenDocs* handler = [[SumatraOpenDocs alloc] init];
-    [[NSAppleEventManager sharedAppleEventManager] setEventHandler:handler
-                                                       andSelector:@selector(openDocs:withReply:)
-                                                     forEventClass:kCoreEventClass
-                                                        andEventID:kAEOpenDocuments];
+// Finder's "Open With" and `open -a` deliver documents through gpui's
+// on_open_urls, not in argv. Those arriving before the first window exists
+// wait in gOpenDocs.
+void AppShellHandleOpenDocs(gp::App* app) {
+    gp::AppOnOpenUrls(app, OnOpenUrls);
 }
 
 void AppShellOpenDocsReady() {

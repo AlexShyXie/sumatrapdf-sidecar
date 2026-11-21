@@ -24,6 +24,19 @@
 #include "FindBar.h"
 #include "AppHelpersCommon.h"
 
+#if defined(SUMATRA_NG)
+// width of the "n / m" status slot, wide enough for the largest count it will
+// show, so the text field next to it doesn't move on every count update
+float FindStatusSlotDx(int totalHits, bool capped) {
+    int digits = DecimalDigits(std::max(totalHits, 0));
+    int nChars = (2 * digits) + 3; // N, " / ", M
+    if (capped) {
+        nChars++; // the trailing '+' in e.g. "999 / 999+"
+    }
+    return (float)nChars * 7.f;
+}
+#endif
+
 // Exercise and report find-UI state for focused integration tests.
 TempStr FindUiStateResultTemp(Str action, int* exitCodeOut) {
     str::Builder out;
@@ -78,8 +91,8 @@ TempStr FindUiStateResultTemp(Str action, int* exitCodeOut) {
     int page = first->ctrl ? first->ctrl->CurrentPageNo() : 0;
     out.Append(
         fmt("OK windows=%d docs=%d pref=%d compact=%d floating=%d firstTextLen=%d matches=%d hitPage=%d "
-            "busy=%d page=%d\n",
+            "busy=%d page=%d historyOpen=%d\n",
             len(gWindows), docs, gSettings->searchUIFloating ? 1 : 0, compact, floating, firstTextLen, matches, hitPage,
-            busy ? 1 : 0, page));
+            busy ? 1 : 0, page, IsFindHistoryOpen(first) ? 1 : 0));
     return finish(0);
 }

@@ -20,7 +20,6 @@
 
 #include "gui/UIModels.h"
 
-#define INCLUDE_SETTINGSSTRUCTS_METADATA
 #include "Settings.h"
 #include "AppSettings.h"
 #include "DisplayMode.h"
@@ -47,6 +46,7 @@
 #include "SumatraPDF.h"
 #include "MainWindow.h"
 #include "AnnotPlacement.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Tabs.h"
 #include "FileHistory.h"
@@ -64,7 +64,7 @@
 #include "SumatraLog.h"
 
 // the palette: a query line over a hairline, the mode switches, the rows on
-// an inset with a rounded selection, and the key hints under a hairline
+// an inset with a rounded selection, and the key hints
 constexpr float kPaletteRowDy = 24;
 constexpr float kPaletteQueryDy = 40;
 constexpr float kPaletteSwitchRowDy = 30;
@@ -76,6 +76,8 @@ constexpr float kPaletteTextFontPx = 13;
 constexpr float kPaletteMetaFontPx = 12;
 constexpr float kPaletteHintFontPx = 11;
 constexpr float kPaletteSelectionRadius = 4;
+constexpr float kPaletteSwatchDx = 12;
+constexpr float kPaletteSwatchGap = 8;
 constexpr float kPaletteTopMargin = 42;
 constexpr int kPaletteMinDx = 640;
 constexpr int kPaletteMaxDx = 1024;
@@ -105,10 +107,8 @@ struct PaletteThumb {
 struct ThumbnailCache {
     Vec<PaletteThumb> thumbs;
     EngineBase* renderEngine = nullptr;
-    AtomicInt cancelRendering = 0;
+    BgJob job;
     int rotation = 0;
-    bool workerRunning = false;
-    bool deleteWhenWorkerFinishes = false;
 };
 
 struct CommandPaletteWnd : PaletteSources {
@@ -122,10 +122,6 @@ struct CommandPaletteWnd : PaletteSources {
     // orig's popup window, where the platform can have one; null: an overlay
     // in the frame
     ToolWindow* tw = nullptr;
-#if OS_WIN
-    // tests look for a focused Edit whose root is not the frame
-    HWND queryEdit = nullptr;
-#endif
 
     // what the list shows: the filtered rows
     StrVecCP items;
@@ -232,28 +228,6 @@ static void DeleteThumbnailCache(ThumbnailCache* cache) {
     delete cache;
 }
 
-// orig's RenderPageThumbnail
-static Pixmap* RenderPageThumbnail(EngineBase* engine, int pageNo, Location loc, int rotation) {
-    // reflow docs share one mediabox; don't use a flat pageNo that a clone's
-    // chapter layout may have already shifted
-    int boxPage = loc.IsValid() && engine->isReflowable ? 1 : pageNo;
-    RectF pageRect = engine->PageMediabox(boxPage);
-    if (pageRect.IsEmpty()) {
-        return nullptr;
-    }
-
-    pageRect = engine->Transform(pageRect, boxPage, 1.0f, rotation);
-    if (pageRect.dx <= 0 || pageRect.dy <= 0) {
-        return nullptr;
-    }
-    float zoom = (float)kThumbDx / pageRect.dx;
-    pageRect.dy = std::min(pageRect.dy, (float)kThumbDy / zoom);
-    pageRect = engine->Transform(pageRect, boxPage, 1.0f, rotation, true);
-    RenderPageArgs args(pageNo, zoom, rotation, &pageRect, RenderTarget::View);
-    args.loc = loc;
-    return PixmapToBgr(engine->RenderPage(args));
-}
-
 struct ThumbRenderTask {
     ThumbnailCache* cache = nullptr;
     int pageNo = 0;
@@ -266,12 +240,13 @@ struct ThumbRenderWorker {
     Vec<int> pages;
     Vec<Location> locs;
     int rotation = 0;
+    int next = 0; // pages[next] is rendered next
 };
 
 static void FinishThumbRender(ThumbRenderTask* task) {
     ThumbnailCache* cache = task->cache;
     int idx = task->pageNo - 1;
-    bool isValid = !cache->deleteWhenWorkerFinishes && idx >= 0 && idx < len(cache->thumbs);
+    bool isValid = !cache->job.IsDetached() && idx >= 0 && idx < len(cache->thumbs);
     if (isValid) {
         PaletteThumb& t = cache->thumbs[idx];
         if (task->bitmap) {
@@ -294,35 +269,38 @@ static void FinishThumbRender(ThumbRenderTask* task) {
 }
 
 static void FinishThumbWorker(ThumbnailCache* cache) {
-    cache->workerRunning = false;
-    if (cache->deleteWhenWorkerFinishes) {
+    if (cache->job.Finish()) {
         DeleteThumbnailCache(cache);
         return;
     }
     StartThumbnailRendering();
 }
 
+// Without threads (see kUiSliceMs) this runs in slices, each posting the next
 static void RenderThumbsInBackground(ThumbRenderWorker* worker) {
     ThumbnailCache* cache = worker->cache;
+    u64 sliceStart = GetTickCount64();
     if (worker->sourceEngine) {
         cache->renderEngine = worker->sourceEngine->Clone();
         worker->sourceEngine->Release();
         worker->sourceEngine = nullptr;
     }
     EngineBase* engine = cache->renderEngine;
-    if (engine) {
-        int n = len(worker->pages);
-        for (int i = 0; i < n; i++) {
-            if (AtomicIntGet(&cache->cancelRendering) != 0) {
-                break;
-            }
-            Location loc = i < len(worker->locs) ? worker->locs[i] : kInvalidLocation;
-            auto* task = new ThumbRenderTask;
-            task->cache = cache;
-            task->pageNo = worker->pages[i];
-            task->bitmap = RenderPageThumbnail(engine, worker->pages[i], loc, worker->rotation);
-            uitask::Post(MkFunc0<ThumbRenderTask>(FinishThumbRender, task));
+    while (engine && worker->next < len(worker->pages)) {
+        if (cache->job.IsCanceled()) {
+            break;
         }
+        if (!kHasThreads && GetTickCount64() - sliceStart >= (u64)kUiSliceMs) {
+            uitask::Post(MkFunc0<ThumbRenderWorker>(RenderThumbsInBackground, worker), "CommandPaletteThumbnailRender");
+            return;
+        }
+        int i = worker->next++;
+        Location loc = i < len(worker->locs) ? worker->locs[i] : kInvalidLocation;
+        auto* task = new ThumbRenderTask;
+        task->cache = cache;
+        task->pageNo = worker->pages[i];
+        task->bitmap = RenderPageThumb(engine, worker->pages[i], loc, worker->rotation);
+        uitask::Post(MkFunc0<ThumbRenderTask>(FinishThumbRender, task));
     }
     uitask::Post(MkFunc0<ThumbnailCache>(FinishThumbWorker, cache));
     delete worker;
@@ -357,7 +335,7 @@ static float ThumbMaxScrollY(CommandPaletteWnd* wnd) {
 // screen on either side; thumbnails further than two more screens are freed
 static void StartThumbnailRendering() {
     CommandPaletteWnd* wnd = gCommandPaletteWnd;
-    if (!wnd || !wnd->thumbnailMode || !wnd->thumbCache || wnd->thumbCache->workerRunning) {
+    if (!wnd || !wnd->thumbnailMode || !wnd->thumbCache || wnd->thumbCache->job.IsRunning()) {
         return;
     }
     DisplayModel* dm = wnd->win ? wnd->win->AsFixed() : nullptr;
@@ -418,9 +396,13 @@ static void StartThumbnailRendering() {
         worker->sourceEngine = engine;
         engine->AddRef();
     }
-    AtomicIntSet(&cache->cancelRendering, 0);
-    cache->workerRunning = true;
-    RunAsync(MkFunc0<ThumbRenderWorker>(RenderThumbsInBackground, worker), StrL("CommandPaletteThumbnailRender"));
+    cache->job.Start();
+    auto fn = MkFunc0<ThumbRenderWorker>(RenderThumbsInBackground, worker);
+    if (kHasThreads) {
+        RunAsync(fn, StrL("CommandPaletteThumbnailRender"));
+    } else {
+        uitask::Post(fn, "CommandPaletteThumbnailRender");
+    }
 }
 
 static void SetThumbnailMode(bool enabled) {
@@ -431,7 +413,7 @@ static void SetThumbnailMode(bool enabled) {
     wnd->thumbnailMode = enabled;
     if (!enabled) {
         if (wnd->thumbCache) {
-            AtomicIntSet(&wnd->thumbCache->cancelRendering, 1);
+            wnd->thumbCache->job.Cancel();
         }
         return;
     }
@@ -474,25 +456,15 @@ void CloseCommandPalette() {
     }
     gCommandPaletteWnd = nullptr;
     MainWindow* win = wnd->win;
-#if OS_WIN
-    if (wnd->queryEdit) {
-        HWND edit = wnd->queryEdit;
-        wnd->queryEdit = nullptr;
-        DestroyWindow(edit);
-    }
-#endif
     if (wnd->tw) {
         ToolWindowClose(wnd->tw);
         wnd->tw = nullptr;
     } else if (win && win->gpuiWin && wnd->editQuery) {
-        gp::InputBlur(wnd->editQuery, win->gpuiWin->app, win->gpuiWin);
+        InputBlurWhereFocused(wnd->editQuery, win->gpuiWin);
     }
     delete wnd->editQuery;
     if (wnd->thumbCache) {
-        AtomicIntSet(&wnd->thumbCache->cancelRendering, 1);
-        if (wnd->thumbCache->workerRunning) {
-            wnd->thumbCache->deleteWhenWorkerFinishes = true;
-        } else {
+        if (wnd->thumbCache->job.Detach()) {
             DeleteThumbnailCache(wnd->thumbCache);
         }
     }
@@ -898,10 +870,6 @@ static bool RemoveSelectedItem() {
     return true;
 }
 
-#if OS_WIN
-static void PaletteAttachQueryEdit(CommandPaletteWnd* wnd);
-#endif
-
 // orig's list-box dump. exit 2 when the palette is not open.
 TempStr CommandPaletteStateTemp(int* exitCodeOut) {
     str::Builder out;
@@ -916,21 +884,11 @@ TempStr CommandPaletteStateTemp(int* exitCodeOut) {
         out.Append(StrL("NOTREADY no-palette\n"));
         return finish(2);
     }
-#if OS_WIN
-    // the query Edit appears with the tool window, after this state is first visible
-    if (!wnd->queryEdit) {
-        PaletteAttachQueryEdit(wnd);
-    }
-    if (!wnd->queryEdit) {
+    // in a window of its own: ready once that window is made
+    if (!wnd->editQuery || (wnd->tw && !ToolWindowGpui(wnd->tw))) {
         out.Append(StrL("NOTREADY no-palette\n"));
         return finish(2);
     }
-#else
-    if (!wnd->editQuery) {
-        out.Append(StrL("NOTREADY no-palette\n"));
-        return finish(2);
-    }
-#endif
     int sel = wnd->sel;
     int n = len(wnd->items);
     int selectedCmdId = 0;
@@ -1072,143 +1030,19 @@ WindowTab* CommandPaletteHighlightedTab(MainWindow* win) {
 
 // orig's UpdateCommandNameTemp, with the toggles this port has
 static TempStr UpdateCommandNameTemp(MainWindow* win, int cmdId, Str s) {
-    bool isToggle = false;
-    bool newIsOn = false;
-    switch (cmdId) {
-        case CmdToggleFullscreen: {
-            isToggle = true;
-            newIsOn = !(win->isFullScreen || win->presentation);
-        } break;
-        case CmdToggleMenuBar: {
-            isToggle = true;
-            bool visible = SettingsUseTabs() ? gSettings->showMenubarWithTabs : gSettings->showMenubar;
-            newIsOn = !visible;
-        } break;
-        case CmdToggleBookmarks:
-        case CmdToggleTableOfContents: {
-            isToggle = true;
-            newIsOn = !SidebarContentVisible(win, SidebarContent::Bookmarks);
-        } break;
-        case CmdToggleThumbnails: {
-            isToggle = true;
-            newIsOn = !SidebarContentVisible(win, SidebarContent::Thumbnails);
-        } break;
-        case CmdTogglePresentationMode: {
-            isToggle = true;
-            newIsOn = !win->presentation;
-        } break;
-        case CmdToggleLinks: {
-            isToggle = true;
-            newIsOn = !gSettings->showLinks;
-        } break;
-        case CmdToggleHighlightFormFields: {
-            isToggle = true;
-            newIsOn = !gSettings->highlightFormFields;
-        } break;
-        case CmdToggleDisableLinks: {
-            isToggle = true;
-            newIsOn = !gSettings->disableLinks;
-        } break;
-        case CmdTogglePageGrid: {
-            isToggle = true;
-            newIsOn = !ShowPageGrid();
-        } break;
-        case CmdToggleShowAnnotations: {
-            WindowTab* tab = win->CurrentTab();
-            if (tab) {
-                isToggle = true;
-                newIsOn = tab->hideAnnotations;
-            }
-        } break;
-        case CmdToggleContinuousView: {
-            if (win->ctrl) {
-                isToggle = true;
-                newIsOn = !IsContinuous(win->ctrl->GetDisplayMode());
-            }
-        } break;
-        case CmdToggleMangaMode: {
-            DisplayModel* dm = win->AsFixed();
-            if (dm) {
-                isToggle = true;
-                newIsOn = !dm->GetDisplayR2L();
-            }
-        } break;
-        case CmdToggleAutoRotateWidePages:
-            isToggle = true;
-            newIsOn = !gSettings->comicBookUI.autoRotateWidePages;
-            break;
-        case CmdToggleUniformPageWidth: {
-            DisplayModel* dm = win->AsFixed();
-            if (dm) {
-                isToggle = true;
-                newIsOn = !dm->GetUniformPageWidth();
-            }
-        } break;
-        case CmdToggleTrimEmptyMargins: {
-            DisplayModel* dm = win->AsFixed();
-            if (dm) {
-                isToggle = true;
-                newIsOn = !dm->GetTrimEmptyMargins();
-            }
-        } break;
-        case CmdToggleFreePan: {
-            DisplayModel* dm = win->AsFixed();
-            if (dm) {
-                isToggle = true;
-                newIsOn = !dm->GetFreePan();
-            }
-        } break;
-        case CmdFindToggleMatchCase: {
-            isToggle = true;
-            newIsOn = !win->findMatchCase;
-        } break;
-        case CmdFindToggleMatchWholeWord: {
-            isToggle = true;
-            newIsOn = !win->findMatchWholeWord;
-        } break;
-        case CmdFavoriteToggle: {
-            isToggle = true;
-            newIsOn = !gSettings->showFavorites;
-        } break;
-        case CmdTogglePageInfo: {
-            isToggle = true;
-            newIsOn = !win->pageInfoWanted;
-        } break;
-        case CmdTogglePageBoxes: {
-            isToggle = true;
-            newIsOn = !win->showPageBoxes;
-        } break;
-        case CmdToggleImages: {
-            isToggle = true;
-            newIsOn = !ShowImageOutlines();
-        } break;
-        case CmdToggleTransparencyGrid: {
-            isToggle = true;
-            newIsOn = !ShowTransparencyGrid();
-        } break;
-        case CmdDebugShowFitContentArea: {
-            isToggle = true;
-            newIsOn = !ShowFitContentArea();
-        } break;
-        case CmdTogglePreservePdfImages: {
-            isToggle = true;
-            newIsOn = !GetPreservePdfImagesInDarkMode();
-        } break;
-        case CmdDebugTogglePredictiveRender: {
-            isToggle = true;
-            newIsOn = !gPredictiveRender;
-        } break;
-        case CmdToggleEngineeringDrawingEnhance: {
-            DisplayModel* dm = win->AsFixed();
-            if (dm) {
-                isToggle = true;
-                newIsOn = !EngineMupdfCadEnhanceActive(dm->GetEngine());
-            }
-        } break;
+    bool isOn = false;
+    bool isToggle = ToggleCmdState(win, nullptr, cmdId, isOn);
+    // debug toggles: not in toggleCommands, so no state argument
+    if (cmdId == CmdDebugShowFitContentArea) {
+        isToggle = true;
+        isOn = ShowFitContentArea();
     }
-
+    if (cmdId == CmdDebugTogglePredictiveRender) {
+        isToggle = true;
+        isOn = gPredictiveRender;
+    }
     if (isToggle) {
-        return str::JoinTemp(s, newIsOn ? StrL(": set to true") : StrL(": set to false"));
+        return str::JoinTemp(s, isOn ? StrL(": set to false") : StrL(": set to true"));
     }
 
     // these cycle through values rather than on and off, so they name what
@@ -1625,8 +1459,11 @@ void PaletteView::OnInput(PaletteView*, gp::Ctx* cx, const gp::InputEvent* ev) {
         return;
     }
     if (ev->kind == gp::InputEventKind::PressEnter) {
-        ExecuteCurrentSelection();
-        gp::Notify(cx);
+        // in the frame the key goes on to CommandPaletteOnKeyDown, which runs the row
+        if (ToolWindowsAvailable()) {
+            ExecuteCurrentSelection();
+            gp::Notify(cx);
+        }
         return;
     }
     if (ev->kind != gp::InputEventKind::Change) {
@@ -1754,6 +1591,17 @@ static gp::El* BuildList(CommandPaletteWnd* wnd, gp::Ctx* cx, float listDy) {
             }
         }
         row->Child(left);
+        // a color setting shows its color before the value, as in advanced settings
+        Color swatch;
+        if (PaletteRowColor(data, itemText, &swatch)) {
+            row->Child(gp::Div(cx->a)->W(kPaletteSwatchGap)->Shrink0());
+            row->Child(gp::Div(cx->a)
+                           ->W(kPaletteSwatchDx)
+                           ->H(kPaletteSwatchDx)
+                           ->Shrink0()
+                           ->Bg(ToGpui(swatch))
+                           ->Border(1, ToGpui(ThemeEdgeColor())));
+        }
         TempStr right = PaletteRightColumnTemp(data);
         if (len(right) > 0) {
             // a setting's value reads as part of the row; one off its default is bold
@@ -1928,9 +1776,8 @@ static gp::El* BuildSwitchRow(CommandPaletteWnd* wnd, gp::Ctx* cx) {
                          ->Cursor(gp::CursorKind::Pointer)
                          ->PathClick(GpuiDup(cx->a, fmt("palette-switch-%d", prefixIdx)))
                          ->OnClick(gp::ListenTo(gPaletteView, &PaletteView::OnSwitchClick, (intptr_t)prefixIdx));
-        // the leading character is the prefix: draw it as a key cap, as orig does
-        el->Child(DlgKeyCap(cx, Str(sw.label.s, 1), active));
-        el->Child(gp::TextEl(cx->a, GpuiDup(cx->a, Str(sw.label.s + 2, len(sw.label) - 2)))
+        el->Child(DlgKeyCap(cx, sw.prefix, active));
+        el->Child(gp::TextEl(cx->a, GpuiDup(cx->a, PaletteSwitchLabel(sw.label, sw.prefix)))
                       ->Font(kPaletteMetaFontPx)
                       ->Fg(ToGpui(active ? colText : colMuted)));
         row->Child(el);
@@ -1950,7 +1797,6 @@ static gp::El* BuildHelpRow(CommandPaletteWnd* wnd, gp::Ctx* cx) {
                       ->W(gp::kFill)
                       ->H(kPaletteFootDy)
                       ->Shrink0()
-                      ->BorderT(1, ToGpui(ThemeEdgeColor()))
                       ->PadX(kPalettePadDx)
                       ->ItemsCenter()
                       ->Gap(18);
@@ -2046,57 +1892,6 @@ static Size PaletteWindowSize(MainWindow* win, CommandPaletteWnd* wnd) {
     return Size(dx, dy);
 }
 
-#if OS_WIN
-constexpr UINT_PTR kPaletteQuerySubclassId = 7;
-
-// WM_SETTEXT and the keys tests post at the query Edit. The box they see is
-// this control; the text they filter is the gpui input.
-static LRESULT CALLBACK PaletteQueryProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR dw) {
-    auto* win = (MainWindow*)dw;
-    if (msg == WM_SETTEXT && lp) {
-        CommandPaletteSetText(win, (const WCHAR*)lp);
-    }
-    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
-        bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-        if (CommandPaletteOnKeyDown(win, (int)wp, ctrl, shift)) {
-            return 0;
-        }
-    }
-    if (msg == WM_KEYUP) {
-        CommandPaletteOnKeyUp(win, (int)wp);
-    }
-    if (msg == WM_NCDESTROY) {
-        RemoveWindowSubclass(hwnd, PaletteQueryProc, kPaletteQuerySubclassId);
-    }
-    return DefSubclassProc(hwnd, msg, wp, lp);
-}
-
-static void PaletteAttachQueryEdit(CommandPaletteWnd* wnd) {
-    if (!wnd || wnd->queryEdit) {
-        return;
-    }
-    HWND parent = wnd->tw ? ToolWindowOrigHwnd(wnd->tw) : nullptr;
-    if (!parent) {
-        return;
-    }
-    HWND edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 1, 1, parent, nullptr,
-                                GetModuleHandleW(nullptr), nullptr);
-    if (!edit) {
-        return;
-    }
-    SetWindowSubclass(edit, PaletteQueryProc, kPaletteQuerySubclassId, (DWORD_PTR)wnd->win);
-    wnd->queryEdit = edit;
-}
-
-static void PaletteFocusQueryEdit(CommandPaletteWnd* wnd) {
-    if (!wnd || !wnd->queryEdit || GetFocus() == wnd->queryEdit) {
-        return;
-    }
-    SetFocus(wnd->queryEdit);
-}
-#endif
-
 static gp::El* PaletteToolBuild(MainWindow* win, gp::Ctx* cx) {
     CommandPaletteWnd* wnd = gCommandPaletteWnd;
     if (!wnd || !wnd->visible || wnd->win != win || !wnd->tw || ToolWindowGpui(wnd->tw) != cx->win) {
@@ -2105,23 +1900,13 @@ static gp::El* PaletteToolBuild(MainWindow* win, gp::Ctx* cx) {
     // orig's WA_INACTIVE: the palette goes when another window is activated.
     // The query Edit lives on the orig-class window, so focus there is still us.
     bool active = gp::WindowIsActive(cx);
-#if OS_WIN
-    if (!active && wnd->queryEdit && GetFocus() == wnd->queryEdit) {
-        active = true;
-    }
-#endif
     if (wnd->wasActive && !active) {
         CloseCommandPalette();
         return nullptr;
     }
     wnd->wasActive = active;
     gp::WinSize ws = gp::WindowSize(cx->win);
-    gp::El* card = PaletteCard(wnd, cx, RectF(0, 0, ws.dipW, ws.dipH));
-#if OS_WIN
-    PaletteAttachQueryEdit(wnd);
-    PaletteFocusQueryEdit(wnd);
-#endif
-    return card;
+    return PaletteCard(wnd, cx, RectF(0, 0, ws.dipW, ws.dipH));
 }
 
 static bool PaletteToolOnKey(MainWindow* win, gp::Ctx*, const gp::KeyEvent* ev) {

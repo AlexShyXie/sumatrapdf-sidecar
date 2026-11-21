@@ -16,6 +16,7 @@
 #include "EngineAll.h"
 #include "DisplayModel.h"
 #include "SumatraPDF.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "MainWindow.h"
 #include "Commands.h"
@@ -503,6 +504,29 @@ bool IsPdfDoc(WindowTab* tab) {
     return !engine || EngineMupdfIsPdf(engine);
 }
 
+// Convert EPUB to PDF is offered for EPUB only
+bool IsEpubDoc(WindowTab* tab) {
+    if (!tab || len(tab->filePath) == 0) {
+        return false;
+    }
+    return GuessFileTypeFromName(tab->filePath, true) == FileType::Epub;
+}
+
+// a loaded document MuPDF opened that isn't a PDF: XPS, EPUB, FB2, ... Extract
+// Pages writes its pages to a new PDF (#6509)
+bool IsMupdfNonPdfDoc(WindowTab* tab) {
+    DisplayModel* dm = tab ? tab->AsFixed() : nullptr;
+    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
+    return engine && engine->kind == kindEngineMupdf && !EngineMupdfIsPdf(engine);
+}
+
+// Convert CAJ to PDF is offered once caj2pdf opened the file
+bool IsCajDoc(WindowTab* tab) {
+    DisplayModel* dm = tab ? tab->AsFixed() : nullptr;
+    EngineBase* engine = dm ? dm->GetEngine() : nullptr;
+    return engine && engine->kind == kindEngineCaj;
+}
+
 // substitutions in cmdLine:
 //  %1 : file path (else the file path is appended)
 //  %d : directory in which file is
@@ -840,11 +864,13 @@ static bool SendAsEmailAttachmentWithMail(Str filePath) {
 }
 #endif
 
+#if !OS_WASM
 static bool SendAsEmailAttachmentWithMailto(Str filePath) {
     TempStr name = path::GetBaseNameTemp(filePath);
     TempStr url = fmt("mailto:?subject=%s&body=%s", name, filePath);
     return LaunchBrowser(url);
 }
+#endif
 
 #endif
 
@@ -875,7 +901,17 @@ bool SendAsEmailAttachment(WindowTab* tab) {
     if (WasmShareFile(tab->filePath)) {
         return true;
     }
+    // No share sheet (Firefox, Chrome on Linux): a mailto link can't carry the
+    // file, and its path is one inside the page. Download the file, to attach
+    // it, and start the email with its name.
+    if (!WasmDownloadFile(tab->filePath)) {
+        return false;
+    }
+    TempStr name = path::GetBaseNameTemp(tab->filePath);
+    return LaunchBrowser(fmt("mailto:?subject=%s", name));
 #endif
+#if !OS_WASM
     return SendAsEmailAttachmentWithMailto(tab->filePath);
+#endif
 #endif
 }

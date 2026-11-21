@@ -20,10 +20,16 @@ const AccelStroke* GetAcceleratorStrokes(int& nOut);
 TempStr AppendAccelKeyToMenuStringTemp(TempStr str, int cmdId);
 TempStr ShortcutsForCmdTemp(int cmdId, int maxCount);
 int SafeAcceleratorCmd(u16 vk, bool ctrl, bool shift, bool alt, bool cmd = false);
+int AcceleratorCmd(u16 vk, bool ctrl, bool shift, bool alt, bool cmd = false);
 int AsciiAcceleratorCmd(u32 ch);
 bool IsSafeAccel(const Accel&);
 bool IsSafeTreeAccel(const Accel&);
 
 #if OS_WIN
 HACCEL* GetAcceleratorTables();
+#endif
+
+#if OS_WASM
+bool IsBrowserReservedShortcut(const KeyShortcut&);
+int WasmAcceleratorCmd(u16 vk, u32 ch, bool ctrl, bool shift, bool alt);
 #endif

@@ -19,6 +19,7 @@
 #include "SumatraConfig.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Commands.h"
 #include "ExternalViewers.h"
@@ -184,7 +185,7 @@ bool CommandUsesContextMenuPoint(int cmdId) {
     }
     return cmdId == CmdDeleteAnnotation || cmdId == CmdCreateAnnotImageFromClipboard || cmdId == CmdInsertImage ||
            cmdId == CmdSignWithImage || cmdId == CmdPasteAnnotation || cmdId == CmdCopyAnnotation ||
-           cmdId == CmdCutAnnotation;
+           cmdId == CmdCutAnnotation || cmdId == CmdEditAnnotationText;
 }
 
 // note: IDM_VIEW_SINGLE_PAGE - IDM_VIEW_CONTINUOUS and also

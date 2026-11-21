@@ -2,12 +2,13 @@
    License: GPLv3 */
 
 // ng: orig shows a number of things in top-level windows of their own (Browse
-// Files In Folder, the find window, Document Properties, ...). gpui opens a
-// window at a size and nothing else (see "gpui gaps": no owner, no style, no
-// position). On Windows, macOS and Linux the native frame is configured, and
-// such a window is a second gpui window described by a ToolWindowDesc. On
-// wasm, and in plugin mode, ToolWindowsAvailable() is false and the caller
-// draws the same content inside the frame.
+// Files In Folder, the find window, Document Properties, ...). On Windows,
+// macOS and Linux such a window is a second gpui window described by a
+// ToolWindowDesc, with its frame, owner and place from gpui's window options.
+// A window without a caption is moved by its body: the content marks that
+// area with gpui's ClickWinCaption. On wasm, and in plugin mode,
+// ToolWindowsAvailable() is false and the caller draws the same content
+// inside the frame.
 
 namespace gpui {
 struct Ctx;
@@ -67,8 +68,8 @@ struct ToolWindowDesc {
     Size minClient;
     // largest; a 0 side is unbounded
     Size maxClient;
-    // files can be dropped on it: an OLE drop target on its HWND (Windows)
-    bool dropFiles = false;
+    // files dropped on it (gpui's ExternalPaths drop); `pt` is window dips
+    void (*onDropFiles)(MainWindow* owner, const Str* paths, int n, PointF pt) = nullptr;
     // the content; fills the window
     gpui::El* (*build)(MainWindow* owner, gpui::Ctx* cx) = nullptr;
     // a key the content's own listeners did not take; true when handled
@@ -94,10 +95,6 @@ struct ToolWindowDesc {
     void (*onExitSizeMove)(MainWindow* owner, Rect outer) = nullptr;
     // orig's WM_ACTIVATE
     void (*onActivate)(MainWindow* owner, bool active) = nullptr;
-    // a window without a caption is moved by its body (orig's WM_NCHITTEST ->
-    // HTCAPTION): true for the points that are the content's (a button). The
-    // point is in the window's client area, in dips
-    bool (*isClientPoint)(MainWindow* owner, Point pt) = nullptr;
     // for a window docked to the frame, as orig's popups that are put back in
     // place on the frame's WM_MOVE / WM_SIZE (RegisterOnWindowMoved): where it
     // belongs now, in screen pixels; empty: nowhere, it is hidden. Asked when
@@ -156,8 +153,6 @@ Rect ToolWindowRect(ToolWindow* tw);
 // HwndResizeClientSize
 void ToolWindowSetClientSize(ToolWindow* tw, Size clientDip);
 void ToolWindowMove(ToolWindow* tw, Rect outer);
-// starts the system's move loop, for a window dragged by its body
-void ToolWindowDragMove(ToolWindow* tw);
 // orig's SetIsVisible() on a dialog that stays alive while it is out of the
 // way: a hidden modal window gives its main window back (enabled, active),
 // shown again it takes it away. The window keeps its place
@@ -192,13 +187,12 @@ void ToolWindowsCloseFor(MainWindow* win);
 // NativeWindow.cpp claims gpui windows by class name; these are not frames
 bool ToolWindowOwnsHwnd(HWND hwnd);
 HWND ToolWindowHwnd(ToolWindow* tw);
-// the SumatraWgDefaultWinClass window tests post to, or the tool window
-HWND ToolWindowOrigHwnd(ToolWindow* tw);
+ToolWindow* ToolWindowFromHwnd(HWND hwnd);
 // the main window of the tool window with this handle
 MainWindow* ToolWindowOwnerFromHwnd(HWND hwnd);
 #endif
 
-// -dbg-control's TestToolWindow: list | on | off | close <name> |
+// -dbg-control's TestToolWindow: list | on | off | close <name> | move <name> x y |
 // input <name> <kind> a b c d (see AppShellTestInput) | state <name> |
 // layout <name> (also TestLayout <name>): the texts, click targets and
 // scrolled boxes of the window's last frame; `layout frame`: the same of the

@@ -60,6 +60,7 @@
 #include "Canvas.h"
 #endif
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "SelectionToolbar.h"
 #if defined(SUMATRA_NG)
@@ -74,6 +75,7 @@
 #include "uia/Provider.h"
 #endif
 #include "Selection.h"
+#include "CanvasCommon.h"
 #if defined(SUMATRA_NG)
 
 #include "SumatraLog.h"
@@ -152,6 +154,12 @@ void DeleteOldSelectionInfo(MainWindow* win, bool alsoTextSel) {
     win->showSelection = false;
     win->selectionMeasure = SizeF();
     win->selectionDragEdge = SelectionDragEdge::None;
+#if !defined(SUMATRA_NG)
+    // the handles belong to the selection: a later keyboard or menu selection
+    // must not show them
+    win->touchSelHandles = false;
+    win->touchSelDragging = TouchSelHandle::None;
+#endif
     WindowTab* tab = win->CurrentTab();
     if (!tab) {
         return;
@@ -229,6 +237,14 @@ bool IsRectangularSelection(MainWindow* win) {
     return len(dm->textSelection->result) == 0;
 }
 
+// Select All's selectionRect starts here; a rectangle drawn on screen can't.
+constexpr int kSelectAllOrigin = INT_MIN / 2;
+
+// A rectangle the user drew (Ctrl+drag), not Select All's page-sized ones.
+bool IsDrawnRectSelection(MainWindow* win) {
+    return IsRectangularSelection(win) && win->selectionRect.x != kSelectAllOrigin;
+}
+
 static Rect SelectionBounds(DisplayModel* dm, Vec<SelectionOnPage>* selections) {
     Rect bounds;
     for (SelectionOnPage& sel : *selections) {
@@ -265,24 +281,14 @@ bool GetSelectionScreenRect(WindowTab* tab, Rect& out) {
     }
     MainWindow* win = tab->win;
     DisplayModel* dm = win->AsFixed();
-#if defined(SUMATRA_NG)
     if (!dm || !win->showSelection) {
-#else
-    if (!dm || !win->hwndCanvas || !win->showSelection) {
-#endif
         return false;
     }
     Rect bounds = SelectionBounds(dm, tab->selectionOnPage);
     if (bounds.IsEmpty()) {
         return false;
     }
-#if defined(SUMATRA_NG)
-    out = bounds;
-#else
-    Point p = HwndClientToScreen(win->hwndCanvas, bounds.TL());
-    out = Rect(p.x, p.y, bounds.dx, bounds.dy);
-#endif
-    return true;
+    return CanvasClientToScreen(win, bounds, out);
 }
 
 TempStr FormatSelectionPositionTemp(WindowTab* tab) {
@@ -312,24 +318,14 @@ static void RepaintSelection(MainWindow* win) {
 }
 
 static void StartSelectionCapture(MainWindow* win) {
-#if defined(SUMATRA_NG)
     CanvasSetCapture(win, true);
-#else
-    SetCapture(win->hwndCanvas);
-    SetTimer(win->hwndCanvas, kSelectSmoothScrollTimerID, kSelectSmoothScrollDelayInMs, nullptr);
-#endif
+    CanvasStartTimer(win, kSelectSmoothScrollTimerID, kSelectSmoothScrollDelayInMs);
     RepaintSelection(win);
 }
 
 static void StopSelectionCapture(MainWindow* win) {
-#if defined(SUMATRA_NG)
     CanvasSetCapture(win, false);
-#else
-    if (GetCapture() == win->hwndCanvas) {
-        ReleaseCapture();
-    }
-    KillTimer(win->hwndCanvas, kSelectSmoothScrollTimerID);
-#endif
+    CanvasKillTimer(win, kSelectSmoothScrollTimerID);
 }
 
 // Apply edge/corner/move drag to an original normalized rect (screen coords).
@@ -996,10 +992,8 @@ void OnSelectAll(MainWindow* win, bool textOnly) {
         return;
     }
 
-    if (win->AsChm()) {
-        win->AsChm()->SelectAll();
-    } else if (win->AsMarkdown()) {
-        win->AsMarkdown()->SelectAll();
+    if (win->AsBrowser()) {
+        win->AsBrowser()->SelectAll();
         return;
     }
     if (!win->AsFixed()) {
@@ -1021,7 +1015,7 @@ void OnSelectAll(MainWindow* win, bool textOnly) {
         UpdateTextSelection(win);
     } else {
         DeleteOldSelectionInfo(win, true);
-        win->selectionRect = Rect::FromXY(INT_MIN / 2, INT_MIN / 2, INT_MAX, INT_MAX);
+        win->selectionRect = Rect::FromXY(kSelectAllOrigin, kSelectAllOrigin, INT_MAX, INT_MAX);
         win->CurrentTab()->selectionOnPage = SelectionOnPage::FromRectangle(dm, win->selectionRect);
     }
 

@@ -8,6 +8,7 @@
 #include "base/Win.h"
 #endif
 
+#include "AIChatTypes.h"
 #include "AIChatCommon.h"
 
 #if OS_POSIX && !OS_WASM
@@ -116,15 +117,6 @@ int AIChatReadPipeChunk(void* hReadPipe, char* buf, int size) {
 
 void AIChatCloseReadPipe(void* hReadPipe) {
     CloseHandle((HANDLE)hReadPipe);
-}
-
-void AIChatReadPipeToEnd(void* hReadPipe, str::Builder& out) {
-    char buf[4096];
-    int n;
-    while ((n = AIChatReadPipeChunk(hReadPipe, buf, sizeof(buf))) > 0) {
-        out.Append(Str(buf, n));
-    }
-    AIChatCloseReadPipe(hReadPipe);
 }
 
 bool AIChatWaitForProcess(void* hProcess, int timeoutMs) {
@@ -338,15 +330,6 @@ void AIChatCloseReadPipe(void* hReadPipe) {
     close(fd);
 }
 
-void AIChatReadPipeToEnd(void* hReadPipe, str::Builder& out) {
-    char buf[4096];
-    int n;
-    while ((n = AIChatReadPipeChunk(hReadPipe, buf, sizeof(buf))) > 0) {
-        out.Append(Str(buf, n));
-    }
-    AIChatCloseReadPipe(hReadPipe);
-}
-
 bool AIChatWaitForProcess(void* hProcess, int timeoutMs) {
     auto* process = (AIChatPosixProcess*)hProcess;
     if (!process || process->exited) {
@@ -424,8 +407,6 @@ bool AIChatLaunchProcessWithStdoutPipe(Str, Str, AIChatProcessLaunchResult* out)
     return false;
 }
 
-void AIChatReadPipeToEnd(void*, str::Builder&) {}
-
 int AIChatReadPipeChunk(void*, char*, int) {
     return -1;
 }
@@ -443,6 +424,15 @@ bool AIChatRunCapture(Str, int, str::Builder&) {
 }
 
 #endif
+
+void AIChatReadPipeToEnd(void* hReadPipe, str::Builder& out) {
+    char buf[4096];
+    int n;
+    while ((n = AIChatReadPipeChunk(hReadPipe, buf, sizeof(buf))) > 0) {
+        out.Append(Str(buf, n));
+    }
+    AIChatCloseReadPipe(hReadPipe);
+}
 
 TempStr AIChatFormatSessionIdTemp(const u8* bytes) {
     u8 b[16];

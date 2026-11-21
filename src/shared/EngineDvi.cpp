@@ -493,17 +493,6 @@ static TempStr EnsureDviPdf(Str src) {
     return pdfPath;
 }
 
-static i64 FileAgeSec(FILETIME ft) {
-    FILETIME nowFt{};
-    GetSystemTimeAsFileTime(&nowFt);
-    u64 now = FileTimeToU64(nowFt);
-    u64 then = FileTimeToU64(ft);
-    if (then == 0 || then > now) {
-        return 0;
-    }
-    return (i64)((now - then) / kFileTimeTicksPerSec);
-}
-
 static void DeleteAged(Str path, i64 ageSec, i64 maxAgeSec) {
     if (ageSec < maxAgeSec) {
         return;
@@ -558,43 +547,14 @@ void DeleteStaleDviCache() {
     }
 }
 
-class EngineDvi : public EnginePdfProxy {
+class EngineDvi : public EngineCachedPdf {
   public:
     EngineDvi() {
         kind = kindEngineDvi;
         defaultExt = str::Dup(StrL(".dvi"));
     }
 
-    ~EngineDvi() override { str::Free(cachedPdf); }
-
-    EngineBase* Clone() override {
-        if (len(cachedPdf) == 0 || !file::Exists(cachedPdf)) {
-            return nullptr;
-        }
-        EngineBase* inner = CreateEngineMupdfFromFile(cachedPdf, FileType::PDF, DpiGet(), nullptr);
-        if (!inner) {
-            return nullptr;
-        }
-        EngineDvi* clone = new EngineDvi();
-        if (FilePath()) {
-            clone->SetFilePath(FilePath());
-        }
-        clone->pdfEngine = inner;
-        clone->cachedPdf = str::Dup(cachedPdf);
-        clone->CopyStateFromPdfEngine();
-        return clone;
-    }
-
-    // saving as .pdf writes the cached conversion; anything else copies the DVI
-    bool SaveFileAs(Str dstPath) override {
-        if (str::EndsWithI(dstPath, StrL(".pdf")) && len(cachedPdf) > 0) {
-            return file::Copy(dstPath, cachedPdf, false);
-        }
-        Str srcPath = FilePath();
-        return len(srcPath) > 0 && file::Copy(dstPath, srcPath, false);
-    }
-
-    Str cachedPdf;
+    EngineCachedPdf* NewEmpty() override { return new EngineDvi(); }
 
     bool Load(Str fileName) {
         pageCount = 0;
@@ -606,13 +566,7 @@ class EngineDvi : public EnginePdfProxy {
         if (len(pdf) == 0) {
             return false;
         }
-        cachedPdf = str::Dup(pdf);
-        pdfEngine = CreateEngineMupdfFromFile(cachedPdf, FileType::PDF, DpiGet(), nullptr);
-        if (!pdfEngine) {
-            return false;
-        }
-        CopyStateFromPdfEngine();
-        return true;
+        return OpenCachedPdf(pdf);
     }
 };
 

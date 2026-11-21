@@ -205,6 +205,8 @@ enum
 	PRO_WIDOWS,
 	PRO_WIDTH,
 	PRO_WORD_SPACING,
+	PRO_TRANSFORM, /* SumatraPDF: not in css-properties.gperf, see fz_new_css_property */
+	PRO_TRANSFORM_ORIGIN,
 
 	/* Number of real properties. */
 	NUM_PROPERTIES,
@@ -314,6 +316,8 @@ struct fz_css_style_s
 	const char *background_image;
 	fz_css_number background_size[2];
 	fz_css_number background_position[2];
+	float transform[6]; /* SumatraPDF: CSS transform as an fz_matrix (a b c d e f) */
+	fz_css_number transform_origin[2];
 
 	unsigned int rowspan : 10; /* Needs to be able to represent 1-1000 */
 	unsigned int colspan : 10; /* Needs to be able to represent 1-1000 */
@@ -337,6 +341,7 @@ struct fz_css_style_s
 	unsigned int hyphens : 2;
 	unsigned int background_size_mode : 2;
 	unsigned int background_repeat : 2;
+	unsigned int has_transform : 1;
 };
 
 struct fz_css_style_splay_s {
@@ -503,6 +508,9 @@ struct fz_html_box_s
 
 	// to indicate when an inline formatting context has been finished (when interrupted by a block level block)
 	unsigned int stop : 1;
+
+	// inside <a epub:type="noteref">: a link to a footnote
+	unsigned int is_noteref : 1;
 
 	fz_html_box *up, *down, *next;
 

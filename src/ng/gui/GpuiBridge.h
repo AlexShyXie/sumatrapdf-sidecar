@@ -7,7 +7,7 @@
 //   - NOMINMAX before the first <windows.h> (winsock2.h pulls it in, and
 //     gpui.h's own min/max-free code is parsed after that)
 //   - winsock2.h before <windows.h>, which our Base.h also requires
-//   - StrL / dimof are undefined after gpui.h so Base.h can define ours
+//   - StrL / dimof / dimofi are undefined after gpui.h so Base.h can define ours
 // After this header, `Str` / `Vec` / `Rect` / `Point` / `Size` are ours and
 // gpui's are `gp::Str` &c. Never `using namespace gpui` in such a file.
 
@@ -20,6 +20,7 @@
 
 #undef StrL
 #undef dimof
+#undef dimofi
 
 #include "base/Base.h"
 
@@ -92,8 +93,27 @@ inline Rect FromGpui(gp::Bounds b) {
     return Rect{(int)b.x, (int)b.y, (int)b.w, (int)b.h};
 }
 
+// screen rectangles: device pixels on Windows and X11, points on macOS
+inline gp::ScreenBounds ToGpuiScreen(Rect r) {
+    return gp::ScreenBounds{r.x, r.y, r.dx, r.dy};
+}
+
+inline Rect FromGpui(gp::ScreenBounds b) {
+    return Rect{b.x, b.y, b.w, b.h};
+}
+
 // ng: gpui's Listen() needs the listener's owner entity type, so it can't be
 // wrapped generically. This is the one shape the shell repeats: a handler on
 // the root view entity.
+// Blur a text field in the window it is focused in. A dialog's field lives in
+// its tool window: blurred against the main window, the tool window kept
+// pointing at it after it was freed, and closing that window read it.
+inline void InputBlurWhereFocused(gp::InputState* s, gp::Window* fallback) {
+    gp::Window* w = s && s->focusWin ? s->focusWin : fallback;
+    if (w) {
+        gp::InputBlur(s, w->app, w);
+    }
+}
+
 #define GpuiListen(cx, fn) gp::Listen(cx, fn)
 #define GpuiListenArg(cx, fn, arg) gp::Listen(cx, fn, arg)

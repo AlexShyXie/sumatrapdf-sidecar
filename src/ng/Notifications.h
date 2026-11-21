@@ -65,8 +65,8 @@ struct NotificationWnd {
     int xMargin = kNotifDefaultMargin;
     int yMargin = kNotifDefaultMargin;
     NotificationClosed onClosed;
-    // ms left before the timeout closes it; the shell's tick counts it down
-    int timeLeftMs = 0;
+    // the timeout that closes it; the shell's tick counts it down
+    Countdown timeLeft;
     // 0..100, or -1 when the notification has no progress bar
     int progressPerc = -1;
     // ng: identity for the shell's listeners, which can only carry an integer
@@ -111,7 +111,6 @@ bool UpdateNotificationProgress(NotificationWnd* wnd, Str msg, int perc);
 TempStr NotificationGetMessageTemp(NotificationWnd* wnd);
 void RemoveNotification(NotificationWnd*);
 void CloseNotification(NotificationWnd*, NotifCloseReason reason = NotifCloseReason::Program);
-bool AreNotificationsEnabled();
 void SetNotificationsEnabled(bool);
 bool RemoveNotificationsForGroup(MainWindow*, Kind);
 void RemoveNotificationsForWindow(MainWindow*);
@@ -122,6 +121,7 @@ NotificationWnd* GetNotificationByKey(u32 key);
 // calls it with the ms since the last one
 void ExpireNotifications(MainWindow* win, int elapsedMs);
 void InstallLayoutNotifHooks();
+void InstallFontDownloadNotifHook();
 
 void MaybeDelayedWarningNotification(Str msg);
 void ShowMaybeDelayedNotifications(MainWindow* win);

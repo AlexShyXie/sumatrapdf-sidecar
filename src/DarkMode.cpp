@@ -33,10 +33,9 @@
 #include "DarkModeSubclass.h" // IWYU pragma: keep
 #include "DarkMode.h"
 
-// darkmodelib only supports the architectures we still ship it for; older
-// 32-bit builds run without it
-#if !defined(_DARKMODELIB_NOT_USED) && \
-    (defined(__x86_64__) || defined(_M_X64) || defined(__arm64__) || defined(__arm64) || defined(_M_ARM64))
+// without darkmodelib, dialogs in a dark theme keep light title bars and
+// controls (black checkbox labels on a black background)
+#if !defined(_DARKMODELIB_NOT_USED)
 static bool gUseDarkModeLib = true;
 #else
 static bool gUseDarkModeLib = false;
@@ -44,13 +43,6 @@ static bool gUseDarkModeLib = false;
 
 bool DarkModeIsActive() {
     return gUseDarkModeLib && DarkMode::isEnabled();
-}
-
-Color DarkModeDialogBgColor() {
-    if (DarkModeIsActive()) {
-        return ThemeWindowControlBackgroundColor();
-    }
-    return MkGray(0xee);
 }
 
 void DarkModeInit() {
@@ -192,14 +184,6 @@ void DarkModeApplyToWindowAndEraseBg(HWND hwnd) {
         return;
     }
     DarkMode::setDarkWndSafe(hwnd);
-    DarkMode::setWindowEraseBgSubclass(hwnd);
-}
-
-void DarkModeApplyToNotifyWindowAndEraseBg(HWND hwnd) {
-    if (!gUseDarkModeLib) {
-        return;
-    }
-    DarkMode::setDarkWndNotifySafe(hwnd);
     DarkMode::setWindowEraseBgSubclass(hwnd);
 }
 

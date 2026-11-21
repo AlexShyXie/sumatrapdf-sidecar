@@ -26,6 +26,7 @@
 #include "SumatraConfig.h"
 #include "AppSettings.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "SumatraPDF.h"
 #include "Theme.h"
@@ -54,8 +55,6 @@ enum NavBtn {
     NavBtnHome,
     NavBtnCount
 };
-
-constexpr int kNavHistoryMax = 100;
 
 // Clear: show ".." alone until the listing arrives (new folder).
 // Keep: leave the current listing on screen while it is re-read (F5,
@@ -150,10 +149,6 @@ struct NavFilesInFolderWnd : WindowBase {
 
 static NavFilesInFolderWnd* gNavFilesWnd = nullptr;
 static HWND gHwndToActivateOnNavClose = nullptr;
-// dirs visited ("" for home), kept for the whole session so a re-opened
-// window can still go Back to where the previous one was
-static StrVec gNavHistory;
-static int gNavHistIdx = -1;
 
 NavFilesInFolderWnd::~NavFilesInFolderWnd() {
     scanGen++; // in-flight scans must not apply to a destroyed window
@@ -205,8 +200,6 @@ static void ScheduleFocusNavListBox() {
     auto fn = MkFunc0Void(FocusNavListBox);
     uitask::Post(fn, "FocusNavListBox");
 }
-
-Str NavEntryBaseName(const NavFileEntry& e);
 
 // rebuild the shown entries: all of them without a filter, else those whose
 // name has every filter word (the command palette's matching), without ".."
@@ -405,15 +398,6 @@ static TempStr NavEntryPathTemp(NavFilesInFolderWnd* wnd, NavFileEntry& e) {
     return path::JoinTemp(wnd->currDir, name);
 }
 
-// entry display name without a trailing path separator (dirs use "name\\")
-Str NavEntryBaseName(const NavFileEntry& e) {
-    Str name = e.name;
-    if (e.isDir && name.len > 0 && path::IsSep(name.s[name.len - 1])) {
-        return Str(name.s, name.len - 1);
-    }
-    return name;
-}
-
 // index of selectPath in the listing, or 0 if not found / empty
 static int FindEntryIndex(NavFilesInFolderWnd* wnd, ListBoxModelNav* m, Str selectPath) {
     if (!m || len(selectPath) == 0) {
@@ -574,19 +558,9 @@ void NavFilesInFolderWnd::OnListChar(VirtCharEvent* ev) {
     ev->didHandle = true;
 }
 
-// show dir and record it in the session history, dropping the forward entries
+// show dir and record it in the session history
 void NavFilesInFolderWnd::Navigate(Str dir, Str selectPath) {
-    bool same = gNavHistIdx >= 0 && str::EqI(gNavHistory[gNavHistIdx], dir);
-    if (!same) {
-        while (len(gNavHistory) > gNavHistIdx + 1) {
-            gNavHistory.RemoveAt(len(gNavHistory) - 1);
-        }
-        if (len(gNavHistory) >= kNavHistoryMax) {
-            gNavHistory.RemoveAt(0);
-        }
-        gNavHistory.Append(dir);
-        gNavHistIdx = len(gNavHistory) - 1;
-    }
+    NavHistoryPush(dir);
     SetDir(dir, selectPath);
 }
 
@@ -660,7 +634,7 @@ void NavFilesInFolderWnd::RefreshList() {
     TempStr sel = SelectedPathTemp();
     int selIdx = -1;
     // listing still in flight: keep the file we meant to select
-    if (len(sel) == 0 && len(pendingSelectPath) > 0) {
+    if (len(sel) == 0 && scanInFlight && len(pendingSelectPath) > 0) {
         sel = str::DupTemp(pendingSelectPath);
     } else if (len(sel) == 0 && scanInFlight) {
         selIdx = pendingSelectIdx;
@@ -1291,7 +1265,7 @@ bool NavFilesInFolderWnd::Create(MainWindow* mainWin, Str filePath) {
     }
     LayoutAndSizeToContent(layout, dx, dy, hwnd);
     // pick up the virtual controls so we paint them and they get their input
-    DoLayout(HwndClientRect(hwnd).Size());
+    DoLayout();
     PositionNavFilesWnd(hwnd, mainWin->hwndFrame, docked, placeLeft);
 
     if (selIdx >= 0) {
@@ -1388,6 +1362,15 @@ TempStr NavFilesInFolderStateTemp(Str action, int idx, int* exitCodeOut) {
             *exitCodeOut = 0;
         }
         return fmt("OK %d %d %d %d", r.x, r.y, r.dx, r.dy);
+    } else if (str::Eq(action, StrL("list-screen-rect"))) {
+        // where a test must touch to pan the list (screen coords)
+        Rect r = wnd->listBox->VisibleRectInWindow();
+        POINT pt{r.x, r.y};
+        ClientToScreen(wnd->hwnd, &pt);
+        if (exitCodeOut) {
+            *exitCodeOut = 0;
+        }
+        return fmt("OK %d %d %d %d", (int)pt.x, (int)pt.y, r.dx, r.dy);
     } else if (str::Eq(action, StrL("edit-path")) || str::TrimPrefix(action, StrL("path-"))) {
         // path editing: edit-path, path-text:<text>, path-commit, path-cancel,
         // path-state (report only)
@@ -1427,6 +1410,6 @@ TempStr NavFilesInFolderStateTemp(Str action, int idx, int* exitCodeOut) {
     }
     int canBack = wnd->navBtns[NavBtnBack]->IsEnabled();
     int canFwd = wnd->navBtns[NavBtnForward]->IsEnabled();
-    return fmt("OK scan=%d sel=%d items=%d back=%d fwd=%d dir=\"%s\" name=\"%s\"", (int)wnd->scanInFlight, sel,
-               m->ItemsCount(), canBack, canFwd, wnd->currDir, name);
+    return fmt("OK scan=%d sel=%d items=%d back=%d fwd=%d dir=\"%s\" name=\"%s\" scrollY=%d", (int)wnd->scanInFlight,
+               sel, m->ItemsCount(), canBack, canFwd, wnd->currDir, name, wnd->listBox->scrollY);
 }

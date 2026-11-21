@@ -21,9 +21,7 @@ export enum ControlCommand {
   TestInverseSearch = 22,
   TestImageResizeArrowKey = 23,
   TestFindResultPageColumnClip = 24,
-  TestFileKind = 25,
   TestScrollToLink = 26,
-  TestI18nErrorString = 27,
   TestPageInfoOverlay = 28,
   TestGetToc = 29,
   TestPageLinks = 30,
@@ -72,7 +70,6 @@ export enum ControlCommand {
   TestSelectionToolbar = 73,
   TestMarkupAnnots = 74,
   TestCmykImageSave = 75,
-  TestContextMenuPoint = 76,
   TestFindWindowContents = 77,
   TestFindUiState = 78,
   TestRenderViewPrint = 79,
@@ -97,7 +94,6 @@ export enum ControlCommand {
   TestReadingBar = 98,
   TestSeedTextSelection = 99,
   TestTtsEngineCrash = 100,
-  StartPerfLog = 101,
   StopPerfLog = 102,
   WaitSessionRestored = 103,
   TestNavFiles = 104,
@@ -131,6 +127,67 @@ export enum ControlCommand {
   TestRenameFile = 131,
   // holds background chapter layout (1) or lets it run (0)
   TestChapterLayoutHold = 133,
+  // the path the next Save As takes, without its dialog
+  TestSaveFileName = 134,
+  // places the signature being placed at a canvas point (pixels), as a click does
+  TestPlaceSignature = 135,
+  // orig: Run PDF Script's drawn buttons: examples, pick <idx>, add, remove, run
+  TestPdfScript = 136,
+  // orig: visible virtual controls, or the control under a client point
+  TestVirtTree = 137,
+  // orig: [brightness, contrast] applies them to the current file as the
+  // Brightness / Contrast dialog's OK does; returns the current values
+  TestPageAdjust = 138,
+  // orig: urls the current markdown document's browser view was served
+  TestMarkdownServed = 139,
+  TestTemporaryFile = 140,
+  // orig: [x, y] frame client point the auto-hide sidebar takes as the cursor; x < 0 clears
+  TestSidebarCursor = 141,
+  // [destPath, pageSizeIdx, fontSize]: Convert EPUB to PDF without its dialog
+  TestConvertEpubToPdf = 142,
+  // [path, pageNo]: image element rects of a page
+  TestPageImages = 143,
+  // the first window's page and scroll position
+  TestScrollState = 144,
+  TestDrawRectSelection = 145,
+  TestEutlUpdate = 146,
+  TestFetchRevocation = 147,
+  TestSignatureStatus = 148,
+  TestTabWidths = 149,
+  TestOpenFromUrl = 150,
+  TestMigrateTab = 151,
+  TestLayers = 152,
+  TestSelectWordEdges = 153,
+  TestWordCount = 154,
+  TestPageInfoText = 155,
+  TestPageInfoBar = 156,
+  TestSelectedText = 157,
+  TestTocRows = 158,
+  TestMeasurement = 159,
+  TestImageReplace = 160,
+  // ng only: performance snapshot (cmd/port-perf.ts)
+  TestPerfStats = 161,
+  // ng only: the state of the canvas overlays
+  TestOverlayState = 162,
+  // [timeoutMs]: blocks until the home page painted after startup
+  WaitHomePainted = 163,
+  // [idx]: select tab idx; idx < 0 only reports the current tab and count
+  TestSelectTab = 164,
+  // [definition]: does "CmdToggleX on" parse, and the command's on/off state
+  TestToggleCmd = 165,
+  // page 1 pixels a Clone() of the current document renders differently
+  TestCloneRender = 166,
+  // does the document have load errors, does the Errors notification show
+  TestDocErrors = 167,
+  // [pageNo, idx, value]: pick value in the idx-th combo / list box
+  TestSetFormChoice = 168,
+  // [action, a, b, c]: "drop" from to groupPos, "move" dir, "select" idx, or
+  // "" for the state; answers with the strip groups and tabs
+  TestStripGroups = 169,
+  // ng only (macOS): [path, mode]: a PNG of the first window as drawn
+  TestCaptureWindow = 170,
+  // [ms]: every document open waits this long first, like a sleeping drive
+  TestLoadDelay = 171,
 }
 
 export type ControlArg = number | string | Uint8Array | ControlArg[];
@@ -152,6 +209,14 @@ export type HomeSelection = {
   // "<isPromo>,<index>" of the tip shown, and its band
   tip: string;
   tipRect: number[];
+  // a vertical scrollbar is shown for the entries
+  vbar: boolean;
+  // header row: brand (empty when hidden), Open icon + text, view-mode icons;
+  // and the tip's wrap rect
+  logo: number[];
+  open: number[];
+  views: number[];
+  tipText: number[];
   raw: string;
 };
 
@@ -167,6 +232,39 @@ export type ChapterInfo = {
 };
 
 export type LayoutRect = { x: number; y: number; dx: number; dy: number };
+
+export type VirtCtrlInfo = {
+  className: string;
+  hwnd: number;
+  kind: string;
+  // "-" when the control has no name
+  name: string;
+  rect: LayoutRect;
+  text: string;
+};
+
+const virtLineRe =
+  /^virt class=(\S+) hwnd=(-?\d+) kind=(\S+) name=(\S+) rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+) text=(.*)$/;
+
+function parseVirtLine(line: string): VirtCtrlInfo {
+  const m = virtLineRe.exec(line);
+  if (!m) {
+    throw new Error(`TestVirtTree: could not parse '${line}'`);
+  }
+  return {
+    className: m[1],
+    hwnd: parseInt(m[2], 10),
+    kind: m[3],
+    name: m[4],
+    rect: {
+      x: parseInt(m[5], 10),
+      y: parseInt(m[6], 10),
+      dx: parseInt(m[7], 10),
+      dy: parseInt(m[8], 10),
+    },
+    text: m[9],
+  };
+}
 
 export type LayoutItem = {
   visible: boolean;
@@ -408,8 +506,18 @@ function cleanEnv(env: Record<string, string | undefined> | undefined): Record<s
   if (!env) {
     return undefined;
   }
+  // Windows env names are case-insensitive: { ...process.env, PATH } keeps the
+  // original "Path" too, and the child may read the stale one. Last key wins.
+  const isWin = process.platform === "win32";
   const res: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
+    if (isWin) {
+      for (const k of Object.keys(res)) {
+        if (k.toLowerCase() === key.toLowerCase()) {
+          delete res[k];
+        }
+      }
+    }
     if (value !== undefined) {
       res[key] = value;
     }
@@ -524,6 +632,31 @@ export class ControlClient {
     return info;
   }
 
+  async waitForHomePainted(timeoutMs = 15000): Promise<string> {
+    const res = await this.request(ControlCommand.WaitHomePainted, [timeoutMs * SLOW_BUILD_FACTOR]);
+    const code = typeof res[0] === "number" ? res[0] : -1;
+    const info = String(res[1] ?? "");
+    if (code !== 0) {
+      throw new Error(`WaitHomePainted failed: ${info || code}`);
+    }
+    return info;
+  }
+
+  // Selects tab idx (none when idx < 0) and reports the selected tab and count.
+  async selectTab(idx = -1): Promise<{ idx: number; count: number }> {
+    const res = await this.request(ControlCommand.TestSelectTab, [idx]);
+    const code = typeof res[0] === "number" ? res[0] : -1;
+    const info = String(res[1] ?? "");
+    if (code !== 0) {
+      throw new Error(`TestSelectTab failed: ${info || code}`);
+    }
+    const m = /idx=(-?\d+) count=(\d+)/.exec(info);
+    if (!m) {
+      throw new Error(`TestSelectTab: unexpected result '${info}'`);
+    }
+    return { idx: parseInt(m[1]!, 10), count: parseInt(m[2]!, 10) };
+  }
+
   async waitForSessionRestored(timeoutMs = 15000): Promise<string> {
     const res = await this.request(ControlCommand.WaitSessionRestored, [timeoutMs * SLOW_BUILD_FACTOR]);
     const code = typeof res[0] === "number" ? res[0] : -1;
@@ -569,11 +702,16 @@ export class ControlClient {
         lastCaption: [0, 0, 0, 0],
         tip: "",
         tipRect: [0, 0, 0, 0],
+        vbar: false,
+        logo: [0, 0, 0, 0],
+        open: [0, 0, 0, 0],
+        views: [0, 0, 0, 0],
+        tipText: [0, 0, 0, 0],
         raw,
       };
     }
     const m =
-      /OK sel=(-?\d+) entries=(\d+) searchFocus=(\d) searchBox=(\d) search=(-?\d+),(-?\d+),(-?\d+),(-?\d+) outline=(-?\d+),(-?\d+),(-?\d+),(-?\d+) outlineFull=(-?\d+),(-?\d+),(-?\d+),(-?\d+) path=(.*) listView=(\d) listIcon=(-?\d+),(-?\d+),(-?\d+),(-?\d+) thumbsArea=(-?\d+),(-?\d+),(-?\d+),(-?\d+) lastCaption=(-?\d+),(-?\d+),(-?\d+),(-?\d+) tip=(\d,-?\d+) tipRect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)$/.exec(
+      /OK sel=(-?\d+) entries=(\d+) searchFocus=(\d) searchBox=(\d) search=(-?\d+),(-?\d+),(-?\d+),(-?\d+) outline=(-?\d+),(-?\d+),(-?\d+),(-?\d+) outlineFull=(-?\d+),(-?\d+),(-?\d+),(-?\d+) path=(.*) listView=(\d) listIcon=(-?\d+),(-?\d+),(-?\d+),(-?\d+) thumbsArea=(-?\d+),(-?\d+),(-?\d+),(-?\d+) lastCaption=(-?\d+),(-?\d+),(-?\d+),(-?\d+) tip=(\d,-?\d+) tipRect=(-?\d+),(-?\d+),(-?\d+),(-?\d+) vbar=(\d) logo=(-?\d+),(-?\d+),(-?\d+),(-?\d+) open=(-?\d+),(-?\d+),(-?\d+),(-?\d+) views=(-?\d+),(-?\d+),(-?\d+),(-?\d+) tipText=(-?\d+),(-?\d+),(-?\d+),(-?\d+)$/.exec(
         raw,
       );
     if (!m) {
@@ -595,6 +733,11 @@ export class ControlClient {
       lastCaption: [parseInt(m[27], 10), parseInt(m[28], 10), parseInt(m[29], 10), parseInt(m[30], 10)],
       tip: m[31],
       tipRect: [parseInt(m[32], 10), parseInt(m[33], 10), parseInt(m[34], 10), parseInt(m[35], 10)],
+      vbar: m[36] === "1",
+      logo: m.slice(37, 41).map((v) => parseInt(v, 10)),
+      open: m.slice(41, 45).map((v) => parseInt(v, 10)),
+      views: m.slice(45, 49).map((v) => parseInt(v, 10)),
+      tipText: m.slice(49, 53).map((v) => parseInt(v, 10)),
       raw,
     };
   }
@@ -640,6 +783,24 @@ export class ControlClient {
       nodes,
       raw,
     };
+  }
+
+  // Visible virtual controls. className limits the dump to one window class.
+  async virtTree(className = ""): Promise<VirtCtrlInfo[]> {
+    const res = await this.request(ControlCommand.TestVirtTree, className ? [className] : []);
+    const code = typeof res[0] === "number" ? res[0] : -1;
+    const raw = String(res[1] ?? "");
+    if (code !== 0) {
+      throw new Error(`TestVirtTree failed: ${raw.trim() || code}`);
+    }
+    const rows: VirtCtrlInfo[] = [];
+    for (const line of raw.split("\n")) {
+      if (!line || line === "NONE") {
+        continue;
+      }
+      rows.push(parseVirtLine(line));
+    }
+    return rows;
   }
 
   // Notifications are drawn over the document and linger for ~2s, so a test

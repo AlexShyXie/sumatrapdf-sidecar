@@ -6,7 +6,6 @@
 #include "base/DbgHelpDyn.h"
 #include "base/File.h"
 #include "base/Win.h"
-#include "base/Crypto.h"
 #include "base/Launch.h"
 
 #include "gui/UIModels.h"
@@ -165,15 +164,6 @@ TempStr GetAppDataDirTemp() {
     logf("GetAppDataDirTemp(): '%s'%s\n", dir, Str(isPortable ? " (portable)" : "(installed)"));
     SetAppDataDir(dir);
     return gAppDataDir;
-}
-
-// Generate full path for a file or directory for storing data
-TempStr GetPathInAppDataDirTemp(Str name) {
-    if (len(name) == 0) {
-        return {};
-    }
-    TempStr dir = GetAppDataDirTemp();
-    return path::JoinTemp(dir, name);
 }
 
 // List of rules used to detect TeX editors.
@@ -456,45 +446,18 @@ Rect GetDefaultWindowPos() {
     return r;
 }
 
-void SaveCallstackLogs() {
-    Str s = dbghelp::GetCallstacks();
-    if (len(s) == 0) {
-        return;
+// build id of the running exe (see GetPeBuildIdTemp), cached; empty on error
+Str BuildIdOfAppExe() {
+    static Str id;
+    if (id) {
+        return id;
     }
-    TempStr filePath = GetPathInAppDataDirTemp(StrL("callstacks.txt"));
-    file::WriteFile(filePath, s);
-    str::Free(s);
-}
-
-// cache because calculating sha1 of the whole executable
-// might be relatively expensive
-// sha1 is 20 bytes => 40 hex chars + null terminator
-static char gAppSha1[41]{};
-
-// return hex version of sha1 of app's executable (pointer to cached value)
-// nullptr if there was an error
-Str Sha1OfAppExe() {
-    if (gAppSha1[0]) {
-        return Str(gAppSha1);
-    }
-
-    TempStr appPath = GetSelfExePathTemp();
-    if (len(appPath) == 0) {
+    TempStr res = GetPeBuildIdTemp(GetSelfExePathTemp());
+    if (len(res) == 0) {
         return {};
     }
-    Str d = file::ReadFile(appPath);
-    if (len(d) == 0) {
-        return {};
-    }
-
-    u8 sha1[20]{};
-    CalcSHA1Digest(d, sha1);
-    str::Free(d);
-
-    for (size_t i = 0; i < 20; i++) {
-        sprintf_s(&gAppSha1[2 * i], 3, "%02x", sha1[i]);
-    }
-    return Str(gAppSha1);
+    id = str::Dup(res);
+    return id;
 }
 
 TempStr GetWebViewDataDirTemp() {
@@ -504,15 +467,24 @@ TempStr GetWebViewDataDirTemp() {
     }
     dir = path::JoinTemp(dir, StrL("SumatraPDF-data"));
     char id[7] = "000000";
-    Str sha1 = Sha1OfAppExe();
-    if (sha1) {
-        str::BufSet(Str(id, dimof(id)), sha1);
+    Str buildId = BuildIdOfAppExe();
+    if (buildId) {
+        str::BufSet(Str(id, dimof(id)), buildId);
     }
     dir = path::JoinTemp(dir, Str(id));
     return path::JoinTemp(dir, fmt("webview-%d", (int)GetCurrentProcessId()));
 }
 
 #endif // OS_WIN
+
+// Generate full path for a file or directory for storing data
+TempStr GetPathInAppDataDirTemp(Str name) {
+    if (len(name) == 0) {
+        return {};
+    }
+    TempStr dir = GetAppDataDirTemp();
+    return path::JoinTemp(dir, name);
+}
 
 // Portable helpers shared with AppTools_posix.cpp.
 
@@ -619,3 +591,11 @@ int CurrentProcessId() {
 }
 
 #endif // OS_WIN
+
+TempStr PathForDisplayTemp(Str path) {
+#if OS_WASM
+    return path::GetBaseNameTemp(path);
+#else
+    return str::DupTemp(path);
+#endif
+}

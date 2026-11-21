@@ -146,32 +146,54 @@ static bool ParseJsQuotedString(const char*& p, const char* end, str::Builder& b
     return true;
 }
 
-static bool SkipJsNested(const char*& p, const char* end, char open, char close) {
-    if (p >= end || *p != open) {
-        return false;
-    }
-    int depth = 1;
-    p++;
-    while (p < end && depth > 0) {
+// Menu entries up to `close`: a string is an item at `level`; an array is a
+// submenu, its first string the title and the rest its items (issue #3940):
+// popUpMenu('A', ['Sub', 'B', 'C']) => A(0) Sub(0) B(1) C(1)
+static void ParseJsMenuEntries(const char*& p, const char* end, char close, int level, StrVec& items,
+                               Vec<int>& levels) {
+    while (p < end) {
+        SkipJsWs(p, end);
+        if (p >= end) {
+            return;
+        }
+        if (*p == close) {
+            p++;
+            return;
+        }
         if (*p == '"' || *p == '\'') {
-            str::Builder ignored;
-            if (!ParseJsQuotedString(p, end, ignored)) {
-                return false;
+            str::Builder item;
+            if (!ParseJsQuotedString(p, end, item)) {
+                p = end;
+                return;
             }
+            items.Append(ToStr(item));
+            VecAppend(levels, level);
             continue;
         }
-        if (*p == open) {
-            depth++;
-        } else if (*p == close) {
-            depth--;
+        if (*p != '[') {
+            p++;
+            continue;
         }
         p++;
+        SkipJsWs(p, end);
+        int itemsLevel = level;
+        if (p < end && (*p == '"' || *p == '\'')) {
+            str::Builder title;
+            if (!ParseJsQuotedString(p, end, title)) {
+                p = end;
+                return;
+            }
+            items.Append(ToStr(title));
+            VecAppend(levels, level);
+            itemsLevel = level + 1;
+        }
+        ParseJsMenuEntries(p, end, ']', itemsLevel, items, levels);
     }
-    return depth == 0;
 }
 
-// Collect the quoted arguments of app.popUpMenu(...) / app.popUpMenuEx(...).
-bool ParseJsPopUpMenuItems(Str js, StrVec& items) {
+// Collect the items of app.popUpMenu(...) / app.popUpMenuEx(...) and their
+// submenu depth; levels is left empty when there are no submenus.
+bool ParseJsPopUpMenuItems(Str js, StrVec& items, Vec<int>& levels) {
     const Str menuCall = StrL("popUpMenu");
     int idx = str::IndexOf(js, menuCall);
     if (idx < 0) {
@@ -187,28 +209,397 @@ bool ParseJsPopUpMenuItems(Str js, StrVec& items) {
         return false;
     }
     p++;
+    ParseJsMenuEntries(p, end, ')', 0, items, levels);
+    bool hasSubmenu = false;
+    for (int level : levels) {
+        hasSubmenu |= level > 0;
+    }
+    if (!hasSubmenu) {
+        VecReset(levels);
+    }
+    return len(items) > 0;
+}
+
+// KiCad: ShM([["Reference = U1"], ["Datasheet = <url>", "<url>"], ...]). Each
+// inner array's first string is a menu item, the second what picking it returns.
+bool ParseJsMenuCallItems(Str js, StrVec& items, StrVec& returns) {
+    Str name = ExtractJsCallName(js);
+    if (len(name) == 0) {
+        return false;
+    }
+    const char* p = name.s + len(name);
+    const char* end = js.s + len(js);
+    SkipJsWs(p, end);
+    if (p >= end || *p != '(') {
+        return false;
+    }
+    p++;
+    SkipJsWs(p, end);
+    if (p >= end || *p != '[') {
+        return false;
+    }
+    p++;
+
     while (p < end) {
         SkipJsWs(p, end);
-        if (p >= end || *p == ')') {
+        if (p < end && *p == ',') {
+            p++;
+            continue;
+        }
+        if (p >= end || *p != '[') {
             break;
         }
-        if (*p == '[') {
-            if (!SkipJsNested(p, end, '[', ']')) {
-                break;
+
+        // one [item, return] entry
+        p++;
+        str::Builder item;
+        str::Builder ret;
+        int nStrings = 0;
+        while (p < end && *p != ']') {
+            if (*p != '"' && *p != '\'') {
+                p++;
+                continue;
             }
+            str::Builder ignored;
+            str::Builder& b = nStrings == 0 ? item : (nStrings == 1 ? ret : ignored);
+            if (!ParseJsQuotedString(p, end, b)) {
+                return false;
+            }
+            nStrings++;
+        }
+        if (p >= end) {
+            return false;
+        }
+        p++;
+        if (nStrings == 0) {
             continue;
         }
-        if (*p == '"' || *p == '\'') {
-            str::Builder item;
-            if (!ParseJsQuotedString(p, end, item)) {
-                break;
-            }
-            items.Append(ToStr(item));
+        items.Append(ToStr(item));
+        returns.Append(ToStr(ret));
+    }
+    return len(items) > 0;
+}
+
+// true when js defines function `name` and shows a popUpMenu
+bool JsDefinesMenuFunction(Str js, Str name) {
+    if (len(name) == 0 || str::IndexOf(js, StrL("popUpMenu")) < 0) {
+        return false;
+    }
+    TempStr needle = fmt("function %s", name);
+    const char* end = js.s + len(js);
+    int idx = str::IndexOf(js, needle);
+    while (idx >= 0) {
+        const char* p = js.s + idx + len(needle);
+        if (p >= end || !IsJsIdentChar(*p)) {
+            return true;
+        }
+        int next = str::IndexOf(Str(p, (int)(end - p)), needle);
+        idx = next < 0 ? -1 : (int)(p - js.s) + next;
+    }
+    return false;
+}
+
+// Xpedition: var t = ['Symbol :', 'Property :', 'Push Schematic', ...], the
+// string table its menu builder _b._c() indexes into
+bool ParseXpeditionStrings(Str docJs, StrVec& strings) {
+    if (str::IndexOf(docJs, StrL("popUpMenu")) < 0 || str::IndexOf(docJs, StrL("_c")) < 0) {
+        return false;
+    }
+    int idx = str::IndexOf(docJs, StrL("var t"));
+    if (idx < 0) {
+        return false;
+    }
+    const char* p = docJs.s + idx + 5;
+    const char* end = docJs.s + len(docJs);
+    if (p < end && IsJsIdentChar(*p)) {
+        return false;
+    }
+    SkipJsWs(p, end);
+    if (p >= end || *p != '=') {
+        return false;
+    }
+    p++;
+    SkipJsWs(p, end);
+    if (p >= end || *p != '[') {
+        return false;
+    }
+    p++;
+
+    while (p < end) {
+        SkipJsWs(p, end);
+        if (p < end && *p == ',') {
+            p++;
             continue;
+        }
+        if (p >= end || *p == ']') {
+            break;
+        }
+        str::Builder s;
+        if (!ParseJsQuotedString(p, end, s)) {
+            return false;
+        }
+        strings.Append(ToStr(s));
+    }
+    return p < end && len(strings) > 0;
+}
+
+// One entry of an Xpedition index array: 3, or a pair [6, 7]
+struct XpEntry {
+    int a = -1;
+    int b = -1;
+};
+
+// An argument of _b._c(): an index array, or a scalar ('', '1', 3)
+struct XpArg {
+    bool isArray = false;
+    Str scalar;
+    Vec<XpEntry> entries;
+};
+
+// a JS number, or a quoted one ('7')
+static bool ParseJsInt(const char*& p, const char* end, int& out) {
+    SkipJsWs(p, end);
+    if (p < end && (*p == '"' || *p == '\'')) {
+        str::Builder b;
+        if (!ParseJsQuotedString(p, end, b)) {
+            return false;
+        }
+        Str s = ToStr(b);
+        if (len(s) == 0 || !str::IsDigit(s.s[0])) {
+            return false;
+        }
+        out = ParseInt(s);
+        return true;
+    }
+    if (p >= end || !str::IsDigit(*p)) {
+        return false;
+    }
+    out = 0;
+    while (p < end && str::IsDigit(*p)) {
+        out = out * 10 + (*p - '0');
+        p++;
+    }
+    return true;
+}
+
+// [3, [6, 7], ...]
+static bool ParseXpEntries(const char*& p, const char* end, Vec<XpEntry>& entries) {
+    if (p >= end || *p != '[') {
+        return false;
+    }
+    p++;
+    while (p < end) {
+        SkipJsWs(p, end);
+        if (p < end && *p == ',') {
+            p++;
+            continue;
+        }
+        if (p < end && *p == ']') {
+            p++;
+            return true;
+        }
+        XpEntry e;
+        if (p < end && *p == '[') {
+            // a pair: [key, value]
+            p++;
+            if (!ParseJsInt(p, end, e.a)) {
+                return false;
+            }
+            SkipJsWs(p, end);
+            if (p >= end || *p != ',') {
+                return false;
+            }
+            p++;
+            if (!ParseJsInt(p, end, e.b)) {
+                return false;
+            }
+            SkipJsWs(p, end);
+            if (p >= end || *p != ']') {
+                return false;
+            }
+            p++;
+        } else if (!ParseJsInt(p, end, e.a)) {
+            return false;
+        }
+        VecAppend(entries, e);
+    }
+    return false;
+}
+
+// a literal at p: [..], '..' or a number
+static bool ParseXpLiteral(const char*& p, const char* end, XpArg& arg) {
+    SkipJsWs(p, end);
+    if (p >= end) {
+        return false;
+    }
+    if (*p == '[') {
+        arg.isArray = true;
+        return ParseXpEntries(p, end, arg.entries);
+    }
+    const char* start = p;
+    if (*p == '"' || *p == '\'') {
+        str::Builder ignored;
+        if (!ParseJsQuotedString(p, end, ignored)) {
+            return false;
+        }
+        // the text between the quotes; the string table holds no escapes we need
+        arg.scalar = Str((char*)start + 1, (int)(p - start) - 2);
+        return true;
+    }
+    while (p < end && str::IsDigit(*p)) {
+        p++;
+    }
+    arg.scalar = Str((char*)start, (int)(p - start));
+    return p > start;
+}
+
+// the value of `var <name> = <literal>` in js
+static bool ParseXpVar(Str js, Str name, XpArg& arg) {
+    TempStr needle = fmt("var %s", name);
+    const char* end = js.s + len(js);
+    int idx = str::IndexOf(js, needle);
+    while (idx >= 0) {
+        const char* p = js.s + idx + len(needle);
+        SkipJsWs(p, end);
+        if (p < end && *p == '=') {
+            p++;
+            return ParseXpLiteral(p, end, arg);
+        }
+        int next = str::IndexOf(Str((char*)p, (int)(end - p)), needle);
+        idx = next < 0 ? -1 : (int)(p - js.s) + next;
+    }
+    return false;
+}
+
+// one argument of _b._c(...): a literal, or a variable the link script set
+static bool ParseXpArg(Str js, const char*& p, const char* end, XpArg& arg) {
+    SkipJsWs(p, end);
+    if (p >= end || !IsJsIdentStart(*p)) {
+        return ParseXpLiteral(p, end, arg);
+    }
+    const char* start = p;
+    while (p < end && IsJsIdentChar(*p)) {
+        p++;
+    }
+    return ParseXpVar(js, Str((char*)start, (int)(p - start)), arg);
+}
+
+static void XpAppendItem(PageDestinationJsMenu* menu, Str item, int level, Str ret) {
+    menu->items.Append(item);
+    menu->returns.Append(ret);
+    VecAppend(menu->levels, level);
+}
+
+// What _c() shows for one index array entry: t[a], or "t[a] = t[b]" for a pair
+static TempStr XpEntryText(StrVec& strings, XpEntry e, bool isPair) {
+    int n = len(strings);
+    Str a = e.a >= 0 && e.a < n ? strings[e.a] : Str{};
+    if (!isPair) {
+        return str::DupTemp(a);
+    }
+    Str b = e.b >= 0 && e.b < n ? strings[e.b] : Str{};
+    return fmt("%s = %s", a, b);
+}
+
+// A submenu: the first entry is its title, the others its items. jumps picks
+// _c()'s jj_ form, where a pair is [item, page] going to named dest "[{page}]"
+static void XpAppendSubmenu(PageDestinationJsMenu* menu, StrVec& strings, XpArg& arg, bool jumps) {
+    for (int i = 0; i < len(arg.entries); i++) {
+        XpEntry e = arg.entries[i];
+        bool isPair = e.b >= 0;
+        TempStr text = XpEntryText(strings, e, isPair && !jumps);
+        TempStr ret = jumps && isPair && i > 0 ? fmt("[{%d}]", e.b) : TempStr{};
+        XpAppendItem(menu, text, i == 0 ? 0 : 1, ret);
+    }
+}
+
+// Siemens Xpedition (SCH2PDF): a link runs _b._c(symbol, prop, page, jumps)
+// with index arrays into the document's string table. _c() shows nested menus:
+// symbol [title, item], prop [title, items...], "Push Schematic" going to
+// 0-based page `page` when it isn't '', and jumps [title, [item, dest]...].
+// Named dest returns stay "[{n}]" for the engine to resolve (issue #6517).
+bool ParseXpeditionMenu(Str linkJs, StrVec& strings, PageDestinationJsMenu* menu) {
+    constexpr int kPushSchematicStr = 2;
+    Str name = ExtractJsCallName(linkJs);
+    if (!menu || len(strings) <= kPushSchematicStr || !str::Eq(name, StrL("_c"))) {
+        return false;
+    }
+    const char* p = name.s + len(name);
+    const char* end = linkJs.s + len(linkJs);
+    SkipJsWs(p, end);
+    if (p >= end || *p != '(') {
+        return false;
+    }
+    p++;
+
+    constexpr int kArgs = 4;
+    XpArg args[kArgs];
+    for (int i = 0; i < kArgs; i++) {
+        if (!ParseXpArg(linkJs, p, end, args[i])) {
+            return false;
+        }
+        SkipJsWs(p, end);
+        char want = i == kArgs - 1 ? ')' : ',';
+        if (p >= end || *p != want) {
+            return false;
         }
         p++;
     }
-    return len(items) > 0;
+    XpArg& symbol = args[0];
+    XpArg& prop = args[1];
+    XpArg& page = args[2];
+    XpArg& jumps = args[3];
+    if (!symbol.isArray || !prop.isArray || page.isArray || !jumps.isArray) {
+        return false;
+    }
+
+    // _c() always shows the symbol submenu, from its first two entries
+    if (len(symbol.entries) >= 2) {
+        XpAppendItem(menu, XpEntryText(strings, symbol.entries[0], false), 0, {});
+        XpAppendItem(menu, XpEntryText(strings, symbol.entries[1], false), 1, {});
+    }
+    XpAppendSubmenu(menu, strings, prop, false);
+    if (len(page.scalar) > 0 && str::IsDigit(page.scalar.s[0])) {
+        XpAppendItem(menu, strings[kPushSchematicStr], 0, fmt("#%s", page.scalar));
+    }
+    XpAppendSubmenu(menu, strings, jumps, true);
+    return len(menu->items) > 0;
+}
+
+// What picking item i of a JavaScript menu does: launch a URL, go to a page,
+// or else copy the item's text (issue #3940).
+JsMenuAction GetJsMenuAction(PageDestinationJsMenu* dest, int i) {
+    JsMenuAction res;
+    if (!dest || i < 0 || i >= len(dest->items)) {
+        return res;
+    }
+
+    Str ret = i < len(dest->returns) ? dest->returns[i] : Str{};
+    if (len(ret) > 0) {
+        // KiCad: "#<n>" sets the 0-based this.pageNum; file:///<net> names a net, not a file
+        if (ret.s[0] == '#' && len(ret) > 1 && str::IsDigit(ret.s[1])) {
+            res.pageNo = ParseInt(Str(ret.s + 1, len(ret) - 1)) + 1;
+        } else if (IsExternalUrl(ret) || str::StartsWithI(ret, StrL("ftp://"))) {
+            res.url = ret;
+        } else {
+            res.copyText = dest->items[i];
+        }
+        return res;
+    }
+
+    // Altium: "Datasheet: https://..."
+    Str url = dest->items[i];
+    int colon = str::IndexOf(url, StrL(": "));
+    if (colon >= 0) {
+        url = Str(url.s + colon + 2, url.len - colon - 2);
+        str::TrimWs(url);
+    }
+    if (IsExternalUrl(url) || str::StartsWithI(url, StrL("ftp://"))) {
+        res.url = url;
+        return res;
+    }
+    res.copyText = dest->items[i];
+    return res;
 }
 
 // First identifier that is followed by '(', skipping JS keywords.
@@ -263,10 +654,23 @@ Str PageDestinationJsMenu::GetValue() {
         if (len(b) > 0) {
             b.AppendChar('\n');
         }
+        // submenu items indented under their title
+        for (int lvl = Level(i); lvl > 0; lvl--) {
+            b.Append(StrL("  "));
+        }
         b.Append(it);
     }
     tooltip = b.TakeStr();
     return tooltip;
+}
+
+int PageDestinationJsMenu::Level(int i) {
+    return i >= 0 && i < len(levels) ? levels[i] : 0;
+}
+
+// true when item i is the title of a submenu: the next item is deeper
+bool PageDestinationJsMenu::IsSubmenu(int i) {
+    return i + 1 < len(items) && Level(i + 1) > Level(i);
 }
 
 IPageDestination* NewSimpleDest(Arena* arena, int pageNo, RectF rect, float zoom, Str value) {
@@ -494,8 +898,15 @@ struct ChapterTextCache {
 
 struct PageTextCache {
     Vec<ChapterTextCache*> chapters; // index = chapter - 1; entries lazily created
+    // invalidated text: callers may still hold its pointers, so it lives as long as the engine
+    Vec<PageText> retired;
 
-    ~PageTextCache() { DeleteVecMembers(chapters); }
+    ~PageTextCache() {
+        DeleteVecMembers(chapters);
+        for (PageText& pt : retired) {
+            FreePageText(&pt);
+        }
+    }
 
     // Existing page entry, without creating or growing its chapter cache.
     TextCacheEntry* Peek(Location loc) {
@@ -727,6 +1138,10 @@ static void ChapterLayoutThread(ChapterLayoutJob* job) {
     int id = job->job;
     delete job;
     AutoRelease release(engine);
+    // shutdown waits for this thread: laying out uses fonts it frees
+    defer {
+        AtomicIntDec(&gDangerousThreadCount);
+    };
 
     int total = engine->ChapterCount();
     {
@@ -768,6 +1183,7 @@ void EngineBase::StartBackgroundChapterLayout() {
     }
     int id = AtomicIntInc(&layoutJob);
     AddRef();
+    AtomicIntInc(&gDangerousThreadCount);
     auto* job = new ChapterLayoutJob();
     job->engine = this;
     job->job = id;
@@ -1037,7 +1453,10 @@ void EngineBase::InvalidateTextForPage(int pageNo) {
     if (!page) {
         return;
     }
-    FreePageText(&page->data);
+    if (page->data.text || page->data.coords || page->data.quads) {
+        VecAppend(pageTextCache->retired, page->data);
+    }
+    page->data = {};
     page->state = TextExtractionState::NotExtracted;
 }
 
@@ -1135,6 +1554,18 @@ RenderedBitmap* EngineBase::GetImageForPageElement(IPageElement* /*ipel*/) {
 // (a JPEG stream in a PDF, a page of a CBZ, …). Empty if the image only
 // exists as decoded pixels. Caller must str::Free.
 Str EngineBase::GetImageDataForPageElement(IPageElement*) {
+    return {};
+}
+
+// A page-element image as PNG bytes, for the clipboard where it takes PNG
+// (ng off Windows). Here: the encoded bytes when they already are a PNG.
+// Caller must str::Free.
+Str EngineBase::GetImagePngForPageElement(IPageElement* ipel) {
+    Str data = GetImageDataForPageElement(ipel);
+    if (len(data) > 8 && memcmp(data.s, "\x89PNG\r\n\x1a\n", 8) == 0) {
+        return data;
+    }
+    str::Free(data);
     return {};
 }
 
@@ -1252,6 +1683,10 @@ Str EnginePdfProxy::GetImageDataForPageElement(IPageElement* ipel) {
     return pdfEngine->GetImageDataForPageElement(ipel);
 }
 
+Str EnginePdfProxy::GetImagePngForPageElement(IPageElement* ipel) {
+    return pdfEngine->GetImagePngForPageElement(ipel);
+}
+
 bool EnginePdfProxy::TryGetElements(int pageNo, Vec<IPageElement*>* out) {
     return pdfEngine->TryGetElements(pageNo, out);
 }
@@ -1316,10 +1751,9 @@ void EnginePdfProxy::CopyStateFromPdfEngine() {
     logicalPageCount = pdfEngine->LogicalPageCount();
 }
 
-// returns false if didn't perform action (temporary until we move
-// all code there)
+// an engine that follows a link itself (mupdf, djvu, ebook) overrides this;
+// false lets the caller's link handler follow it
 bool EngineBase::HandleLink(IPageDestination* /*dest*/, ILinkHandler* /*linkHandler*/) {
-    // if not implemented in derived classes
     return false;
 }
 

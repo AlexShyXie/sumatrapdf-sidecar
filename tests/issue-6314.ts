@@ -5,7 +5,8 @@
 //
 // Copies the exe next to a restrict ini, opens a PDF and counts the chat rows
 // the command palette offers (orig "AI Claude chat with document", ng "Claude
-// chat..."): the four backends when AI is allowed, none when it is not.
+// chat..."): the five backends (with the custom API) when AI is allowed, none
+// when it is not.
 //
 // Run: bun tests/issue-6314.ts [--no-build]
 
@@ -13,12 +14,12 @@ import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node
 import { basename, dirname, join, resolve } from "node:path";
 import { ControlCommand, withControlledSumatra, type ControlClient } from "./control.ts";
 import { cmdId, EXE, runStandalone, tmpPath } from "./util.ts";
-import { sendCommand, waitForFrame } from "./win-automation.ts";
-import { getFocusedHwnd, sendText, sleep } from "./winapi.ts";
+import { paletteSetText, sendCommand, waitForFrame, waitForPalette, paletteState } from "./win-automation.ts";
+import { sleep } from "./winapi.ts";
 
 const PDF = resolve("ext/a-zlib/zlib.3.pdf");
 const AI_QUERY = ">chat";
-const AI_BACKENDS = 4;
+const AI_BACKENDS = 5;
 
 // what the exe needs beside it once copied out of the build directory
 const SIDE_BY_SIDE_DLLS = ["libsumatrapdf.dll", "clang_rt.asan_dynamic-x86_64.dll"].map((name) =>
@@ -51,20 +52,18 @@ async function paletteItems(client: ControlClient, frame: number, query: string)
   const deadline = Date.now() + 8000;
   let typed = false;
   for (;;) {
-    const res = await client.request(ControlCommand.TestCommandPalette, []);
-    const out = String(res[1] ?? "").trim();
-    if (res[0] === 0) {
+    const state = await paletteState(client);
+    if (state.open) {
       if (!typed) {
-        sendText(getFocusedHwnd(frame), query);
+        await paletteSetText(client, await waitForPalette(client, frame), query);
         typed = true;
       }
-      const m = /items=(\d+).*queryLen=(\d+)/.exec(out);
-      if (m && +m[2]! === query.length) {
-        return +m[1]!;
+      if (state.queryLen === query.length) {
+        return state.items;
       }
     }
     if (Date.now() > deadline) {
-      throw new Error(`issue-6314: palette never showed '${query}': ${out}`);
+      throw new Error(`issue-6314: palette never showed '${query}': ${state.raw}`);
     }
     await sleep(50);
   }

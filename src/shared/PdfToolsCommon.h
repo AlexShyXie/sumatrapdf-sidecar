@@ -3,6 +3,7 @@
 
 // --- shared by PdfToolsCommon.cpp and each app's PdfTools.cpp ---
 
+char* PdfToolPasswordTemp(MainWindow* win, Str srcPath);
 bool ParseDeletePages(Str s, int pageCount, Vec<int>& pagesToDelete);
 bool PageRangeOk(Str s, int pageCount, bool isExtract, Vec<int>& pages);
 TempStr PageRangeCountTemp(Str s, int pageCount, bool isExtract);
@@ -29,17 +30,28 @@ TempStr BuildKeepPagesRangeTemp(int pageCount, const Vec<int>& pagesToDelete);
 TempStr FormatPageRangeTemp(const Vec<int>& pages);
 bool KeepOnlyPagesWithAnnotations(EngineBase* engine, Vec<int>& pages);
 TempStr DefaultPdfDestPathTemp(Str srcPath);
+bool ExtractPagesToNewPdf(WindowTab* tab, const Vec<int>& pages, Str destPath);
 bool ConvertImageCollectionToPdf(EngineBase* engine, Str destPath);
 constexpr int kConvertPdfToImagesDpi = 150;
 constexpr int kSaveSelectionDefaultDpi = 300;
 float SaveSelectionZoom(EngineBase* engine, float dpi);
 bool SaveSelectionSizeOk(int w, int h);
 bool EstimateSelectionPx(RectF rect, float zoom, int& w, int& h);
+// PNG / JPEG / BMP / GIF, same core formats as the Save Image dialog
+struct ConvertImageFormat {
+    Str label;
+    Str ext; // including the dot, e.g. ".png"
+};
+constexpr int kConvertImageFormatCount = 4;
+extern const ConvertImageFormat kConvertImageFormats[kConvertImageFormatCount];
 int ConvertImageFormatIdxFromPath(Str path);
 bool IsSupportedConvertImageExt(Str path);
 bool PathHasPagePlaceholder(Str path);
 TempStr EnsurePagePlaceholderTemp(Str path, bool multiPage);
 TempStr WithDefaultImageExtTemp(Str path);
+int CountExistingImages(Str templatePath, const Vec<int>& pages);
+TempStr UniqueImagesTemplateTemp(Str templatePath, const Vec<int>& pages);
+TempStr ExistingImagesTextTemp(int nExisting);
 bool PagesFitDpi(EngineBase* engine, const Vec<int>& pages, int dpi);
 int ConvertPagesToImages(EngineBase* engine, int rotation, Str templatePath, const Vec<int>& pages, int dpi,
                          Str* firstPathOwnedOut);
@@ -68,6 +80,24 @@ void FinishSaveSelImg(SaveSelImgWork* d);
 constexpr int kMaxImageDpi = 9600;
 
 static const int kImageDpiChoices[] = {72, 96, 150, 300, 600, 1200};
+
+// Convert EPUB to PDF: the page sizes (points) and font sizes it offers.
+// A5 and 11 pt are mupdf's ebook layout defaults
+struct EbookPdfPageSize {
+    Str label;
+    float dx;
+    float dy;
+};
+static const EbookPdfPageSize kEbookPdfPageSizes[] = {
+    {StrL("A5"), 420, 595},
+    {StrL("A4"), 595, 842},
+    {StrL("A6"), 298, 420},
+    {StrL("Letter"), 612, 792},
+};
+static const int kEbookPdfFontSizes[] = {8, 9, 10, 11, 12, 14, 16, 18, 20, 24};
+constexpr int kEbookPdfDefaultFontSize = 11;
+constexpr int kEbookPdfMaxFontSize = 72;
+int EbookPdfFontSizeFromText(Str s);
 
 // rectangular selection → PNG / JPEG / BMP at a chosen DPI, independent of
 // the current zoom (issue #6127)

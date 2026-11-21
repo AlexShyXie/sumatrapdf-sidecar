@@ -40,6 +40,7 @@
 #include "Theme.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "gui/AppShell.h"
 #include "gui/DialogWidgets.h"
@@ -53,8 +54,6 @@
 
 #include "SumatraLog.h"
 
-constexpr int kFindWinCloseCmdId = (int)CmdLast + 52;
-
 constexpr int kFindWinDefaultDx = 460;
 constexpr int kFindWinDefaultDy = 320;
 constexpr int kFindWinMinDx = 260;
@@ -62,16 +61,6 @@ constexpr int kFindWinMinDy = 140;
 constexpr int kFindWinPagesDx = 160;
 constexpr int kFindWinRowDy = 20;
 constexpr int kFindWinPageColDx = 40;
-
-// "n / m" slot, wide enough for the full count so the search box stays put
-static float FindStatusSlotDx(int totalHits, bool capped) {
-    int digits = DecimalDigits(std::max(totalHits, 0));
-    int nChars = (2 * digits) + 3;
-    if (capped) {
-        nChars++;
-    }
-    return (float)nChars * 7.f;
-}
 
 struct FindWindowView;
 
@@ -84,10 +73,6 @@ struct FindWindowUI {
     gp::Bounds prevBtn;
     gp::Bounds nextBtn;
     int editFontPx = kFindEditFontPx;
-#if OS_WIN
-    // orig's find combo is an Edit. Tests type into whichever Edit has focus.
-    HWND queryEdit = nullptr;
-#endif
     // orig's edit is a combo box: the list under it is the search history
     DialogSelect ddHistory;
     int historyLen = -1;
@@ -95,17 +80,7 @@ struct FindWindowUI {
 };
 
 FindWindowWnd::~FindWindowWnd() {
-    str::Free(status);
-    if (ui) {
-        ui->ddHistory.Free();
-        str::Free(ui->historyFirst);
-#if OS_WIN
-        if (ui->queryEdit && IsWindow(ui->queryEdit)) {
-            DestroyWindow(ui->queryEdit);
-        }
-#endif
-    }
-    delete ui;
+    FindFreeUi(status, ui);
 }
 
 static void FindWindowOpenToolWindow(MainWindow* win);
@@ -124,48 +99,6 @@ static FindWindowWnd* Wnd(MainWindow* win) {
 }
 
 // --- results ----------------------------------------------------------------
-
-// list index of the match the document is currently on (so the selection can
-// track the current match), or -1 if it isn't in the list
-static int CurrentMatchIndex(MainWindow* win) {
-    if (win->ctrl && win->ctrl->CanFindInPage()) {
-        // tracked by the browser (chm / markdown) webview find
-        return win->browserFindCurrent;
-    }
-    DisplayModel* dm = win->AsFixed();
-    if (!dm || !dm->textSearch || dm->textSearch->result.len == 0) {
-        return -1;
-    }
-    return FindMatchIndex(win, dm->textSearch->startPage, dm->textSearch->startGlyph);
-}
-
-// first match at/after the current page, wrapping to the start of the document
-// if there is none: the match with the smallest forward page distance from the
-// current page (the list itself is in document order)
-static int FirstMatchFromCurrentPage(MainWindow* win) {
-    int n = len(win->findMatches);
-    if (n == 0) {
-        return -1;
-    }
-    int curPage = win->ctrl ? win->ctrl->CurrentPageNo() : 1;
-    int nPages = win->ctrl ? win->ctrl->PageCount() : 1;
-    int best = 0;
-    int bestDist = INT_MAX;
-    for (int i = 0; i < n; i++) {
-        int dist = win->findMatches[i].startPage - curPage;
-        if (dist < 0) {
-            dist += nPages;
-        }
-        if (dist < bestDist) {
-            bestDist = dist;
-            best = i;
-            if (dist == 0) {
-                break; // first match on the current page
-            }
-        }
-    }
-    return best;
-}
 
 // ng: orig defers the navigation through uitask so the list can repaint first
 // and coalesces rapid presses with an epoch; here the selection is drawn from
@@ -245,7 +178,7 @@ void FindWindowRefreshResults(MainWindow* win, bool allowNavigation) {
         w->savedSelGlyph = -1;
     }
     if (sel < 0) {
-        sel = CurrentMatchIndex(win);
+        sel = FindCurrentMatchIndex(win);
     }
     if (sel >= 0) {
         // the document already sits on a match (find-as-you-type found it): just
@@ -255,7 +188,7 @@ void FindWindowRefreshResults(MainWindow* win, bool allowNavigation) {
         // find-as-you-type gave up (it self-cancels for matches on far pages),
         // so the document isn't on a match. Drive selection + navigation off the
         // full count instead: go to the first match at/after the current page.
-        w->sel = FirstMatchFromCurrentPage(win);
+        w->sel = FindFirstMatchFromPage(win);
         // streamed partial updates must not navigate: OnResultSelected joins
         // the in-flight count worker, which would cancel the very scan that's
         // producing these results
@@ -284,7 +217,7 @@ static bool MoveResultSelection(MainWindow* win, int vkey) {
     constexpr int kPage = 10;
     int cur = w->sel;
     if (cur < 0) {
-        cur = CurrentMatchIndex(win); // start from where the document already is
+        cur = FindCurrentMatchIndex(win); // start from where the document already is
     }
     int idx;
     switch (vkey) {
@@ -364,6 +297,10 @@ bool FindWindowHasKeyboard(MainWindow* win) {
         return true;
     }
     return ToolWindowIsActive(w->tw);
+}
+
+bool FindWindowHistoryOpen(MainWindow* win) {
+    return win->findWindow && win->findWindow->ui && win->findWindow->ui->ddHistory.comboOpen;
 }
 
 bool FindWindowOnKeyDown(MainWindow* win, int vk, bool ctrl, bool shift, bool alt) {
@@ -495,6 +432,13 @@ static gp::InputState* EnsurePagesEdit(MainWindow* win) {
 }
 
 void ShowFindWindow(MainWindow* win) {
+    // hiding the bar aborts a running search or count (e.g. -search); restart below
+    bool wasFinding = win->findThread != nullptr;
+    bool wasCounting = win->findCountThread != nullptr;
+    // one find UI at a time: SearchUIFloating can change while the bar is up
+    if (IsFindBarVisible(win)) {
+        HideFindBar(win);
+    }
     // Capture before we point findEdit at this window's (possibly empty) edit.
     // CLI -search writes the term into the hidden compact bar; without this the
     // floating window opens with a blank box and empty result rows (#6055).
@@ -516,6 +460,12 @@ void ShowFindWindow(MainWindow* win) {
     // populate the results list: show what's cached, and (re)run the search for
     // the current term so snippets get built now that the window is visible
     FindWindowRefreshResults(win);
+    if (wasFinding && !win->findThread && len(term) > 0) {
+        FindTextOnThread(win, TextSearch::Direction::Forward, term, true, true);
+    }
+    if (wasCounting && !win->findCountThread) {
+        EnsureFindSnippets(win);
+    }
     if (FindEditTextLen(win) == 0 || win->findThread) {
         return;
     }
@@ -572,63 +522,6 @@ void FindWindowSetStatus(MainWindow* win, Str s, int totalHits) {
 // --- a window of its own (Windows) ------------------------------------------
 
 static gp::El* FindWindowContentEl(MainWindow* win, gp::Ctx* cx, bool ownWindow);
-
-#if OS_WIN
-constexpr UINT_PTR kFindQuerySubclassId = 8;
-
-// The Edit is what tests type into. Mirror its text into the gpui field and
-// mark it modified, the way orig's EN_CHANGE does.
-static LRESULT CALLBACK FindQueryProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR dw) {
-    auto* win = (MainWindow*)dw;
-    if (msg == WM_CHAR && IsMainWindowValidAndNotClosing(win)) {
-        LRESULT res = DefSubclassProc(hwnd, msg, wp, lp);
-        WCHAR buf[1024];
-        int n = GetWindowTextW(hwnd, buf, dimof(buf));
-        FindEditSetText(win, ToUtf8Temp(WStr(buf, n)));
-        FindEditSetModified(win, true);
-        return res;
-    }
-    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && wp == VK_ESCAPE) {
-        if (IsMainWindowValidAndNotClosing(win)) {
-            HideFindBar(win);
-        }
-        return 0;
-    }
-    if (msg == WM_NCDESTROY) {
-        RemoveWindowSubclass(hwnd, FindQueryProc, kFindQuerySubclassId);
-    }
-    return DefSubclassProc(hwnd, msg, wp, lp);
-}
-
-static void FindAttachQueryEdit(MainWindow* win) {
-    FindWindowWnd* w = Wnd(win);
-    if (!w || !w->ui) {
-        return;
-    }
-    if (w->ui->queryEdit && IsWindow(w->ui->queryEdit)) {
-        return;
-    }
-    w->ui->queryEdit = nullptr;
-    HWND parent = w->tw ? ToolWindowHwnd(w->tw) : nullptr;
-    if (!parent) {
-        return;
-    }
-    HWND edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 1, 1, parent, nullptr,
-                                GetModuleHandleW(nullptr), nullptr);
-    if (!edit) {
-        return;
-    }
-    SetWindowSubclass(edit, FindQueryProc, kFindQuerySubclassId, (DWORD_PTR)win);
-    w->ui->queryEdit = edit;
-}
-
-static void FindSyncQueryEdit(MainWindow* win, HWND edit, bool selectAll) {
-    SetWindowTextW(edit, CWStrTemp(ToWStrTemp(FindEditTextTemp(win))));
-    if (selectAll) {
-        SendMessageW(edit, EM_SETSEL, 0, -1);
-    }
-}
-#endif
 
 static Str FindToolTitle() {
     return Tr("Find");
@@ -1055,6 +948,10 @@ static gp::El* FindWindowContentEl(MainWindow* win, gp::Ctx* cx, bool ownWindow)
         str::ReplaceWithCopy(&ui->historyFirst, first);
         ui->ddHistory.SetItems(history, -1);
     }
+    if (win->findHistoryWantOpen) {
+        win->findHistoryWantOpen = false;
+        ui->ddHistory.OpenCombo();
+    }
     // orig's OnHistoryCommitted: picking an entry out of the open history list
     // is a search request; walking the list with the arrow keys only fills the
     // box, and waits for Enter
@@ -1112,15 +1009,6 @@ static gp::El* FindWindowContentEl(MainWindow* win, gp::Ctx* cx, bool ownWindow)
             w->wantSelectAll = false;
             gp::InputSelectAll(edit, cx->app, cx->win);
         }
-#if OS_WIN
-        FindAttachQueryEdit(win);
-        if (w->ui->queryEdit) {
-            FindSyncQueryEdit(win, w->ui->queryEdit, selectAll);
-            if (GetFocus() != w->ui->queryEdit) {
-                SetFocus(w->ui->queryEdit);
-            }
-        }
-#endif
     }
     return card;
 }
@@ -1223,8 +1111,9 @@ TempStr FindWindowContentsResultTemp(int maxRows, int* exitCodeOut) {
     gSettings->searchUIFloating = true;
     ShowFindWindow(win);
     TempStr term = FindEditTextTemp(win);
+    // a [Search] or -search fills the box only once its search got going
     if (len(term) == 0) {
-        return finish(1, StrL("ERROR empty-term"));
+        return finish(2, StrL("NOTREADY empty-term"));
     }
     if (win->findThread || win->findCountThread || !win->findCountValid || !win->findCountHasSnippets) {
         return finish(2, StrL("NOTREADY snippets"));

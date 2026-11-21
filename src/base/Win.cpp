@@ -16,12 +16,6 @@
 #include "base/Win.h"
 #include "base/Launch.h"
 
-//--- bool / BOOL
-
-bool ToBool(BOOL b) {
-    return b ? true : false;
-}
-
 //--- subclass ids
 
 static AtomicInt gSubclassId = 0;
@@ -83,6 +77,10 @@ void HwndCenterDialog(HWND hDlg, HWND hParent) {
 
 // change size of the window to have a given client size
 void HwndResizeClientSize(HWND hwnd, int dx, int dy) {
+    Size client = HwndClientRect(hwnd).Size();
+    if (client.dx == dx && client.dy == dy) {
+        return;
+    }
     Rect rc = HwndWindowRect(hwnd);
     int x = rc.x;
     int y = rc.y;
@@ -106,28 +104,6 @@ void HwndPositionInCenterOf(HWND hwnd, HWND hwndRelative) {
     Rect r2 = {x, y, r.dx, r.dy};
     r = ShiftRectToWorkArea(r2, hwndRelative, true);
     SetWindowPos(hwnd, nullptr, r.x, r.y, 0, 0, SWP_NOZORDER | SWP_NOSIZE);
-}
-
-void ResizeHwndToClientArea(HWND hwnd, int dx, int dy, bool hasMenu) {
-    WINDOWINFO wi{};
-    wi.cbSize = sizeof(wi);
-    ::GetWindowInfo(hwnd, &wi);
-
-    RECT r{};
-    r.right = dx;
-    r.bottom = dy;
-    DWORD style = wi.dwStyle;
-    DWORD exStyle = wi.dwExStyle;
-    AdjustWindowRectEx(&r, style, hasMenu, exStyle);
-    if ((dx == RectDx(wi.rcClient)) && (dy == RectDy(wi.rcClient))) {
-        return;
-    }
-
-    dx = RectDx(r);
-    dy = RectDy(r);
-    int x = wi.rcWindow.left;
-    int y = wi.rcWindow.top;
-    MoveWindow(hwnd, x, y, dx, dy, TRUE);
 }
 
 //--- HWND: screen / work area / placement
@@ -470,16 +446,16 @@ bool HwndIsRtl(HWND hwnd) {
     return bit::IsMaskSet<DWORD>(style, WS_EX_LAYOUTRTL);
 }
 
+static void HwndSetWindowExStyle(HWND hwnd, DWORD flags, bool enable) {
+    HwndSetWindowStyle(hwnd, flags, enable, GWL_EXSTYLE);
+}
+
 void HwndSetRtl(HWND hwnd, bool isRtl) {
     HwndSetWindowExStyle(hwnd, WS_EX_LAYOUTRTL | WS_EX_NOINHERITLAYOUT, isRtl);
 }
 
 void HwndSetWindowStyle(HWND hwnd, DWORD flags, bool enable) {
     HwndSetWindowStyle(hwnd, flags, enable, GWL_STYLE);
-}
-
-void HwndSetWindowExStyle(HWND hwnd, DWORD flags, bool enable) {
-    HwndSetWindowStyle(hwnd, flags, enable, GWL_EXSTYLE);
 }
 
 //--- HWND: text / font / icon / paint
@@ -713,6 +689,32 @@ void EditSetPasswordVisible(HWND hwnd, bool show) {
     HwndInvalidate(hwnd, true);
 }
 
+// Ctrl+Backspace reaches an edit as WM_CHAR 0x7F, which it would insert as a box.
+// Call on WM_CHAR: for 0x7F, deletes the selection or the word before the caret.
+bool EditHandleCtrlBack(HWND hwnd, WPARAM ch) {
+    constexpr WPARAM kCtrlBackChar = 0x7F;
+    if (!hwnd || ch != kCtrlBackChar) {
+        return false;
+    }
+    int selStart = 0;
+    int selEnd = 0;
+    EditGetSelection(hwnd, selStart, selEnd);
+    if (selStart == selEnd) {
+        // "foo bar  |" => "foo |"
+        TempWStr text = HwndGetTextWTemp(hwnd);
+        selStart = std::min(selStart, len(text));
+        for (; selStart > 0 && wstr::IsWs(text.s[selStart - 1]); selStart--) {
+            ;
+        }
+        for (; selStart > 0 && !wstr::IsWs(text.s[selStart - 1]); selStart--) {
+            ;
+        }
+        EditSelectText(hwnd, selStart, selEnd);
+    }
+    SendMessageW(hwnd, WM_CLEAR, 0, 0);
+    return true;
+}
+
 //--- list box
 
 int LbAddString(HWND hwnd, WStr text) {
@@ -940,12 +942,11 @@ int MsgBox(HWND hwnd, Str text, Str caption, UINT flags) {
     return MessageBoxW(hwnd, textW, captionW, flags);
 }
 
-void MessageBoxWarningSimple(HWND hwnd, WStr msg, WStr title) {
-    uint type = MB_OK | MB_ICONEXCLAMATION;
+void MsgBoxWarning(HWND hwnd, Str msg, Str title) {
     if (len(title) == 0) {
-        title = WStrL(L"Warning");
+        title = StrL("Warning");
     }
-    MessageBoxW(hwnd, msg.s, title.s, type);
+    MsgBox(hwnd, msg, title, MB_OK | MB_ICONEXCLAMATION);
 }
 
 //--- GDI: draw / measure
@@ -1009,16 +1010,6 @@ static Rect HdcMeasureWithDrawText(HDC hdc, Str s, Rect r, uint format, HFONT fo
     return HdcMeasureWithDrawText(hdc, ToWStrTemp(s), r, format, font);
 }
 
-bool HdcExTextOut(HDC hdc, Point pos, uint options, const Rect& rect, WStr text) {
-    RECT r = ToRECT(rect);
-    RECT* rectPtr = rect.IsEmpty() ? nullptr : &r;
-    return ExtTextOutW(hdc, pos.x, pos.y, options, rectPtr, text.s, (uint)text.len, nullptr) != 0;
-}
-
-bool HdcExTextOut(HDC hdc, Point pos, uint options, const Rect& rect, Str text) {
-    return HdcExTextOut(hdc, pos, options, rect, ToWStrTemp(text));
-}
-
 // uses the same logic as HdcDrawText
 // maxDx limits the width, used when measuring text wrapped with DT_WORDBREAK
 Size HdcMeasureText(HDC hdc, Str s, int maxDx, uint format, HFONT font) {
@@ -1075,13 +1066,13 @@ Size HdcGetTextExtentPoint32(HDC hdc, Str str) {
 
 //--- GDI: handles / bitmaps / pixmaps
 
-bool DeleteObjectSafe(HGDIOBJ* h) {
+static bool DeleteObjectSafe(HGDIOBJ* h) {
     if (!h || !*h) {
         return false;
     }
     auto res = ::DeleteObject(*h);
     *h = nullptr;
-    return ToBool(res);
+    return tobool(res);
 }
 
 bool DeleteBrushSafe(HBRUSH* br) {
@@ -1250,13 +1241,15 @@ static HWND GetClipboardOwnerWnd() {
 // --- end: merged from former src/common/win_util.cpp ---
 
 // OpenClipboard fails when another process still holds it (Explorer, a just-
-// exited Set-Clipboard). Retry briefly rather than silently dropping the copy.
+// exited Set-Clipboard, rdpclip syncing a change). Retry rather than silently
+// dropping the copy.
 bool OpenClipboardForUpdate() {
+    constexpr int kTries = 100; // 2 secs
     HWND owner = GetClipboardOwnerWnd();
     if (!owner) {
         return false;
     }
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < kTries; i++) {
         if (OpenClipboard(owner)) {
             if (EmptyClipboard()) {
                 return true;
@@ -1463,7 +1456,7 @@ TempStr MenuToSafeStringTemp(Str s) {
 
 //--- keyboard state
 
-bool IsKeyPressed(int key) {
+static bool IsKeyPressed(int key) {
     SHORT state = GetKeyState(key);
     SHORT isDown = (SHORT)(state & 0x8000);
     return isDown != 0;
@@ -1475,6 +1468,27 @@ bool IsShiftPressed() {
 
 bool IsAltPressed() {
     return IsKeyPressed(VK_MENU);
+}
+
+// a path the next Save As takes instead of showing the dialog: tests set it
+// through the control channel, so no script has to drive the system dialog
+static WStr gTestSaveFileName;
+
+void SetTestSaveFileName(Str path) {
+    wstr::Free(gTestSaveFileName);
+    gTestSaveFileName = len(path) > 0 ? ToWStr(path) : WStr{};
+}
+
+// call before GetSaveFileNameW: true when a test's path was put in ofn
+bool TakeTestSaveFileName(OPENFILENAMEW* ofn) {
+    if (len(gTestSaveFileName) == 0 || !ofn || !ofn->lpstrFile || ofn->nMaxFile == 0) {
+        return false;
+    }
+    int n = std::min(len(gTestSaveFileName), (int)ofn->nMaxFile - 1);
+    memcpy(ofn->lpstrFile, gTestSaveFileName.s, n * sizeof(WCHAR));
+    ofn->lpstrFile[n] = 0;
+    SetTestSaveFileName({});
+    return true;
 }
 
 bool IsCtrlPressed() {
@@ -2078,8 +2092,9 @@ bool CreateShortcut(Str shortcutPath, Str exePath, Str args, Str description, in
 
 //--- process launch / shell
 
-// SHAddToRecentDocs can block on network paths (shell resolves / writes Recent).
-// Run those off the UI thread with COM initialized and a heap-owned path.
+// SHAddToRecentDocs blocks while the shell resolves the path and writes
+// Recent, ~40 ms for a local file and longer on a network path. Run it off
+// the UI thread with COM initialized and a heap-owned path.
 static void AddPathToRecentDocsOnThread(WCHAR* pathW) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     bool comInitedByUs = SUCCEEDED(hr);
@@ -2103,12 +2118,6 @@ void AddPathToRecentDocs(Str path) {
     if (len(path) == 0) {
         return;
     }
-    if (!path::IsOnNetworkDrive(path)) {
-        WCHAR* pathW = CWStrTemp(path);
-        SHAddToRecentDocs(SHARD_PATH, pathW);
-        return;
-    }
-
     WCHAR* owned = ToWStr(path).s; // heap; thread frees
     if (!owned) {
         return;
@@ -2147,7 +2156,12 @@ void RunNonElevated(Str exePath) {
     }
     cmd = fmt("\"%s\" \"%s\"", explorerPath, exePath);
 Run:
-    HANDLE h = LaunchProcessInDir(len(cmd) == 0 ? exePath : cmd);
+    // LaunchProcessInDir needs the exe quoted: "C:\Program Files\..." would
+    // otherwise first try to run C:\Program.exe
+    if (len(cmd) == 0) {
+        cmd = fmt("\"%s\"", exePath);
+    }
+    HANDLE h = LaunchProcessInDir(cmd);
     SafeCloseHandle(&h);
 }
 
@@ -2271,20 +2285,31 @@ ChildProcess* StartChildProcess(Str cmdLine) {
     return p;
 }
 
-bool ChildProcessHasExited(ChildProcess* p, int waitMs) {
-    return WaitForSingleObject(p->process, (DWORD)waitMs) != WAIT_TIMEOUT;
-}
-
-void CloseChildProcess(ChildProcess* p) {
-    if (!p) {
-        return;
-    }
-    CloseHandle(p->process);
-    delete p;
-}
-
 bool LaunchElevated(Str path, Str cmdline) {
     return LaunchFileShell(path, cmdline, StrL("runas"));
+}
+
+// Run elevated, wait for it to finish and return its exit code. 1 if it
+// couldn't start, e.g. the UAC prompt was declined.
+int RunElevatedAndWait(Str path, Str cmdline) {
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"runas";
+    sei.lpFile = CWStrTemp(path);
+    sei.lpParameters = CWStrTemp(cmdline);
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei) || !sei.hProcess) {
+        logf("RunElevatedAndWait: ShellExecuteExW failed for '%s' '%s'\n", path, cmdline);
+        LogLastError();
+        return 1;
+    }
+    WaitForSingleObject(sei.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(sei.hProcess, &exitCode);
+    CloseHandle(sei.hProcess);
+    logf("RunElevatedAndWait: '%s' exited with %d\n", path, (int)exitCode);
+    return (int)exitCode;
 }
 
 //--- console
@@ -2585,7 +2610,7 @@ bool WriteRegDWORD(HKEY keySub, Str keyName, Str valName, DWORD value) {
     return ERROR_SUCCESS == res;
 }
 
-bool WriteRegNone(HKEY hkey, Str key, Str valName) {
+static bool WriteRegNone(HKEY hkey, Str key, Str valName) {
     WCHAR* keyW = CWStrTemp(key);
     WCHAR* valNameW = CWStrTemp(valName);
     LSTATUS res = SHSetValueW(hkey, keyW, valNameW, REG_NONE, nullptr, 0);
@@ -2836,33 +2861,6 @@ Exit:
 }
 
 /* adapted from http://blogs.msdn.com/oldnewthing/archive/2004/09/20/231739.aspx */
-IDataObject* GetDataObjectForFile(Str filePath, HWND hwnd) {
-    AutoReleaseComPtr<IShellFolder> pDesktopFolder;
-    HRESULT hr = SHGetDesktopFolder(&pDesktopFolder);
-    if (FAILED(hr)) {
-        return nullptr;
-    }
-
-    WCHAR* lpWPath = CWStrTemp(filePath);
-    LPITEMIDLIST pidl;
-    hr = pDesktopFolder->ParseDisplayName(nullptr, nullptr, lpWPath, nullptr, &pidl, nullptr);
-    if (FAILED(hr)) {
-        return nullptr;
-    }
-    AutoReleaseComPtr<IShellFolder> pShellFolder;
-    LPCITEMIDLIST pidlChild;
-    hr = SHBindToParent(pidl, IID_IShellFolder, (void**)&pShellFolder, &pidlChild);
-    CoTaskMemFree(pidl);
-    if (FAILED(hr)) {
-        return nullptr;
-    }
-    IDataObject* pDataObject = nullptr;
-    hr = pShellFolder->GetUIObjectOf(hwnd, 1, &pidlChild, IID_IDataObject, nullptr, (void**)&pDataObject);
-    if (FAILED(hr)) {
-        return nullptr;
-    }
-    return pDataObject;
-}
 
 HRESULT CLSIDFromString(Str lpsz, LPCLSID pclsid) {
     WCHAR* ws = CWStrTemp(lpsz);
@@ -3091,392 +3089,6 @@ static const DWORD groupsToCheck[] = {
     DOMAIN_ALIAS_RID_ADMINS,
 };
 
-i64 RenderedBitmapByteSize(RenderedBitmap* bmp) {
-    if (!bmp) {
-        return 0;
-    }
-    Size s = bmp->GetSize();
-    i64 res = i64(s.dx) * i64(s.dy) * i64(4);
-    return res;
-}
-
-bool RenderedBitmap::Blit(HDC hdc, Rect target) {
-    return BlitHBITMAP(hbmp, hdc, target);
-}
-
-void LbResetContent(HWND hwnd) {
-    SendMessageW(hwnd, LB_RESETCONTENT, 0, 0);
-}
-
-int LbInsertString(HWND hwnd, int idx, WStr text) {
-    return (int)SendMessageW(hwnd, LB_INSERTSTRING, (WPARAM)idx, (LPARAM)CWStrTemp(text));
-}
-
-int LbInsertString(HWND hwnd, int idx, Str text) {
-    return LbInsertString(hwnd, idx, ToWStrTemp(text));
-}
-
-int LbGetCount(HWND hwnd) {
-    return (int)SendMessageW(hwnd, LB_GETCOUNT, 0, 0);
-}
-
-int LbGetItemHeight(HWND hwnd, int idx) {
-    return (int)SendMessageW(hwnd, LB_GETITEMHEIGHT, (WPARAM)idx, 0);
-}
-
-Rect LbGetItemRect(HWND hwnd, int idx) {
-    RECT rect{};
-    LRESULT res = SendMessageW(hwnd, LB_GETITEMRECT, (WPARAM)idx, (LPARAM)&rect);
-    if (res == LB_ERR) {
-        return {};
-    }
-    return {rect};
-}
-
-int LbItemFromPoint(HWND hwnd, Point point, bool* outside) {
-    LRESULT res = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, MAKELPARAM(point.x, point.y));
-    *outside = HIWORD(res) != 0;
-    return (int)LOWORD(res);
-}
-
-int LbGetTopIndex(HWND hwnd) {
-    return (int)SendMessageW(hwnd, LB_GETTOPINDEX, 0, 0);
-}
-
-bool LbSetTopIndex(HWND hwnd, int idx) {
-    LRESULT res = SendMessageW(hwnd, LB_SETTOPINDEX, (WPARAM)idx, 0);
-    return res != LB_ERR;
-}
-
-void LbInitStorage(HWND hwnd, int count) {
-    SendMessageW(hwnd, LB_INITSTORAGE, (WPARAM)count, 0);
-}
-
-int LvGetItemCount(HWND hwnd) {
-    return (int)SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0);
-}
-
-int LvGetNextItem(HWND hwnd, int start, UINT flags) {
-    return (int)SendMessageW(hwnd, LVM_GETNEXTITEM, (WPARAM)start, MAKELPARAM(flags, 0));
-}
-
-void LvSetItemState(HWND hwnd, int i, UINT state, UINT mask) {
-    LVITEMW item = {};
-    item.stateMask = mask;
-    item.state = state;
-    SendMessageW(hwnd, LVM_SETITEMSTATE, (WPARAM)i, (LPARAM)&item);
-}
-
-UINT LvGetItemState(HWND hwnd, int i, UINT mask) {
-    return (UINT)SendMessageW(hwnd, LVM_GETITEMSTATE, (WPARAM)i, (LPARAM)mask);
-}
-
-void LvEnsureVisible(HWND hwnd, int i, bool partialOk) {
-    SendMessageW(hwnd, LVM_ENSUREVISIBLE, (WPARAM)i, (LPARAM)(partialOk ? TRUE : FALSE));
-}
-
-HWND LvGetEditControl(HWND hwnd) {
-    return (HWND)SendMessageW(hwnd, LVM_GETEDITCONTROL, 0, 0);
-}
-
-int LvInsertItem(HWND hwnd, const LVITEMW* item) {
-    return (int)SendMessageW(hwnd, LVM_INSERTITEMW, 0, (LPARAM)item);
-}
-
-bool LvEditLabel(HWND hwnd, int i) {
-    return SendMessageW(hwnd, LVM_EDITLABELW, (WPARAM)i, 0) != 0;
-}
-
-void LvDeleteItem(HWND hwnd, int i) {
-    SendMessageW(hwnd, LVM_DELETEITEM, (WPARAM)i, 0);
-}
-
-void LvDeleteAllItems(HWND hwnd) {
-    SendMessageW(hwnd, LVM_DELETEALLITEMS, 0, 0);
-}
-
-Rect LvGetItemRect(HWND hwnd, int i, int code) {
-    RECT rc = {};
-    rc.left = code;
-    if (!SendMessageW(hwnd, LVM_GETITEMRECT, (WPARAM)i, (LPARAM)&rc)) {
-        return {};
-    }
-    return {rc};
-}
-
-Rect LvGetSubItemRect(HWND hwnd, int iItem, int iSub, int code) {
-    RECT rc = {};
-    rc.top = iSub;
-    rc.left = code;
-    if (!SendMessageW(hwnd, LVM_GETSUBITEMRECT, (WPARAM)iItem, (LPARAM)&rc)) {
-        return {};
-    }
-    return {rc};
-}
-
-void LvSetColumnWidth(HWND hwnd, int iCol, int cx) {
-    SendMessageW(hwnd, LVM_SETCOLUMNWIDTH, (WPARAM)iCol, MAKELPARAM(cx, 0));
-}
-
-void LvSetItemText(HWND hwnd, int i, int iSub, WStr text) {
-    LVITEMW item = {};
-    item.iSubItem = iSub;
-    item.pszText = CWStrTemp(text);
-    SendMessageW(hwnd, LVM_SETITEMTEXTW, (WPARAM)i, (LPARAM)&item);
-}
-
-void LvSetItemText(HWND hwnd, int i, int iSub, Str text) {
-    LvSetItemText(hwnd, i, iSub, ToWStrTemp(text));
-}
-
-TempWStr LvGetItemTextTemp(HWND hwnd, int i, int iSub) {
-    // LVM_GETITEMTEXT needs a buffer; grow until it fits
-    int cch = 256;
-    for (;;) {
-        TempWStr text = AllocArrayTemp<WCHAR>(cch);
-        LVITEMW item = {};
-        item.iSubItem = iSub;
-        item.pszText = text.s;
-        item.cchTextMax = cch;
-        int n = (int)SendMessageW(hwnd, LVM_GETITEMTEXTW, (WPARAM)i, (LPARAM)&item);
-        if (n + 1 < cch || cch >= 32 * 1024) {
-            text.len = n;
-            return text;
-        }
-        cch *= 2;
-    }
-}
-
-int LvHitTest(HWND hwnd, Point pt, UINT* flagsOut) {
-    LVHITTESTINFO info = {};
-    info.pt.x = pt.x;
-    info.pt.y = pt.y;
-    int i = (int)SendMessageW(hwnd, LVM_HITTEST, 0, (LPARAM)&info);
-    if (flagsOut) {
-        *flagsOut = info.flags;
-    }
-    return i;
-}
-
-DWORD LvSetExtendedStyle(HWND hwnd, DWORD ex) {
-    return (DWORD)SendMessageW(hwnd, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LPARAM)ex);
-}
-
-int LvInsertColumn(HWND hwnd, int iCol, const LVCOLUMNW* col) {
-    return (int)SendMessageW(hwnd, LVM_INSERTCOLUMNW, (WPARAM)iCol, (LPARAM)col);
-}
-
-void HwndShowWithoutActivate(HWND hwnd) {
-    SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-}
-
-void DbgOutLastError(DWORD err) {
-    TempStr msg = GetLastErrorStrTemp(err);
-    OutputDebugStringA(msg.s);
-}
-
-void InitConsoleOutput() {
-    InitConsoleState();
-}
-
-void SendEnterIfLoggedToConsole() {
-    InitConsoleState();
-    if (!gLoggedToConsole) {
-        return;
-    }
-    if (gConsoleState != ConsoleState::AttachedToParent) {
-        return;
-    }
-    if (!gStartupForegroundWindow) {
-        return;
-    }
-    SendEnterToParentConsole(gStartupForegroundWindow);
-}
-
-void WaitForConsoleClose() {
-    SendEnterIfLoggedToConsole();
-    InitConsoleState();
-    if (gConsoleState != ConsoleState::AllocatedNew) {
-        return;
-    }
-
-    const char* msg = "press Enter to exit";
-    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hConsole != INVALID_HANDLE_VALUE) {
-        DWORD written;
-        WriteConsoleA(hConsole, msg, (DWORD)strlen(msg), &written, nullptr);
-    }
-
-    HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
-    if (hInput != INVALID_HANDLE_VALUE) {
-        FlushConsoleInputBuffer(hInput);
-        char c;
-        DWORD read;
-        ReadConsoleA(hInput, &c, 1, &read, nullptr);
-    }
-}
-
-static ULARGE_INTEGER FileTimeToLargeInteger(const FILETIME& ft) {
-    ULARGE_INTEGER res;
-    res.LowPart = ft.dwLowDateTime;
-    res.HighPart = ft.dwHighDateTime;
-    return res;
-}
-
-DWORD GetFileVersion(const WCHAR* path) {
-    DWORD fileVersion = 0;
-    DWORD size = GetFileVersionInfoSize(path, nullptr);
-    ScopedMem<void> versionInfo(malloc(size));
-
-    if (versionInfo && GetFileVersionInfo(path, 0, size, versionInfo)) {
-        VS_FIXEDFILEINFO* fileInfo;
-        uint n;
-        if (VerQueryValue(versionInfo, L"\\", (LPVOID*)&fileInfo, &n)) {
-            fileVersion = fileInfo->dwFileVersionMS;
-        }
-    }
-
-    return fileVersion;
-}
-
-TempStr GetParentProcessPath(DWORD* pidOut) {
-    if (pidOut) {
-        *pidOut = 0;
-    }
-    DWORD pid = GetCurrentProcessId();
-    AutoCloseHandle snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (INVALID_HANDLE_VALUE == snap) {
-        return {};
-    }
-    PROCESSENTRY32W pe{};
-    pe.dwSize = sizeof(pe);
-    DWORD parentPid = 0;
-    if (!Process32FirstW(snap, &pe)) {
-        return {};
-    }
-    do {
-        if (pe.th32ProcessID == pid) {
-            parentPid = pe.th32ParentProcessID;
-            break;
-        }
-    } while (Process32NextW(snap, &pe));
-    if (parentPid == 0) {
-        return {};
-    }
-    if (pidOut) {
-        *pidOut = parentPid;
-    }
-    AutoCloseHandle hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
-    if (!hProc.IsValid()) {
-        return {};
-    }
-    WCHAR path[MAX_PATH]{};
-    DWORD pathLen = MAX_PATH;
-    if (!QueryFullProcessImageNameW(hProc, 0, path, &pathLen)) {
-        return {};
-    }
-    return ToUtf8Temp(path);
-}
-
-static DWORD GetAccountTypeHelper(bool checkTokenForGroupDeny) {
-    HANDLE hToken = nullptr;
-    BOOL isMember = FALSE;
-    DWORD highestGroup = 0;
-    BOOL validTokenGroups = FALSE;
-    TOKEN_GROUPS* ptg = nullptr;
-    DWORD cbTokenGroups;
-
-    BOOL ok = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, FALSE, &hToken) ||
-              OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken);
-    if (!ok) {
-        return false;
-    }
-
-    // Use "old school" membership check?
-    if (!checkTokenForGroupDeny) {
-        // We must query the size of the group information associated with
-        // the token. Note that we expect a FALSE result from GetTokenInformation
-        // because we've given it a NULL buffer. On exit cbTokenGroups will tell
-        // the size of the group information.
-        if (!GetTokenInformation(hToken, TokenGroups, nullptr, 0, &cbTokenGroups) &&
-            GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-            // Allocate buffer and ask for the group information again.
-            // This may fail if an administrator has added this account
-            // to an additional group between our first call to
-            // GetTokenInformation and this one.
-            ptg = (TOKEN_GROUPS*)GlobalAlloc(GPTR, cbTokenGroups);
-            if (ptg && GetTokenInformation(hToken, TokenGroups, ptg, cbTokenGroups, &cbTokenGroups)) {
-                validTokenGroups = TRUE;
-            }
-        }
-    }
-
-    SID_IDENTIFIER_AUTHORITY systemSid = {SECURITY_NT_AUTHORITY};
-    if (validTokenGroups || checkTokenForGroupDeny) {
-        PSID psid = nullptr;
-        for (DWORD groupID : groupsToCheck) {
-            // Create a SID for the local group and then check if it exists in our token
-            DWORD sub1 = SECURITY_BUILTIN_DOMAIN_RID;
-            ok = AllocateAndInitializeSid(&systemSid, 2, sub1, groupID, 0, 0, 0, 0, 0, 0, &psid);
-            if (!ok) {
-                continue;
-            }
-
-            if (checkTokenForGroupDeny) {
-                CheckTokenMembership(nullptr, psid, &isMember);
-            } else if (validTokenGroups) {
-                isMember = FALSE;
-                for (DWORD j = 0; !isMember && (j < ptg->GroupCount); j++) {
-                    if (EqualSid(ptg->Groups[j].Sid, psid)) {
-                        isMember = TRUE;
-                    }
-                }
-            }
-            if (isMember) {
-                highestGroup = groupID;
-            }
-            FreeSid(psid);
-        }
-    }
-
-    if (ptg) {
-        GlobalFree(ptg);
-    }
-    CloseHandle(hToken);
-    return highestGroup;
-}
-
-DWORD GetAccountType() {
-    return GetAccountTypeHelper(true);
-}
-
-DWORD GetOriginalAccountType() {
-    return GetAccountTypeHelper(false);
-}
-
-void HdcDrawLine(HDC hdc, const Rect& rect) {
-    MoveToEx(hdc, rect.x, rect.y, nullptr);
-    LineTo(hdc, rect.x + rect.dx, rect.y + rect.dy);
-}
-
-bool HwndIsMouseOverRect(HWND hwnd, const Rect& r) {
-    Point curPos = HwndGetCursorPos(hwnd);
-    return r.Contains(curPos);
-}
-
-bool HwndIsWindowStyleExSet(HWND hwnd, DWORD flags) {
-    DWORD style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-    return (style != flags) != 0;
-}
-
-int GetSizeOfDefaultGuiFont() {
-    NONCLIENTMETRICS ncm{};
-    ncm.cbSize = sizeof(ncm);
-    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
-    int res = std::abs(ncm.lfMessageFont.lfHeight);
-    return res;
-}
-
 void DeferWinPosHelper::SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags) {
     hdwp = ::DeferWindowPos(hdwp, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
 }
@@ -3484,79 +3096,6 @@ void DeferWinPosHelper::SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int x, int
 void DeferWinPosHelper::SetWindowPos(HWND hwnd, const Rect rc) {
     uint flags = SWP_NOZORDER;
     hdwp = ::DeferWindowPos(hdwp, hwnd, nullptr, rc.x, rc.y, rc.dx, rc.dy, flags);
-}
-
-bool RegisterOrUnregisterServerDLL(Str dllPath, bool install, Str args) {
-    if (FAILED(OleInitialize(nullptr))) {
-        return false;
-    }
-
-    // make sure that the DLL can find any DLLs it depends on and
-    // which reside in the same directory (in this case: libsumatrapdf.dll)
-    TempStr dllDir = path::GetDirTemp(dllPath);
-    SetDllDirectoryW(CWStrTemp(dllDir));
-
-    defer {
-        SetDllDirectoryW(L"");
-        OleUninitialize();
-    };
-
-    HMODULE lib = LoadLibraryA(dllPath.s);
-    if (!lib) {
-        return false;
-    }
-    defer {
-        FreeLibrary(lib);
-    };
-
-    bool ok = false;
-    typedef HRESULT(WINAPI * DllInstallProc)(BOOL, LPCWSTR);
-    typedef HRESULT(WINAPI * DllRegUnregProc)(VOID);
-    if (args) {
-        DllInstallProc DllInstall = (DllInstallProc)GetProcAddress(lib, "DllInstall");
-        if (DllInstall) {
-            WCHAR* argsW = CWStrTemp(args);
-            ok = SUCCEEDED(DllInstall(install, argsW));
-        } else {
-            args = {};
-        }
-    }
-
-    if (len(args) == 0) {
-        Str func = install ? StrL("DllRegisterServer") : StrL("DllUnregisterServer");
-        DllRegUnregProc DllRegUnreg = (DllRegUnregProc)GetProcAddress(lib, func.s);
-        if (DllRegUnreg) {
-            ok = SUCCEEDED(DllRegUnreg());
-        }
-    }
-    return ok;
-}
-
-bool RegisterServerDLL(Str dllPath, Str args) {
-    return RegisterOrUnregisterServerDLL(dllPath, true, args);
-}
-
-bool UnRegisterServerDLL(Str dllPath, Str args) {
-    if (!file::Exists(dllPath)) {
-        return true;
-    }
-    return RegisterOrUnregisterServerDLL(dllPath, false, args);
-}
-
-bool HwndHasFrameThickness(HWND hwnd) {
-    return bit::IsMaskSet(GetWindowLong(hwnd, GWL_STYLE), WS_THICKFRAME);
-}
-
-bool HwndHasCaption(HWND hwnd) {
-    return bit::IsMaskSet(GetWindowLong(hwnd, GWL_STYLE), WS_CAPTION);
-}
-
-void HwndShow(HWND hwnd) {
-    HwndSetVisible(hwnd, true);
-}
-
-void HwndHide(HWND hwnd) {
-    HwndSetVisible(hwnd, false);
 }
 
 bool BlitHBITMAP(HBITMAP hbmp, HDC hdc, Rect target) {
@@ -3598,131 +3137,10 @@ bool BlitHBITMAP(HBITMAP hbmp, HDC hdc, Rect target) {
     return ok;
 }
 
-double GetProcessRunningTime() {
-    FILETIME currTime, startTime, d1, d2, d3;
-    GetSystemTimeAsFileTime(&currTime);
-    HANDLE hproc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, GetCurrentProcessId());
-    double timeInMs = 0;
-    if (!hproc) {
-        return 0;
-    }
-    if (GetProcessTimes(hproc, &startTime, &d1, &d2, &d3)) {
-        ULARGE_INTEGER start = FileTimeToLargeInteger(startTime);
-        ULARGE_INTEGER curr = FileTimeToLargeInteger(currTime);
-        ULONGLONG diff = curr.QuadPart - start.QuadPart;
-        // FILETIME is in 100 ns chunks
-        timeInMs = ((double)(diff * 100)) / (double)1000000;
-    }
-    CloseHandle(hproc);
-    return timeInMs;
-}
-
-void ResizeWindow(HWND hwnd, int dx, int dy) {
-    Rect rc = HwndWindowRect(hwnd);
-    if (dx == -1) {
-        dx = rc.dx;
-    }
-    if (dy == -1) {
-        dy = rc.dy;
-    }
-    SetWindowPos(hwnd, nullptr, 0, 0, dx, dy, SWP_NOMOVE | SWP_NOZORDER);
-}
-
-void MessageBoxNYI(HWND hwnd) {
-    MessageBoxWarningSimple(hwnd, L"Not Yet Implemented!", L"NYI");
-}
-
-HICON HwndGetIcon(HWND hwnd) {
-    HICON res = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0);
-    return res;
-}
-
-void HwndPositionToTheRightOf(HWND hwnd, HWND hwndRelative) {
-    Rect rHwnd = HwndWindowRect(hwnd);
-    Rect rHwndRelative = HwndWindowRect(hwndRelative);
-    rHwnd.x = rHwndRelative.x + rHwndRelative.dx;
-    rHwnd.y = rHwndRelative.y;
-    // position hwnd vertically in the middle of hwndRelative
-    int dyDiff = rHwndRelative.dy - rHwnd.dy;
-    if (dyDiff > 0) {
-        rHwnd.y += dyDiff / 2;
-    }
-    Rect r = ShiftRectToWorkArea(rHwnd, hwndRelative, true);
-    SetWindowPos(hwnd, nullptr, r.x, r.y, 0, 0, SWP_NOZORDER | SWP_NOSIZE);
-}
-
-bool DestroyIconSafe(HICON* h) {
-    if (!h || !*h) {
-        return false;
-    }
-    auto res = ::DestroyIcon(*h);
-    *h = nullptr;
-    return ToBool(res);
-}
-
-void HdcFillRectWithBkColor(HDC hdc, const Rect& rect) {
-    RECT r = ToRECT(rect);
-    ExtTextOutW(hdc, 0, 0, ETO_OPAQUE, &r, nullptr, 0, nullptr);
-}
-
-HGLOBAL StrToHGLOBAL(Str s, UINT flags) {
-    int cb = len(s) + 1;
-    return MemToHGLOBAL((void*)s.s, cb, flags);
-}
-
 LARGE_INTEGER TimeNow() {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     return now;
-}
-
-double TimeDiffSecs(const LARGE_INTEGER& start, const LARGE_INTEGER& end) {
-    LARGE_INTEGER freq;
-    QueryPerformanceFrequency(&freq);
-    auto diff = end.QuadPart - start.QuadPart;
-    double res = (double)diff / (double)freq.QuadPart;
-    return res;
-}
-
-double TimeDiffMs(const LARGE_INTEGER& start, const LARGE_INTEGER& end) {
-    LARGE_INTEGER freq;
-    QueryPerformanceFrequency(&freq);
-    auto diff = end.QuadPart - start.QuadPart;
-    double res = (double)diff / (double)freq.QuadPart;
-    return res * 1000;
-}
-
-SavedDCState SaveDCState(HWND hwnd) {
-    SavedDCState state = {};
-    state.hwnd = hwnd;
-    state.hdc = GetDC(hwnd);
-    HFONT hFont = (HFONT)SendMessageW(hwnd, WM_GETFONT, 0, 0);
-    if (hFont) {
-        state.oldFont = (HFONT)SelectObject(state.hdc, hFont);
-    }
-    return state;
-}
-
-void RestoreDCState(SavedDCState* state) {
-    if (state->oldFont) {
-        SelectObject(state->hdc, state->oldFont);
-    }
-    ReleaseDC(state->hwnd, state->hdc);
-}
-
-int HdcMeasureStringWidth(HDC hdc, WStr str) {
-    return HdcGetTextExtentPoint32(hdc, str).dx;
-}
-
-Str GetAppLocalDataDirTemp() {
-    wchar_t* path = nullptr;
-    HRESULT hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &path);
-    if (FAILED(hr) || !path) {
-        return {};
-    }
-    Str result = ToUtf8Temp(WStr(path));
-    CoTaskMemFree(path);
-    return result;
 }
 
 void DeferWinPosHelper::MoveWindow(HWND hWnd, int x, int y, int cx, int cy, BOOL bRepaint) {
@@ -3733,10 +3151,105 @@ void DeferWinPosHelper::MoveWindow(HWND hWnd, int x, int y, int cx, int cy, BOOL
     this->SetWindowPos(hWnd, nullptr, x, y, cx, cy, uFlags);
 }
 
-void UpdateBitmapColors(HBITMAP hbmp, Color textColor, Color bgColor, Color linkColor, Vec<Rect>* skipRects) {
-    Pixmap pixmap{};
-    pixmap.hbmp = hbmp;
-    RecolorPixmap(&pixmap, textColor, bgColor, linkColor, skipRects);
+// Build id of a PE file: the CodeView PDB GUID and age (what symbol servers key
+// on, new on every link), or timestamp and image size without a debug directory.
+// Maps the file and touches only its headers, unlike hashing the whole exe.
+static TempStr PeBuildIdFromImage(const u8* d, size_t size) {
+    auto in = [&](size_t off, size_t n) { return off <= size && n <= size - off; };
+    if (!in(0, sizeof(IMAGE_DOS_HEADER))) {
+        return {};
+    }
+    auto dos = (const IMAGE_DOS_HEADER*)d;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return {};
+    }
+    size_t ntOff = (size_t)dos->e_lfanew;
+    size_t fileHdrOff = ntOff + sizeof(DWORD);
+    size_t optOff = fileHdrOff + sizeof(IMAGE_FILE_HEADER);
+    if (!in(ntOff, sizeof(DWORD)) || *(const DWORD*)(d + ntOff) != IMAGE_NT_SIGNATURE || !in(optOff, sizeof(WORD))) {
+        return {};
+    }
+    auto fh = (const IMAGE_FILE_HEADER*)(d + fileHdrOff);
+    if (!in(optOff, fh->SizeOfOptionalHeader)) {
+        return {};
+    }
+
+    const IMAGE_DATA_DIRECTORY* dirs;
+    DWORD nDirs;
+    DWORD sizeOfImage;
+    WORD magic = *(const WORD*)(d + optOff);
+    if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC && fh->SizeOfOptionalHeader >= sizeof(IMAGE_OPTIONAL_HEADER64)) {
+        auto o = (const IMAGE_OPTIONAL_HEADER64*)(d + optOff);
+        dirs = o->DataDirectory;
+        nDirs = o->NumberOfRvaAndSizes;
+        sizeOfImage = o->SizeOfImage;
+    } else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC && fh->SizeOfOptionalHeader >= sizeof(IMAGE_OPTIONAL_HEADER32)) {
+        auto o = (const IMAGE_OPTIONAL_HEADER32*)(d + optOff);
+        dirs = o->DataDirectory;
+        nDirs = o->NumberOfRvaAndSizes;
+        sizeOfImage = o->SizeOfImage;
+    } else {
+        return {};
+    }
+    TempStr res = fmt("%08x%08x", (u32)fh->TimeDateStamp, (u32)sizeOfImage);
+    if (nDirs <= IMAGE_DIRECTORY_ENTRY_DEBUG) {
+        return res;
+    }
+
+    // the debug directory is given as an RVA: locate its section for the file offset
+    IMAGE_DATA_DIRECTORY dbg = dirs[IMAGE_DIRECTORY_ENTRY_DEBUG];
+    size_t secOff = optOff + fh->SizeOfOptionalHeader;
+    if (!in(secOff, (size_t)fh->NumberOfSections * sizeof(IMAGE_SECTION_HEADER))) {
+        return res;
+    }
+    auto secs = (const IMAGE_SECTION_HEADER*)(d + secOff);
+    size_t dbgOff = 0;
+    for (int i = 0; i < fh->NumberOfSections; i++) {
+        const IMAGE_SECTION_HEADER& s = secs[i];
+        if (dbg.VirtualAddress >= s.VirtualAddress && dbg.VirtualAddress < s.VirtualAddress + s.SizeOfRawData) {
+            dbgOff = (size_t)dbg.VirtualAddress - s.VirtualAddress + s.PointerToRawData;
+            break;
+        }
+    }
+    if (dbgOff == 0 || !in(dbgOff, dbg.Size)) {
+        return res;
+    }
+
+    struct CvRsds {
+        DWORD sig;
+        GUID guid;
+        DWORD age;
+    };
+    constexpr DWORD kRsdsSig = 0x53445352; // "RSDS"
+    auto entries = (const IMAGE_DEBUG_DIRECTORY*)(d + dbgOff);
+    int nEntries = (int)(dbg.Size / sizeof(IMAGE_DEBUG_DIRECTORY));
+    for (int i = 0; i < nEntries; i++) {
+        const IMAGE_DEBUG_DIRECTORY& e = entries[i];
+        if (e.Type != IMAGE_DEBUG_TYPE_CODEVIEW || !in(e.PointerToRawData, sizeof(CvRsds))) {
+            continue;
+        }
+        auto cv = (const CvRsds*)(d + e.PointerToRawData);
+        if (cv->sig != kRsdsSig) {
+            continue;
+        }
+        char hex[33];
+        auto g = (const u8*)&cv->guid;
+        for (int k = 0; k < 16; k++) {
+            sprintf_s(hex + 2 * k, 3, "%02x", g[k]);
+        }
+        return fmt("%s%x", Str(hex), (u32)cv->age);
+    }
+    return res;
+}
+
+TempStr GetPeBuildIdTemp(Str path) {
+    file::Mapping m;
+    if (!file::MemoryMap(path, &m)) {
+        return {};
+    }
+    TempStr res = PeBuildIdFromImage(m.data, (size_t)m.size);
+    file::MemoryUnmap(&m);
+    return res;
 }
 
 #endif

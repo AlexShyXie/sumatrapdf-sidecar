@@ -2,6 +2,7 @@
    License: GPLv3 */
 
 #include "gui/GpuiBridge.h"
+#include "VirtKeys.h"
 #include "base/UITask.h"
 #include "gui/UIModels.h"
 #include "Settings.h"
@@ -9,6 +10,7 @@
 #include "DocController.h"
 #include "EngineBase.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "SumatraPDF.h"
 #include "Translations.h"
@@ -39,6 +41,8 @@ constexpr float kScriptLabelMaxDx = 240;
 constexpr float kScriptListDx = 300;
 constexpr float kScriptListRowDy = 28;
 constexpr float kScriptListInsetDx = 8;
+// what the list adds to the window: the list (its inset inside) and the hairline
+constexpr float kScriptListWinDx = kScriptListDx + 1;
 constexpr float kScriptListRadius = 4;
 constexpr int kScriptListSelShift = 28;
 constexpr float kScriptCodeFontPx = 14;
@@ -291,14 +295,30 @@ void PDFScriptView::OnHelp(PDFScriptView*, gp::Ctx*, const gp::ClickEvent*) {
     LaunchDocumentation(StrL(kPDFScriptHelpDocUri));
 }
 
+static float gScriptPendingDx = 0;
+
+// from the ui task queue: resizing renders the window, which frees the
+// handlers of the click that is still being dispatched
+static void ScriptApplyPendingDx() {
+    float extra = gScriptPendingDx;
+    gScriptPendingDx = 0;
+    gp::Window* gw = gScript.tw ? ToolWindowGpui(gScript.tw) : nullptr;
+    if (!gw || extra == 0) {
+        return;
+    }
+    gp::WinSize ws = gp::WindowSize(gw);
+    ToolWindowSetClientSize(gScript.tw, Size((int)(ws.dipW + extra + 0.5f), (int)(ws.dipH + 0.5f)));
+}
+
 // the list beside the editor; the window grows and shrinks with it
 void PDFScriptView::OnExamples(PDFScriptView*, gp::Ctx* cx, const gp::ClickEvent*) {
     gScript.showExamples = !gScript.showExamples;
     if (gScript.tw) {
-        gp::WinSize ws = gp::WindowSize(cx->win);
-        float extra = kScriptListDx + 2 * kScriptListInsetDx + 1;
-        float dx = ws.dipW + (gScript.showExamples ? extra : -extra);
-        ToolWindowSetClientSize(gScript.tw, Size((int)(dx + 0.5f), (int)(ws.dipH + 0.5f)));
+        bool posted = gScriptPendingDx != 0;
+        gScriptPendingDx += gScript.showExamples ? kScriptListWinDx : -kScriptListWinDx;
+        if (!posted) {
+            uitask::Post(MkFunc0Void(ScriptApplyPendingDx), "ScriptApplyPendingDx");
+        }
     }
     gp::Notify(cx);
 }
@@ -344,13 +364,7 @@ static gp::El* ScriptLabel(gp::Ctx* cx, Str label) {
 }
 
 static gp::El* ScriptGhostButton(gp::Ctx* cx, Str id, Str label, gp::Listener onClick, bool disabled = false) {
-    return gpc::Button::New(cx, GpuiDup(cx->a, id))
-        ->Label(GpuiDup(cx->a, label))
-        ->Ghost()
-        ->WithSize(gp::UiSize::Small)
-        ->Disabled(disabled)
-        ->OnClick(onClick)
-        ->IntoEl();
+    return DlgGhostButton(cx, GpuiDup(cx->a, id), label, onClick, disabled);
 }
 
 static gp::El* ScriptCodeBox(gp::Ctx* cx, gp::El* editor) {
@@ -420,7 +434,6 @@ static gp::El* ScriptColumn(gp::Ctx* cx, float editorDy) {
                           ->Fg(ToGpui(colMuted));
         col->Child(ScriptCodeBox(cx, out));
     }
-    col->Child(DlgHairline(cx));
 
     gp::El* footer = gp::Div(cx->a)
                          ->FlexRow()
@@ -511,7 +524,7 @@ static float ScriptFixedDy() {
     if (len(FromGpui(gp::InputValue(gScript.output))) > 0) {
         dy += 1 + 2 * kToolDlgFilesPadDy + kScriptOutputLines * kScriptOutputLineDy;
     }
-    dy += 1 + 2 * kToolDlgFootPadDy + kDlgBtnDy;
+    dy += 2 * kToolDlgFootPadDy + kDlgBtnDy;
     return dy;
 }
 
@@ -525,15 +538,9 @@ gp::El* PDFScriptDialogBuild(MainWindow* win, gp::Ctx* cx) {
         float editorDy = std::max(kScriptEditorMinDy, ws.dipH - ScriptFixedDy());
         result = gp::Div(cx->a)->FlexCol()->SizeFull()->Child(ScriptColumns(cx, editorDy));
     } else {
-        float dx = kScriptDlgDx + (gScript.showExamples ? kScriptListDx + 2 * kScriptListInsetDx + 1 : 0);
-        auto* dlg = gpc::Dialog::New(cx)
-                        ->Open(true)
-                        ->Title(ToGpui(ScriptTitle()))
-                        ->Body(ScriptColumns(cx, kScriptFrameEditorDy))
-                        ->Footer(gp::Div(cx->a)->H(0))
-                        ->W(dx)
-                        ->OnClose(gp::ListenTo(gScriptView, &PDFScriptView::OnCancel));
-        result = DlgIntoEl(cx, dlg);
+        float dx = kScriptDlgDx + (gScript.showExamples ? kScriptListWinDx : 0);
+        result = DlgFrameCard(cx, ScriptColumns(cx, kScriptFrameEditorDy), ScriptTitle(), dx,
+                              gp::ListenTo(gScriptView, &PDFScriptView::OnCancel));
     }
     if (gScript.wantFocus) {
         gp::InputFocus(gScript.script, cx->app, cx->win);

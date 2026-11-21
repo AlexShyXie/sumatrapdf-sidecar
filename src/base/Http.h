@@ -17,12 +17,18 @@ struct HttpProgress {
 
 bool IsHttpRspOk(const HttpRsp*);
 
-bool HttpPost(Str server, int port, Str url, str::Builder* headers, str::Builder* data);
 bool HttpGet(Str url, HttpRsp* rspOut);
 bool HttpGetToFile(Str url, Str destFilePath, const Func1<HttpProgress*>& cbProgress, i64 maxSize = -1);
 
 bool HttpPostUrl(Str url, Str contentType, Str extraHeaders, Str body, HttpRsp* rspOut);
 TempStr HttpNormalizeHeadersTemp(Str headers);
+
+#if OS_WIN
+bool OnlineURLAllowed(Str url);
+bool HttpGetWithHeaders(Str url, Str extraHeaders, HttpRsp* rspOut);
+bool HttpPostUrlNoRedirect(Str url, Str contentType, Str extraHeaders, Str body, HttpRsp* rspOut);
+bool HttpDownloadWithHeaders(Str url, Str extraHeaders, Str destPath, HttpRsp* rspOut);
+#endif
 
 // How much URL-encoded text we're willing to put in a URL. ShellExecuteW hands
 // the URL to the browser as a command line, so the hard ceiling is
@@ -31,3 +37,24 @@ TempStr HttpNormalizeHeadersTemp(Str headers);
 constexpr int kMaxUrlEncodedLen = 8192;
 
 TempStr URLEncodeMayTruncateTemp(Str s, int maxEncodedLen = 0, bool* didTruncateOut = nullptr);
+
+struct HttpStreamSink {
+    virtual ~HttpStreamSink() = default;
+    virtual void OnStatus(int status) = 0;
+    virtual bool OnData(Str bytes) = 0;
+    virtual bool IsCanceled() = 0;
+};
+
+struct HttpStreamCancel {
+    void Cancel();
+    bool IsCanceled();
+
+  private:
+    AtomicBool canceled = 0;
+#if OS_WIN
+    AtomicPtr request = nullptr;
+    friend bool HttpPostStream(Str, Str, Str, HttpStreamSink*, HttpStreamCancel*);
+#endif
+};
+
+bool HttpPostStream(Str url, Str headers, Str body, HttpStreamSink* sink, HttpStreamCancel* cancel);

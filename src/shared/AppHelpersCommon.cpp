@@ -15,11 +15,17 @@
 #include "DisplayMode.h"
 #include "DocController.h"
 #include "EngineBase.h"
+#include "DisplayModel.h"
+#include "ProgressUpdateUI.h"
+#include "TextSelection.h"
+#include "TextSearch.h"
 #include "Annotation.h"
 #include "FormFields.h"
 #include "Theme.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
+#include "WindowTab.h"
 #include "AppTools.h"
 #include "AnnotFilterToolbar.h"
 #include "FindBar.h"
@@ -42,6 +48,62 @@ void FreeTabGroup(TabGroup* group) {
         delete group->tabFiles;
     }
     free(group);
+}
+
+// Makes group's documents those of win, in tab order.
+void SetTabGroupFiles(TabGroup* group, MainWindow* win) {
+    if (!group->tabFiles) {
+        group->tabFiles = new Vec<TabFile*>();
+    }
+    for (auto* tf : *group->tabFiles) {
+        str::Free(tf->path);
+        free(tf);
+    }
+    VecReset(*group->tabFiles);
+    for (WindowTab* tab : win->Tabs()) {
+        if (tab->IsAboutTab() || tab->IsHexTab() || len(tab->filePath) == 0) {
+            continue;
+        }
+        auto* tf = AllocStruct<TabFile>();
+        str::ReplaceWithCopy(&tf->path, tab->filePath);
+        VecAppend(*group->tabFiles, tf);
+    }
+}
+
+// An AutoSync group follows win's tabs from now on; any other group unlinks it.
+void LinkTabGroup(MainWindow* win, TabGroup* group) {
+    win->syncedTabGroup = (group && group->autoSync) ? group : nullptr;
+}
+
+// Copies the window's tabs into its AutoSync group. The group can be gone
+// (deleted, or the settings were reloaded) or no longer AutoSync: then the
+// window stops following it.
+void SyncTabGroup(MainWindow* win) {
+    TabGroup* group = win->syncedTabGroup;
+    if (!group) {
+        return;
+    }
+    Vec<TabGroup*>* groups = gSettings->tabGroups;
+    if (!groups || VecFind(*groups, group) < 0 || !group->autoSync) {
+        win->syncedTabGroup = nullptr;
+        return;
+    }
+    SetTabGroupFiles(group, win);
+}
+
+void SyncTabGroups() {
+    for (MainWindow* win : gWindows) {
+        SyncTabGroup(win);
+    }
+}
+
+// what the tab group lists show next to a group's name: "4 tabs, synced"
+TempStr TabGroupInfoTemp(TabGroup* group) {
+    int n = group->tabFiles ? len(*group->tabFiles) : 0;
+    if (group->autoSync) {
+        return fmt(Tr("%d tabs, synced").s, n);
+    }
+    return fmt("%d tabs", n);
 }
 
 Str ScrollbarModeDisplayName(int idx) {
@@ -67,6 +129,48 @@ int FindMatchIndex(MainWindow* win, int page, int glyph) {
         }
     }
     return -1;
+}
+
+// list index of the match the document is currently on (so the selection can
+// track the current match), or -1 if it isn't in the list
+int FindCurrentMatchIndex(MainWindow* win) {
+    if (win->ctrl && win->ctrl->CanFindInPage()) {
+        // tracked by the browser (chm / markdown) webview find
+        return win->browserFindCurrent;
+    }
+    DisplayModel* dm = win->AsFixed();
+    if (!dm || !dm->textSearch || dm->textSearch->result.len == 0) {
+        return -1;
+    }
+    return FindMatchIndex(win, dm->textSearch->startPage, dm->textSearch->startGlyph);
+}
+
+// first match at/after the current page, wrapping to the start of the document
+// if there is none: the match with the smallest forward page distance from the
+// current page (the list itself is in document order)
+int FindFirstMatchFromPage(MainWindow* win) {
+    int n = len(win->findMatches);
+    if (n == 0) {
+        return -1;
+    }
+    int curPage = win->ctrl ? win->ctrl->CurrentPageNo() : 1;
+    int nPages = win->ctrl ? win->ctrl->PageCount() : 1;
+    int best = 0;
+    int bestDist = INT_MAX;
+    for (int i = 0; i < n; i++) {
+        int dist = win->findMatches[i].startPage - curPage;
+        if (dist < 0) {
+            dist += nPages;
+        }
+        if (dist < bestDist) {
+            bestDist = dist;
+            best = i;
+            if (dist == 0) {
+                break; // first match on the current page
+            }
+        }
+    }
+    return best;
 }
 
 // the field's on-screen font height in pixels: the /DA font size (PDF points)
@@ -204,4 +308,68 @@ void ShowSaveTabGroupDialog(MainWindow* win) {
 
 void ShowOpenTabGroupDialog(MainWindow* win) {
     ShowTabGroupsDialog(win, TabGroupDialogMode::Open);
+}
+
+// find the saved state for a lazy tab by file path. Because gInitialSessionData
+// is kept in sync with the live session, this never matches a closed window;
+// per-tab disambiguation (e.g. same file in two windows) comes from the more
+// reliable tab->tabState, which RememberSessionState prefers.
+TabState* FindSessionTabState(Str fp) {
+    if (!gInitialSessionData) {
+        return nullptr;
+    }
+    for (SessionData* psd : *gInitialSessionData) {
+        for (TabState* pts : *psd->tabStates) {
+            if (str::Eq(pts->filePath, fp)) {
+                return pts;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// lazy tabs borrow tab->tabState from gInitialSessionData. After we replace that
+// snapshot, repoint those pointers so the next SaveSettings() does not clone freed
+// TabState objects
+void RefreshLazyTabStatePointers() {
+    int sdIdx = 0;
+    for (MainWindow* win : gWindows) {
+        bool hasFileTab = false;
+        for (WindowTab* tab : win->Tabs()) {
+            if (tab->filePath) {
+                hasFileTab = true;
+                break;
+            }
+        }
+        if (!hasFileTab) {
+            continue;
+        }
+        SessionData* sd = nullptr;
+        if (gInitialSessionData && sdIdx < len(*gInitialSessionData)) {
+            sd = (*gInitialSessionData)[sdIdx++];
+        }
+        for (WindowTab* tab : win->Tabs()) {
+            if (len(tab->filePath) == 0) {
+                continue;
+            }
+            // by path, not position: the snapshot skips tabs that had no state
+            TabState* ts = nullptr;
+            if (sd) {
+                for (TabState* cand : *sd->tabStates) {
+                    if (str::Eq(cand->filePath, tab->filePath)) {
+                        ts = cand;
+                        break;
+                    }
+                }
+            }
+            if (!ts) {
+                ts = FindSessionTabState(tab->filePath);
+            }
+            if (!tab->ctrl && tab->tabState) {
+                // null when the new snapshot has nothing to borrow: the old one
+                // was just freed and must not be left dangling
+                tab->tabState = ts;
+            }
+        }
+    }
 }

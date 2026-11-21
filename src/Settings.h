@@ -186,6 +186,12 @@ struct Theme {
     // text color of a highlighted notification tip; if empty, derived from
     // the colors above
     ParsedColor notificationHighlightTextColor;
+    // background of the citation hover preview's frame; if empty, pale
+    // yellow in light themes, HotBackgroundColor in dark ones
+    ParsedColor hoverPreviewBackgroundColor;
+    // border color of the citation hover preview; if empty, uses
+    // HotEdgeColor
+    ParsedColor hoverPreviewEdgeColor;
     // if true, apply the theme colors to Windows controls and window areas
     // too
     bool colorizeControls;
@@ -203,6 +209,9 @@ struct TabGroup {
     Str name;
     // documents that belong to this tab group
     Vec<TabFile*>* tabFiles;
+    // if true, the group follows the tabs of the window it was saved from
+    // or restored into
+    bool autoSync;
 };
 
 // pages of this document bookmarked in the Favorites menu
@@ -280,7 +289,7 @@ struct FileState {
     // by the crypt key (64 chars); only applies to PDF documents
     Str decryptionKey;
     // what the sidebar's top panel shows: bookmarks (the default),
-    // thumbnails or favorites
+    // thumbnails, favorites, signatures or layers
     Str sidebarView;
     // how pages are laid out for this document. The string is the
     // persisted form of DisplayModel::displayMode, so it's parsed after
@@ -293,6 +302,13 @@ struct FileState {
     ParsedColor bgCol;
     // if given, overrides the tab color for this document
     ParsedColor tabCol;
+    // visibility of the PDF's layers (optional content groups), if
+    // changed: 1 (shown) or 0 (hidden) for each layer, in document order
+    Str layerStates;
+    // unit name for calibrated measurements
+    Str measurementUnit;
+    // calibrated measurement units per document coordinate; 0 uses points
+    float measurementScale;
     // how often the document was opened, halved every week so that the
     // Frequently Read list reflects what's relevant now instead of what
     // used to be opened a lot
@@ -305,6 +321,12 @@ struct FileState {
     int pageCount;
     // how far pages have been rotated as a multiple of 90 degrees
     int rotation;
+    // brightness of rendered pages, -100 to 100; 0 leaves them unchanged.
+    // Set with CmdAdjustBrightness
+    int brightness;
+    // contrast of rendered pages, -100 to 100; 0 leaves them unchanged.
+    // Set with CmdAdjustContrast
+    int contrast;
     // state of the window. 1 is normal, 2 is maximized, 3 is fullscreen, 4
     // is minimized
     int windowState;
@@ -339,9 +361,23 @@ struct FileState {
     bool uniformPageWidth;
     // if true, empty margins around page content are trimmed from display
     bool trimEmptyMargins;
+    // part of every page that is shown, set with CmdTrimPagesToSelection;
+    // all zeros shows whole pages
+    RectF userCrop;
     // if true, the view can be panned past the page edges, so any part of
     // a page can be brought to the center of the window
     bool freePan;
+    // if true, facing and book view move one page at a time: pages 1-2,
+    // then 2-3, then 3-4
+    bool facingStepOne;
+    // if true, pages are shown (and printed) mirrored left to right
+    bool mirror;
+    // Automatically Scroll speed for this document, in pixels per second;
+    // 0 uses the global ReadingAutoScrollSpeed
+    float readingAutoScrollSpeed;
+    // if true, scrolling reads a two-column page down its left column,
+    // then its right one (View / Read Columns)
+    bool readColumns;
 };
 
 // a subset of FileState required for restoring the state of a single
@@ -364,12 +400,21 @@ struct TabState {
     // if true, the table of contents was shown when the document was
     // closed
     bool showToc;
-    // what the sidebar's top panel showed: bookmarks, thumbnails or
-    // favorites
+    // what the sidebar's top panel showed: bookmarks, thumbnails,
+    // favorites, signatures or layers
     Str sidebarView;
     // which table of contents items were expanded (see FileStates ->
     // TocState)
     Vec<int>* tocState;
+    // tabs with the same number form a group in the tab strip; 0 if the
+    // tab is in none
+    int group;
+    // name of the tab's group
+    Str groupName;
+    // color of the tab's group
+    ParsedColor groupColor;
+    // if true, the tab's group was collapsed
+    bool groupCollapsed;
 };
 
 // windows and tabs still open when SumatraPDF was last closed; reopened
@@ -417,6 +462,10 @@ struct PrinterDefaults {
     // (e.g. 300 for a 300 dpi scan whose file doesn't say); 0 uses the
     // resolution recorded in the file
     float printDpi;
+    // default for the Print dialog's Rotate wide pages to fit the paper:
+    // if true, a page wider than it is tall is turned 90° to fill the
+    // paper
+    bool autoRotate;
 };
 
 // customization options for how forward search results are shown (used
@@ -537,6 +586,28 @@ struct AntiGravity {
     // prompt for permissions with -p)
     bool autoApprove;
     // background color of the Antigravity chat panel
+    ParsedColor bgColor;
+};
+
+// settings for an OpenAI-compatible Chat Completions provider
+struct CustomAI {
+    // display name of the OpenAI-compatible chat provider
+    Str name;
+    // OpenAI-compatible API base URL, such as https://api.deepseek.com/v1
+    Str baseURL;
+    // environment variable holding the API key; takes precedence over
+    // ApiKey
+    Str apiKeyEnv;
+    // API key; prefer ApiKeyEnv, which keeps it out of this file
+    Str apiKey;
+    // model ID accepted by the provider
+    Str model;
+    // additional model IDs, comma-separated
+    Str models;
+    // send the current page's text to the configured provider with each
+    // question
+    bool includeCurrentPage;
+    // background color of the custom AI chat panel
     ParsedColor bgColor;
 };
 
@@ -661,8 +732,10 @@ struct ComicBookUI {
     bool landscapeAsSpread;
 };
 
-// measurement grid overlay (View > Page Grid). Spacing and style are
-// saved; showing the grid is session-only
+// measurement grid overlay (View > Page Grid). Spacing, slant and style
+// are saved; showing the grid is session-only. Drag a grid line while
+// Configure Page Grid is open, or Alt+drag, to resize cells with equal
+// width and height
 struct PageGrid {
     // distance between major vertical grid lines, in PDF points (1/72
     // inch)
@@ -675,6 +748,9 @@ struct PageGrid {
     float offsetX;
     // vertical origin offset from the bottom of the page, in PDF points
     float offsetY;
+    // angle of the vertical grid lines from the rightward horizontal, in
+    // degrees. 90 is upright; 52 to 60 leans right for calligraphy
+    float slant;
     // color of the page grid overlay
     ParsedColor color;
     // grid overlay style: dots (marks at intersections), dotted (dotted
@@ -710,10 +786,13 @@ struct FixedPageUI {
     // to give a subconscious sense of reading progress. Suggested values:
     // #2828aa #28aa28 #aa2828
     Vec<Str>* gradientColors;
-    // if given, sets the canvas background color for PDF files
+    // if given, sets the canvas background color for PDF, DjVu and XPS
+    // files
     ParsedColor windowBgCol;
-    // measurement grid overlay (View > Page Grid). Spacing and style are
-    // saved; showing the grid is session-only
+    // measurement grid overlay (View > Page Grid). Spacing, slant and
+    // style are saved; showing the grid is session-only. Drag a grid line
+    // while Configure Page Grid is open, or Alt+drag, to resize cells with
+    // equal width and height
     PageGrid pageGrid;
 };
 
@@ -811,6 +890,10 @@ struct Annotations {
     // Image stamps on the page. If not set, or the file is missing, Sign
     // With Image asks for an image
     Str signatureImage;
+    // font size of the card that shows an annotation's text when it is
+    // clicked, in pixels; 0 uses UIFontSize. Not scaled by the display
+    // scaling
+    int popupFontSize;
 };
 
 // reading bar (View menu): a horizontal band on the page to keep your
@@ -834,6 +917,9 @@ struct MarkdownUI {
     // if true, use MuPDF (cmark-gfm) to render markdown; if false, use
     // WebView2 browser view when available
     bool useFixedPageUI;
+    // if true, preserve source line breaks in the Markdown browser view;
+    // false uses standard Markdown paragraph wrapping
+    bool preserveLineBreaks;
 };
 
 // customization options for HTML UI. If UseFixedPageUI is true, MuPDF
@@ -849,10 +935,17 @@ struct Settings {
     // what the sidebar's bottom panel shows: favorites (the default),
     // bookmarks or thumbnails
     Str sidebarBottomView;
+    // if false, opening a document with errors doesn't show the Errors in
+    // document notification. Show Errors stays in the context menu
+    bool showDocumentErrors;
     // if true, a PDF without an outline gets a table of contents built
     // from numbered headings in its text (Generate Table Of Contents
     // command does it on demand)
     bool autoGenerateTOC;
+    // if false, lines in documents are drawn one pixel wide, whatever
+    // their width, like Acrobat's Line Weights turned off. Only on screen.
+    // Toggle with CmdToggleLineWeights
+    bool showLineWeights;
     // list of handlers for selected text, shown in context menu when text
     // selection is active. See [docs for more
     // information](https://www.sumatrapdfreader.org/docs/Customize-search-translation-services)
@@ -924,6 +1017,11 @@ struct Settings {
     // where the toolbar is placed: top or bottom (applies to both show and
     // overlay modes)
     Str toolbarPosition;
+    // where Toggle Page Info (i) shows the page information: notification
+    // (or legacy), a tip over the document; bottom, a bar below the
+    // document with more about the file and the page; bottom-overlay, the
+    // same bar drawn over the bottom of the document
+    Str pageInfoLocation;
     // scrollbar mode: windows (standard Windows scrollbar), smart (overlay
     // scrollbar with auto-hide), overlay (always visible overlay
     // scrollbar), hidden (no scrollbars)
@@ -1021,6 +1119,8 @@ struct Settings {
     CodexBuild codexBuild;
     // settings for the Antigravity chat sidebar
     AntiGravity antiGravity;
+    // settings for an OpenAI-compatible Chat Completions provider
+    CustomAI customAI;
     // appearance of the AI chat sidebar, shared by all backends
     AIChat aiChat;
     // customization options for the ebook UI (EPUB, MOBI, FB2, PDB and
@@ -1051,20 +1151,35 @@ struct Settings {
     // 3.0), 1 is normal speed; can also be changed from the Read Aloud
     // playback bar
     float readAloudSpeed;
+    // color of the line Read Aloud draws under the sentence being read
+    // (beside it in vertical text)
+    ParsedColor readAloudSentenceColor;
+    // color of the line Read Aloud draws under the word being read (beside
+    // it in vertical text)
+    ParsedColor readAloudWordColor;
     // pixels per second for Automatically Scroll (View menu /
-    // Ctrl+Shift+H). 8 to 320; also changed from the auto-scroll bar and
+    // Ctrl+Shift+H). 1 to 320; also changed from the auto-scroll bar and
     // the arrow keys while scrolling
     float readingAutoScrollSpeed;
+    // Automatically Scroll pauses after scrolling this many minutes; 0
+    // scrolls until the end of the document
+    float readingAutoScrollMinutes;
     // reading bar (View menu): a horizontal band on the page to keep your
     // place. Highlight fills the band; Invert dims everything else
     ReadingBar readingBar;
     // maximum width of a single tab, in pixels at 100% display scaling (at
     // least 60)
     int tabWidth;
+    // if true, all tabs are equally wide. If false, a tab is as wide as
+    // its file name needs, up to TabWidth
+    bool tabsEqualWidth;
     // if both the favorites and the bookmarks part of the sidebar are
     // visible, this is the height of the bookmarks (table of contents)
     // part, in screen pixels
     int tocDy;
+    // if the sidebar's middle panel is visible, this is its height, in
+    // screen pixels
+    int sidebarMiddleDy;
     // size of the toolbar icons in pixels at 100% display scaling (8-64);
     // the toolbar itself is a few pixels taller
     int toolbarSize;
@@ -1079,6 +1194,10 @@ struct Settings {
     // percentage of the current zoom level. If 0 or negative, zooming
     // steps through ZoomLevels instead
     float zoomIncrement;
+    // Fit Width (and Fit Visible) fit the pages to this percentage of the
+    // window's width, centered: e.g. 40 to read in the middle of a wide
+    // screen. 20 to 100
+    int fitWidthPercent;
     // width of the AI chat sidebar (0 = use default); shared by Claude
     // Code, Grok Build, and OpenAI Codex (internal)
     int aiChatSidebarDx;
@@ -1123,11 +1242,14 @@ struct Settings {
     bool escToExit;
     // if true, show the full path to the document in the title bar
     bool fullPathInTitle;
-    // if true, restoring a session delays loading each document until its
-    // tab is selected
+    // if true, restoring a session delays loading each document, and any
+    // access to its file, until its tab is selected
     bool lazyLoading;
     // if true, doesn't open Home tab
     bool noHomeTab;
+    // if true, doesn't offer to download the caj2pdf converter. CAJ files
+    // open only if it's already downloaded
+    bool noCaj2pdfConverterDownload;
     // if true, the home page lists documents by how often they've been
     // opened (the pre-3.6 behavior); if false, the most recently opened
     // come first
@@ -1135,6 +1257,26 @@ struct Settings {
     // if true, a document will be reloaded automatically whenever it's
     // changed (currently doesn't work for documents shown in the ebook UI)
     bool reloadModifiedDocuments;
+    // if true, opening a digitally signed PDF shows whether its signatures
+    // are valid
+    bool showSignatureStatus;
+    // certificate files (DER or PEM) trusted as roots for OFD signatures
+    Vec<Str>* ofdTrustedCertificates;
+    // if true, opening a file from a temporary folder (e.g. an Outlook
+    // attachment) shows a notification offering to copy it to a permanent
+    // folder. Closing that notification sets this to false
+    bool temporaryFileShowNotification;
+    // folder that files from a temporary folder are copied to. When empty
+    // or not a folder, Copy Temporary File to Permanent Folder asks for
+    // one and remembers it here
+    Str temporaryFileDestDir;
+    // folder that Open from URL... saves downloaded files to. When empty,
+    // the dialog offers the Downloads folder and remembers the folder used
+    // here
+    Str downloadDirectory;
+    // if true and TemporaryFileDestDir is set, a file from a temporary
+    // folder is copied there when it opens, and opened from there
+    bool temporaryFileAutoMove;
     // if true, keep a history of opened documents and their display
     // settings (FileStates); closing a document doesn't remove it from the
     // history. Also required for saving SessionData
@@ -1145,9 +1287,19 @@ struct Settings {
     // if true, documents that were still open when the last window was
     // closed (SessionData) are reopened at startup
     bool restoreSession;
+    // if true, a document of the restored session that no longer exists
+    // keeps its tab, which shows that the file is missing; if false, its
+    // tab is dropped at startup
+    bool keepMissingSessionTabs;
     // if true, open documents in the already running SumatraPDF instead of
     // starting a new one
     bool reuseInstance;
+    // what happens when opening a document already open, or reusing a
+    // window, on another virtual desktop: switch switches to that desktop,
+    // move pulls the window onto the current desktop, copy opens the
+    // document again on the current desktop. a new window always opens on
+    // the current desktop (Windows 10+)
+    Str openOnOtherDesktop;
     // if true, show the menu bar (F9 toggles it; the choice is remembered
     // across sessions)
     bool showMenubar;
@@ -1175,20 +1327,34 @@ struct Settings {
     // if true, show the sidebar's bottom panel: Favorites, unless
     // SidebarBottomView says otherwise
     bool showFavorites;
+    // if true, and the sidebar's top and bottom panels are visible, show a
+    // middle panel between them with the view neither of them shows
+    bool showSidebarMiddle;
     // if true, favorites within each file are sorted alphabetically by
     // name (or page label); if false (the default), they are sorted by
     // page number
     bool sortFavoritesByName;
+    // if true, favorites within each file keep the order set in Edit
+    // Favorites and new ones are added at the end; set by moving a
+    // favorite there, cleared by Sort By Name
+    bool favoritesManualOrder;
     // if true, show the table of contents (Bookmarks) sidebar when the
     // document has one
     bool showToc;
     // if true, every document with bookmarks opens with the Bookmarks
     // sidebar, even one that was closed with it hidden
     bool alwaysShowSidebar;
+    // if true, a document without bookmarks (and with more than one page)
+    // opens with the sidebar showing page thumbnails
+    bool showThumbnailsIfNoToc;
     // if true, put the bookmarks / favorites sidebar on the right of the
     // window (left is the default; right-to-left UI languages already put
     // it on the right)
     bool sidebarOnRight;
+    // if true, the bookmarks / favorites sidebar takes no space: it slides
+    // over the document when the mouse reaches the window's edge and hides
+    // when the mouse leaves it
+    bool sidebarAutoHide;
     // what showing / hiding the bookmarks / favorites sidebar does to the
     // window: empty or keep (the window keeps its size and position, the
     // document area shrinks), or grow (the window grows by the sidebar
@@ -1208,6 +1374,10 @@ struct Settings {
     // (useful for drawings with many links); if false, clicking a link
     // follows it
     bool disableLinks;
+    // if true, dragging with the left mouse button where there is no text
+    // selects text instead of panning the page. Shift + left drag, right
+    // drag and the scrollbars still pan
+    bool disableLeftDragPan;
     // if true, Space in File Explorer (or on the desktop) previews the
     // selected file in a popup window, like macOS Quick Look. Esc or Space
     // closes it; Left / Right open the previous / next file in the folder.
@@ -1224,6 +1394,9 @@ struct Settings {
     // still scrolls, Shift + wheel scrolls horizontally and Ctrl + wheel
     // zooms
     bool mouseWheelTurnsPage;
+    // if true, the mouse wheel scrolls (and turns pages) the other way, as
+    // natural scrolling does; Ctrl + wheel zoom is unchanged
+    bool invertMouseWheel;
     // if true, in single page / facing / book view, scrolling past the top
     // or bottom of a zoomed-in page goes to the previous / next page; if
     // false, scrolling stops at the edge and the page is changed only by
@@ -1245,6 +1418,9 @@ struct Settings {
     // if true, show page numbers (labels) right-aligned on bookmark /
     // table-of-contents entries
     bool showTocPageNumbers;
+    // if true, long bookmark / table-of-contents entries wrap to the
+    // sidebar's width instead of being cut off
+    bool tocWrapText;
     // if true, show a list of frequently read documents when no document
     // is loaded
     bool showStartPage;
@@ -1256,6 +1432,10 @@ struct Settings {
     // if true, continuous view has extra scroll room after the last page
     // so you can scroll the end of the document to the top of the window
     bool paddingAfterLastPage;
+    // if true, continuous view stacks the next page where the bottom of a
+    // rotated page points: left after Rotate Right, right after Rotate
+    // Left, up after a half turn. Off, the next page stays below
+    bool continuousScrollFollowsRotation;
     // if true, going to a destination (clicking a bookmark or a link
     // inside the document) keeps the current zoom instead of applying the
     // zoom the destination asks for; it still goes to the page and the
@@ -1268,6 +1448,10 @@ struct Settings {
     // ForwardSearch. Off when the destination is only a page with no
     // position
     bool highlightLinkDestination;
+    // if true, Find Next / Find Previous blinks a ring around the found
+    // text a few times, so it's easy to spot on a busy page. The color
+    // matches ForwardSearch
+    bool flashFindMatch;
     // if true, mouse wheel scrolling is faster when mouse is over a
     // scrollbar
     bool fastScrollOverScrollbar;
@@ -1289,6 +1473,9 @@ struct Settings {
     bool useSysColors;
     // if true, documents are opened in tabs instead of new windows
     bool useTabs;
+    // show the caption; when hidden, hover at the top to reveal it. Toggle
+    // with Shift+F8
+    bool showCaption;
     // if true, a small floating toolbar with selection actions (copy, read
     // aloud, highlight etc.) pops up after selecting text. Set to false to
     // disable it
@@ -1309,6 +1496,12 @@ struct Settings {
     HtmlUI htmlUI;
     // if true, check once a day whether an update is available
     bool checkForUpdates;
+    // API key for SumatraPDF Web. Set from File / Link SumatraPDF Web. Do
+    // not share the settings file.
+    Str onlineApiKey;
+    // an empty value means the public SumatraPDF Web site. The dialog does
+    // not edit it.
+    Str onlineServer;
 };
 // for parsing themes
 struct Themes {
@@ -1323,7 +1516,7 @@ struct FieldInfo;
 struct StructInfo;
 extern const StructInfo gFavoriteInfo;
 extern const StructInfo gFileEBookUIInfo;
-extern const FieldInfo gFileStateFields[26];
+extern const FieldInfo gFileStateFields[36];
 extern StructInfo gFileStateInfo;
 extern const StructInfo gTabStateInfo;
 extern const StructInfo gSessionDataInfo;

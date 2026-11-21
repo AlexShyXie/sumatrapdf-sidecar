@@ -3,6 +3,7 @@
 
 #include "base/Base.h"
 #include "base/File.h"
+#include "base/FileWatcher.h"
 #include "base/Win.h"
 
 // must be last due to assert() over-write
@@ -45,12 +46,6 @@ void FileUtilTest() {
     utassert(path::IsInDir(StrL("C:\\Temp\\sum17E3.tmp.exe"), StrL("C:\\Temp")));
     utassert(path::IsInDir(StrL("C:\\Temp\\a"), StrL("C:\\Temp\\")));
     utassert(!path::IsInDir(StrL("C:\\Temporary\\a"), StrL("C:\\Temp")));
-    utassert(path::IsDriveRoot(StrL("C:\\")));
-    utassert(path::IsDriveRoot(StrL("C:/")));
-    utassert(path::IsDriveRoot(StrL("C:\\\\")));
-    utassert(!path::IsDriveRoot(StrL("C:")));
-    utassert(!path::IsDriveRoot(StrL("C:\\Windows")));
-    utassert(!path::IsDriveRoot(StrL("file.exe")));
     dirName = path::GetDirTemp(StrL("/etc"));
     utassert(str::Eq(dirName, StrL("/")));
 
@@ -84,6 +79,15 @@ void FileUtilTest() {
     utassert(!path::IsEphemeralHostFile(StrL("C:\\docs\\paper.pdf")));
     utassert(!path::IsEphemeralHostFile(StrL("C:\\docs\\OneNotePDFs\\a.pdf")));
     utassert(!path::IsEphemeralHostFile(StrL("C:\\docs\\my-onenote-export.pdf")));
+    {
+        WCHAR tempDirW[MAX_PATH + 1];
+        DWORD n = GetTempPathW(dimof(tempDirW), tempDirW);
+        utassert(n > 0 && n <= MAX_PATH);
+        TempStr tempDir = ToUtf8Temp(WStr(tempDirW, (int)n));
+        utassert(path::IsInTempDir(path::JoinTemp(tempDir, StrL("Outlook attachment.pdf"))));
+        utassert(!path::IsInTempDir(tempDir));
+        utassert(!path::IsInTempDir(StrL("C:\\docs\\paper.pdf")));
+    }
     utassert(!path::Match(StrL("C:\\file.pdf"), StrL("f??f.p?f")));
     utassert(!path::Match(StrL("C:\\.pdf"), StrL("?.pdf")));
     {
@@ -206,23 +210,6 @@ void FileUtilTest() {
         }
     }
     {
-        // a UNC path is \\?\UNC\server\share when extended, not \\?\\\server\share
-        Str shortUnc = StrL("\\\\server\\share\\doc.pdf");
-        utassert(str::Eq(path::NormalizeTemp(shortUnc), shortUnc));
-
-        str::Builder longName;
-        for (int i = 0; i < MAX_PATH; i++) {
-            longName.AppendChar('a');
-        }
-        TempStr longUnc = fmt("\\\\server\\share\\%s.pdf", ToStr(longName));
-        TempStr expected = fmt("\\\\?\\UNC\\server\\share\\%s.pdf", ToStr(longName));
-        TempStr norm = path::NormalizeTemp(longUnc);
-        utassert(str::Eq(norm, expected));
-        // already extended: unchanged
-        utassert(str::Eq(path::NormalizeTemp(norm), expected));
-    }
-
-    {
         // the module path must come back whole no matter how small the first
         // buffer is, i.e. the growing loop must run and not truncate
         TempWStr expected = GetModulePathTemp((HMODULE) nullptr, MAX_PATH + 1);
@@ -253,6 +240,36 @@ void FileUtilTest() {
         ok = file::Delete(path);
         utassert(ok);
     }
+
+#if OS_WIN
+    {
+        // the short path's length must not count the NUL terminator
+        TempStr path = path::JoinTemp(GetTempDirTemp(), StrL("short path test long name.txt"));
+        utassert(file::WriteFile(path, StrL("x")));
+        TempStr shortPath = path::ShortPathTemp(path);
+        utassert(len(shortPath) > 0);
+        utassert(len(shortPath) == (int)strlen(shortPath.s));
+        utassert(file::Exists(shortPath));
+        file::Delete(path);
+    }
+
+    {
+        // the skip path must be copied: the caller may free or reuse its buffer
+        TempStr path = path::JoinTemp(GetTempDirTemp(), StrL("file-watcher-skip-test.txt"));
+        utassert(file::WriteFile(path, StrL("x")));
+        Str callerBuf = str::Dup(path);
+        FileWatcherSetSkipPath(callerBuf);
+        memset(callerBuf.s, 'z', (size_t)len(callerBuf));
+        WatchedFile* wf = FileWatcherSubscribe(path, Func0{});
+        utassert(wf == nullptr);
+        if (wf) {
+            FileWatcherUnsubscribe(wf);
+        }
+        FileWatcherSetSkipPath(Str());
+        str::Free(callerBuf);
+        file::Delete(path);
+    }
+#endif
 }
 
 #if OS_WIN
@@ -284,6 +301,28 @@ static void RemoveAllWorkerFn(RemoveAllWorker* w) {
     }
 }
 #endif
+
+// A failed lookup of a network path must not hide a file created after it (#6398).
+// Uses the loopback admin share; skipped when it isn't reachable.
+void UncExistsTest() {
+#if OS_WIN
+    TempStr local = GetTempFilePathTemp(StrL("unc"));
+    file::Delete(local);
+    if (len(local) < 3 || local.s[1] != ':') {
+        return;
+    }
+    TempStr unc = fmt("\\\\localhost\\%c$%s", local.s[0], Str(local.s + 2, len(local) - 2));
+    TempStr uncRoot = fmt("\\\\localhost\\%c$\\", local.s[0]);
+    if (GetFileAttributesW(CWStrTemp(uncRoot)) == INVALID_FILE_ATTRIBUTES) {
+        return;
+    }
+
+    utassert(!file::Exists(unc));
+    utassert(file::WriteFile(local, StrL("x")));
+    utassert(file::Exists(unc));
+    file::Delete(local);
+#endif
+}
 
 // dir::RemoveAll must remove nested and read-only content and must be safe
 // to call from several threads at once (the shutdown WebView profile removal

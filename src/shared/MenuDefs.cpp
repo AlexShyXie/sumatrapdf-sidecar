@@ -19,6 +19,7 @@
 #include "SumatraConfig.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Commands.h"
 #include "ExternalViewers.h"
@@ -54,6 +55,10 @@ MenuDef menuDefFileOpen[] = {
         CmdOpenFileWithSumatraFilePicker,
     },
     {
+        TrN("Open from &URL..."),
+        CmdOpenFromURL,
+    },
+    {
         TrN("Use SumatraPDF File Picker"),
         CmdToggleFilePicker,
     },
@@ -61,6 +66,21 @@ MenuDef menuDefFileOpen[] = {
         StrL(kMenuSeparator),
         0,
     },
+#if OS_WASM
+    // the folder is the stored documents (/uploads)
+    {
+        TrN("&Next Document"),
+        CmdOpenNextFileInFolder,
+    },
+    {
+        TrN("&Previous Document"),
+        CmdOpenPrevFileInFolder,
+    },
+    {
+        TrN("&Browse Documents..."),
+        CmdNavigateFilesInFolder,
+    },
+#else
     {
         TrN("&Next File In Folder"),
         CmdOpenNextFileInFolder,
@@ -73,6 +93,7 @@ MenuDef menuDefFileOpen[] = {
         TrN("&Browse Files In Folder..."),
         CmdNavigateFilesInFolder,
     },
+#endif
     {
         {},
         0,
@@ -127,6 +148,10 @@ MenuDef menuDefFile[] = {
     {
         TrN("&Print..."),
         CmdPrint,
+    },
+    {
+        TrN("Lin&k SumatraPDF Web..."),
+        CmdSumatraPDFWeb,
     },
     {
         StrL(kMenuSeparator),
@@ -244,6 +269,30 @@ MenuDef menuDefView[] = {
         CmdToggleTrimEmptyMargins,
     },
     {
+        TrN("Trim Pages To Selection"),
+        CmdTrimPagesToSelection,
+    },
+    {
+        TrN("Show Whole Pages"),
+        CmdShowWholePages,
+    },
+    {
+        TrN("Save Trimmed Pages As..."),
+        CmdSaveTrimmedPagesAs,
+    },
+    {
+        TrN("Read &Columns"),
+        CmdToggleReadColumns,
+    },
+    {
+        TrN("Read Columns: Show &Whole Page"),
+        CmdToggleColumnsWholePage,
+    },
+    {
+        TrN("View As &Hex"),
+        CmdViewAsHex,
+    },
+    {
         StrL(kMenuSeparator),
         0,
     },
@@ -254,6 +303,10 @@ MenuDef menuDefView[] = {
     {
         TrN("Rotate &Right"),
         CmdRotateRight,
+    },
+    {
+        TrN("Mirror Pages"),
+        CmdToggleMirror,
     },
     {
         StrL(kMenuSeparator),
@@ -296,6 +349,10 @@ MenuDef menuDefView[] = {
         CmdToggleToolbar,
     },
     {
+        TrN("Show Caption"),
+        CmdToggleCaption,
+    },
+    {
         TrN("&Highlight Form Fields"),
         CmdToggleHighlightFormFields,
     },
@@ -310,6 +367,10 @@ MenuDef menuDefView[] = {
     {
         TrN("Configure Page Grid..."),
         CmdConfigurePageGrid,
+    },
+    {
+        TrN("Measure"),
+        CmdMeasure,
     },
     {
         StrL(kMenuSeparator),
@@ -330,6 +391,10 @@ MenuDef menuDefView[] = {
     {
         TrN("Antigravity chat"),
         CmdAIChatWithAntiGravity,
+    },
+    {
+        TrN("Custom AI"),
+        CmdAIChatWithCustomAPI,
     },
     {
         {},
@@ -359,6 +424,14 @@ MenuDef menuDefGoTo[] = {
     {
         TrN("Pa&ge..."),
         CmdGoToPage,
+    },
+    {
+        TrN("Next &Chapter"),
+        CmdGoToNextChapter,
+    },
+    {
+        TrN("Previous C&hapter"),
+        CmdGoToPrevChapter,
     },
     {
         StrL(kMenuSeparator),
@@ -502,10 +575,6 @@ MenuDef menuDefThemes[] = {
 
 //[ ACCESSKEY_GROUP Settings Menu
 MenuDef menuDefSettings[] = {
-#if 0
-    { TrN("Contribute Translation"),       CmdContributeTranslation },
-    { StrL(kMenuSeparator),                       0                  },
-#endif
     {
         TrN("&Settings..."),
         CmdOptions,
@@ -569,6 +638,10 @@ MenuDef menuDefFavorites[] = {
     {
         TrN("Show Favorites in Tab"),
         CmdFavoriteShowInTab,
+    },
+    {
+        TrN("Edit Favorites..."),
+        CmdEditFavorites,
     },
     {
         StrL(kMenuSeparator),
@@ -651,6 +724,14 @@ MenuDef menuDefDebug[] = {
     {
         StrL("Show notification"),
         CmdDebugShowNotif,
+    },
+    {
+        StrL("Show crash minidumps"),
+        CmdDebugShowCrashMiniDumps,
+    },
+    {
+        StrL("Show downloaded fonts"),
+        CmdDebugShowDownloadedFonts,
     },
     {
         {},
@@ -900,6 +981,10 @@ MenuDef menuDefContextAnnotations[] = {
         kMenuSeparatorID,
     },
     {
+        TrN("Edit Annotation Text"),
+        CmdEditAnnotationText,
+    },
+    {
         TrN("Cut Annotation"),
         CmdCutAnnotation,
     },
@@ -969,6 +1054,14 @@ MenuDef menuDefContextImage[] = {
         CmdResizeImage,
     },
     {
+        TrN("Re&place Image..."),
+        CmdReplaceImage,
+    },
+    {
+        TrN("Edit Image in &Another App"),
+        CmdEditImageExternally,
+    },
+    {
         TrN("Convert page to &PDF"),
         CmdConvertImageToPdf,
     },
@@ -1002,6 +1095,10 @@ MenuDef menuDefDocumentAIChat[] = {
         CmdAIChatWithAntiGravity,
     },
     {
+        TrN("Custom AI"),
+        CmdAIChatWithCustomAPI,
+    },
+    {
         {},
         0,
     },
@@ -1023,7 +1120,7 @@ MenuDef menuDefDocumentOperations[] = {
         CmdDocumentShowOutline,
     },
     {
-        TrN("Extract Pages From PDF"),
+        TrN("Extract Pages"),
         CmdPdfExtractPages,
     },
     {
@@ -1079,8 +1176,16 @@ MenuDef menuDefDocumentOperations[] = {
         CmdConvertToPDF,
     },
     {
-        TrN("Convert PDF to Images..."),
+        TrN("Convert to Images..."),
         CmdConvertPdfToImages,
+    },
+    {
+        TrN("Convert EPUB to PDF..."),
+        CmdConvertEpubToPdf,
+    },
+    {
+        TrN("Convert CAJ to PDF..."),
+        CmdConvertCajToPDF,
     },
     {
         TrN("Show in fo&lder"),
@@ -1127,6 +1232,21 @@ MenuDef menuDefContextStart[] = {
 
 //] ACCESSKEY_GROUP Context Menu (Start)
 
+static MenuDef menuDefContextTabDuplicate[] = {
+    {
+        TrN("In New Window"),
+        CmdDuplicateInNewWindow,
+    },
+    {
+        TrN("In New Tab"),
+        CmdDuplicateInNewTab,
+    },
+    {
+        {},
+        0,
+    },
+};
+
 MenuDef menuDefContextTab[] = {
     // these top items are removed unless the document has unsaved changes;
     // text matches the "Unsaved changes" close dialog
@@ -1159,8 +1279,8 @@ MenuDef menuDefContextTab[] = {
         CmdCopyFilePath,
     },
     {
-        TrN("Open In New Window"),
-        CmdDuplicateInNewWindow,
+        TrN("Duplicate"),
+        (UINT_PTR)menuDefContextTabDuplicate,
     },
     {
         TrN("Change Tab Color"),
@@ -1194,6 +1314,19 @@ MenuDef menuDefContextTab[] = {
         StrL(kMenuSeparator),
         0,
     },
+    // each app puts an "Add Tab to Group" submenu after this one
+    {
+        TrN("Add Tab to New Group"),
+        CmdStripGroupNew,
+    },
+    {
+        TrN("Remove Tab from Group"),
+        CmdStripGroupRemoveTab,
+    },
+    {
+        StrL(kMenuSeparator),
+        0,
+    },
     {
         TrN("Save Tab Group"),
         CmdTabGroupSave,
@@ -1201,6 +1334,35 @@ MenuDef menuDefContextTab[] = {
     {
         TrN("Restore Tab Group"),
         CmdTabGroupRestore,
+    },
+    {
+        {},
+        0,
+    },
+};
+
+// right-click on a strip group's chip
+MenuDef menuDefStripGroup[] = {
+    {
+        TrN("Rename Group..."),
+        CmdStripGroupRename,
+    },
+    // each app puts a "Group Color" submenu after this one
+    {
+        TrN("Collapse Group"),
+        CmdStripGroupToggle,
+    },
+    {
+        StrL(kMenuSeparator),
+        0,
+    },
+    {
+        TrN("Ungroup"),
+        CmdStripGroupUngroup,
+    },
+    {
+        TrN("Close Group"),
+        CmdStripGroupClose,
     },
     {
         {},
@@ -1232,6 +1394,14 @@ MenuDef menuDefContextToc[] = {
     {
         TrN("Collapse Same Level"),
         CmdTocCollapseSameLevel,
+    },
+    {
+        TrN("Expand Chapter"),
+        CmdTocExpandChapter,
+    },
+    {
+        TrN("Collapse Chapter"),
+        CmdTocCollapseChapter,
     },
     {
         TrN("Expand to Current Page"),
@@ -1276,6 +1446,10 @@ MenuDef menuDefContextFav[] = {
     {
         TrN("Sort By Name"),
         CmdToggleFavoritesSort,
+    },
+    {
+        TrN("Edit Favorites..."),
+        CmdEditFavorites,
     },
     {
         StrL(kMenuSeparator),

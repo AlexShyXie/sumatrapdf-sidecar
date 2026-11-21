@@ -1168,6 +1168,7 @@
     <ClInclude Include="..\src\shared\LitDoc.h" />
     <ClInclude Include="..\src\shared\PdfCad.h" />
     <ClInclude Include="..\src\shared\PdfDarkMode.h" />
+    <ClInclude Include="..\src\shared\RtfDoc.h" />
     <ClInclude Include="..\src\shared\TextSearch.h" />
     <ClInclude Include="..\src\shared\TextSelection.h" />
     <ClInclude Include="..\src\shared\gui\UIModels.h" />
@@ -1193,10 +1194,13 @@
     <ClCompile Include="..\src\shared\MobiDoc.cpp" />
     <ClCompile Include="..\src\shared\PalmDbReader.cpp" />
     <ClCompile Include="..\src\shared\PdfCad.cpp" />
+    <ClCompile Include="..\src\shared\RtfDoc.cpp" />
     <ClCompile Include="..\src\shared\TextSearch.cpp" />
     <ClCompile Include="..\src\shared\TextSelection.cpp" />
     <ClCompile Include="..\src\shared\WebpReader.cpp" />
     <ClCompile Include="..\src\shared\gui\UIModels.cpp" />
+    <ClCompile Include="..\src\shared\tools\TestEnginesCommon.cpp" />
+    <ClCompile Include="..\src\shared\tools\ToolLog.cpp" />
     <ClCompile Include="..\src\tools\test_engines.cpp" />
   </ItemGroup>
   <ItemGroup>

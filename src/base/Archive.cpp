@@ -427,18 +427,30 @@ Archive::FileInfo* Archive::GetFileDataById(int fileId) {
     if (fileId < 0) {
         return nullptr;
     }
-    ReportIf(fileId >= len(fileInfos_));
+    if (ReportIf(fileId >= len(fileInfos_))) {
+        return {};
+    }
     auto* fi = fileInfos_[fileId];
     ReportIf(fi->fileId != fileId);
-    if (fi->data || fi->failed) {
-        return fi; // cached, or already tried
+    {
+        ScopedMutex lock(&extractLock_);
+        while (fi->extracting) {
+            extracted_.Wait(&extractLock_);
+        }
+        if (fi->data || fi->failed) {
+            return fi; // cached, or already tried
+        }
+        fi->extracting = true;
     }
     bool permanent;
     Str d = ReadEntry(fi, fi->fileSizeUncompressed, &permanent);
+    ScopedMutex lock(&extractLock_);
     fi->data = d.s;
     if (!d.s && permanent) {
         fi->failed = true;
     }
+    fi->extracting = false;
+    extracted_.WakeAll();
     return fi;
 }
 
@@ -446,16 +458,27 @@ Str Archive::GetFileDataPartById(int fileId, int sizeHint) {
     if (fileId < 0) {
         return {};
     }
-    ReportIf(fileId >= len(fileInfos_));
+    if (ReportIf(fileId >= len(fileInfos_))) {
+        return {};
+    }
     auto* fi = fileInfos_[fileId];
     int n = std::min(fi->fileSizeUncompressed, sizeHint);
+    // unrar decodes the whole entry even for a prefix, so cache it whole
+    if (LoadedUsingUnrarDll()) {
+        GetFileDataById(fileId);
+    }
     // if full data is cached, return a copy of the prefix
-    if (fi->data) {
+    char* cached;
+    {
+        ScopedMutex lock(&extractLock_);
+        cached = fi->data;
+    }
+    if (cached) {
         u8* data = AllocArray<u8>(n + kZeroPaddingCount);
         if (!data) {
             return {};
         }
-        memcpy(data, fi->data, (size_t)n);
+        memcpy(data, cached, (size_t)n);
         return Str((char*)data, n);
     }
     bool permanent;
@@ -735,17 +758,5 @@ bool Archive::OpenUnrarFallback(Str, bool, const ArchiveExtractProgressCb&) {
 #endif
 
 #if OS_WIN
-FILETIME Archive::FileInfo::GetWinFileTime() const {
-    FILETIME ft = {(DWORD)-1, (DWORD)-1};
-    LocalFileTimeToFileTime((FILETIME*)&fileTime, &ft);
-    return ft;
-}
 #else
-FILETIME Archive::FileInfo::GetWinFileTime() const {
-    if (fileTime < 0) {
-        return {(DWORD)-1, (DWORD)-1};
-    }
-    u64 ticks = kFileTimeUnixEpoch + (u64)fileTime * kFileTimeTicksPerSec;
-    return FileTimeFromU64(ticks);
-}
 #endif

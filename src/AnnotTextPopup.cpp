@@ -26,6 +26,7 @@
 #include "AppSettings.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 
 #include "AnnotTextPopup.h"
@@ -118,7 +119,8 @@ static void PaintPopupBg(AnnotTextPopup*, VirtHostPaintEvent* ev) {
 }
 
 static void PostedHidePopup(MainWindow* win) {
-    AnnotTextPopup* popup = win ? win->annotTextPopup : nullptr;
+    // the window may have been closed since the hide was queued
+    AnnotTextPopup* popup = IsMainWindowValid(win) ? win->annotTextPopup : nullptr;
     // clicking a second annotation kills the focus of the first card and then
     // opens a new one; without this the queued hide would close that new card
     if (!popup || !popup->closing) {
@@ -185,7 +187,6 @@ static AnnotTextPopup* GetOrCreatePopup(MainWindow* win) {
     }
     auto* popup = new AnnotTextPopup();
     popup->win = win;
-    popup->font = GetAppFontForDpi(DpiGetForHwnd(win->hwndCanvas));
 
     VirtHost::CreateArgs args;
     args.parent = win->hwndFrame;
@@ -372,6 +373,8 @@ bool ShowAnnotationTextPopup(MainWindow* win, Annotation* annot) {
         return false;
     }
     HideAnnotationTextPopup(win); // start from a clean card, keep the host
+    // looked up per show so an edited PopupFontSize applies to the next card
+    popup->font = GetAnnotPopupFontForDpi(DpiGetForHwnd(win->hwndCanvas));
 
     Edit::CreateArgs args;
     args.parent = popup->host->native;

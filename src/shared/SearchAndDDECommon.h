@@ -33,6 +33,19 @@ void AppendPageRectsToScreen(DisplayModel* dm, const Rect& clipRc, const FindMat
                              Vec<Rect>& out);
 void AppendTextSelScreenRects(DisplayModel* dm, const Rect& clipRc, Vec<TextSel>* sel, Vec<Rect>& out);
 bool LinkDestHighlightRect(DisplayModel* dm, int pageNo, RectF dest, Rect* out);
+struct OpenDdeArgs {
+    bool parsed = false;
+    TempStr filePath;
+    int newWindow = 0;
+    int setFocus = 0;
+    int forceRefresh = 0;
+    int inCurrentTab = 0;
+    Str next;
+};
+OpenDdeArgs ParseOpenDdeCmd(Str cmd);
+int ApplyOpenNewWindow(int newWindow, int inCurrentTab);
+int FindDebounceDelayMs(int nChars);
+TempStr ForwardSearchFailTextTemp(int ret, Str fileName, int line, int page);
 Str HandleSearchCmd(HWND hwnd, Str cmd, bool* ack);
 Str HandleGotoPageWordCmd(HWND hwnd, Str cmd, bool* ack);
 Str HandleGotoCmd(HWND hwnd, Str cmd, bool* ack);
@@ -68,6 +81,9 @@ struct FindMatchPaintRects {
 };
 
 struct FindMatchPaintCache {
+    // one cache for all windows: countEpoch counts per window
+    MainWindow* win = nullptr;
+    DisplayModel* dm = nullptr;
     int firstPage = 0;
     int lastPage = 0;
     int countEpoch = 0;
@@ -123,6 +139,7 @@ void FindResultsInstalled(MainWindow* win, bool gotSnippets);
 void FindCountShown(MainWindow* win);
 void FindStatusChanged(MainWindow* win);
 void HideFwdSearchMarkAfter(MainWindow* win, int delayMs);
+void ArmFindFlashTimer(MainWindow* win, int delayMs);
 MainWindow* WindowFromHwnd(HWND hwnd);
 MainWindow* LastActiveWindow();
 Str HandleAppRequestCmd(Str cmd, bool* ack, str::Builder& res);

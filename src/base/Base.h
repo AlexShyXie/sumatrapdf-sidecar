@@ -129,6 +129,7 @@
 #include <new>       // for placement new
 #include <algorithm> // for std::min, std::max
 #include <utility>   // for std::forward
+#include <type_traits>
 #if OS_POSIX
 // pthread.h first: glibc mutex structs have a field named __unused
 #include <pthread.h>
@@ -257,6 +258,17 @@ constexpr u64 kFileTimeUnixEpoch = 116444736000000000ULL;
 
 inline u64 FileTimeToU64(const FILETIME& ft) {
     return ((u64)ft.dwHighDateTime << 32) | (u64)ft.dwLowDateTime;
+}
+
+inline i64 FileAgeSec(FILETIME ft) {
+    FILETIME nowFt{};
+    GetSystemTimeAsFileTime(&nowFt);
+    u64 now = FileTimeToU64(nowFt);
+    u64 then = FileTimeToU64(ft);
+    if (then == 0 || then > now) {
+        return 0;
+    }
+    return (i64)((now - then) / kFileTimeTicksPerSec);
 }
 
 inline FILETIME FileTimeFromU64(u64 value) {
@@ -406,9 +418,14 @@ char (&DimofSizeHelper(T (&array)[N]))[N];
 // Note: I tried doing this via RaiseException(0x40000015, EXCEPTION_NONCONTINUABLE, 0, 0);
 // but it seemed to confuse callstack walking
 inline void CrashMe() {
+#if OS_WASM
+    // address 0 is valid wasm memory, so a null write doesn't fault
+    __builtin_trap();
+#else
     char* p = nullptr;
     // cppcheck-suppress nullPointer
     *p = 0; // NOLINT
+#endif
 }
 #if COMPILER_MSVC
 #pragma warning(pop)
@@ -436,13 +453,17 @@ extern void _uploadDebugReport(Str, Str, bool);
 #define STRINGIZE(x) STRINGIZE_(x)
 #define FILE_LINE __FILE__ ":" STRINGIZE(__LINE__)
 
-#define ReportIfCond(cond, condStr, fileLine, isCrash)                  \
-    __analysis_assume(!(cond));                                         \
-    do {                                                                \
-        if (cond) {                                                     \
-            _uploadDebugReport(StrL(condStr), StrL(fileLine), isCrash); \
-        }                                                               \
-    } while (0)
+// an expression, so the analysis assume must be one too (sal.h defines it empty)
+#ifdef _PREFAST_
+#define ReportAssumeNot(cond) __analysis_assume(!(cond))
+#else
+#define ReportAssumeNot(cond) ((void)0)
+#endif
+
+// evaluates to cond, so a release build can bail out too:
+// if (ReportIf(idx >= len)) { return; }
+#define ReportIfCond(cond, condStr, fileLine, isCrash) \
+    (ReportAssumeNot(cond), (cond) ? (_uploadDebugReport(StrL(condStr), StrL(fileLine), isCrash), true) : false)
 
 #define ReportIf(cond) ReportIfCond(cond, #cond, FILE_LINE, false)
 #if IS_DEBUG
@@ -453,8 +474,11 @@ extern void _uploadDebugReport(Str, Str, bool);
 // warns and clang-analyzer-deadcode.DeadStores reports a dead store, tempting
 // someone to "clean up" the variable and delete the debug assert with it.
 // Passing it to an empty inline function is a real read that costs nothing --
-// the call and the (side-effect-free) condition both optimize away.
-inline void ReportDebugIfNoOp(bool) {}
+// the call and the (side-effect-free) condition both optimize away. It returns
+// the condition so if (ReportDebugIf(...)) behaves the same in both builds.
+inline bool ReportDebugIfNoOp(bool cond) {
+    return cond;
+}
 #define ReportDebugIf(cond) ReportDebugIfNoOp(!!(cond))
 #endif
 
@@ -499,6 +523,55 @@ struct NonCopyable {
     NonCopyable& operator=(const NonCopyable&) = delete;
 };
 
+// A one-shot countdown advanced by a periodic tick, for code without OS timers.
+// Not armed until Arm(); Tick() reports expiry exactly once.
+struct Countdown {
+    int leftMs = -1;
+    void Arm(int ms) { leftMs = ms < 0 ? 0 : ms; }
+    void Cancel() { leftMs = -1; }
+    bool IsArmed() const { return leftMs >= 0; }
+    bool Tick(int elapsedMs) {
+        if (leftMs < 0) {
+            return false;
+        }
+        leftMs -= elapsedMs;
+        if (leftMs > 0) {
+            return false;
+        }
+        leftMs = -1;
+        return true;
+    }
+};
+
+// A background job sharing state with an owner that can go away while it runs
+// (a thumbnail cache and the window showing it). Whichever is done last frees
+// the state: Detach() (owner done) and Finish() (job done, back on the UI
+// thread) return true to that one. The job thread polls IsCanceled().
+struct BgJob {
+    AtomicBool canceled = 0;
+    bool running = false;
+    bool detached = false;
+
+    void Start() {
+        AtomicBoolSet(&canceled, false);
+        running = true;
+    }
+    void Cancel() { AtomicBoolSet(&canceled, true); }
+    void ClearCancel() { AtomicBoolSet(&canceled, false); }
+    bool IsCanceled() { return AtomicBoolGet(&canceled); }
+    bool IsRunning() const { return running; }
+    bool IsDetached() const { return detached; }
+    bool Detach() {
+        Cancel();
+        detached = true;
+        return !running;
+    }
+    bool Finish() {
+        running = false;
+        return detached;
+    }
+};
+
 template <typename T>
 T limitValue(T val, T min, T max) {
     if (min > max) {
@@ -507,7 +580,8 @@ T limitValue(T val, T min, T max) {
     return val < min ? min : (val > max ? max : val);
 }
 
-inline int ClampI(int x, int min, int max) {
+template <typename T>
+T ClampT(T x, T min, T max) {
     if (x < min) {
         x = min;
     }
@@ -515,26 +589,18 @@ inline int ClampI(int x, int min, int max) {
         x = max;
     }
     return x;
+}
+
+inline int ClampI(int x, int min, int max) {
+    return ClampT(x, min, max);
 }
 
 inline float ClampF(float x, float min, float max) {
-    if (x < min) {
-        x = min;
-    }
-    if (x > max) {
-        x = max;
-    }
-    return x;
+    return ClampT(x, min, max);
 }
 
 inline double ClampD(double x, double min, double max) {
-    if (x < min) {
-        x = min;
-    }
-    if (x > max) {
-        x = max;
-    }
-    return x;
+    return ClampT(x, min, max);
 }
 
 // return true if adding n to val overflows. Only valid for n > 0
@@ -554,39 +620,6 @@ struct VecStr {
     int cap;
     Str* els;
 };
-
-template <typename T>
-inline bool addSafe(T* valInOut, T n) {
-    if (n == 0 || *valInOut == 0) {
-        valInOut = 0;
-        return true;
-    }
-    ReportIf(n < 0);
-    ReportIf(*valInOut < 0);
-    T res = *valInOut + n;
-    if (res < *valInOut) {
-        return false;
-    }
-    *valInOut = res;
-    return true;
-}
-
-template <typename T>
-inline bool mulSafe(T* valInOut, T n) {
-    if (n == 0 || *valInOut == 0) {
-        *valInOut = 0;
-        return true;
-    }
-    ReportIf(n < 0);
-    ReportIf(*valInOut < 0);
-    T res = *valInOut * n;
-    if (res < *valInOut || res < n) {
-        // multiplication overflowed
-        return false;
-    }
-    *valInOut = res;
-    return true;
-}
 
 bool MemEq(const void* s1, const void* s2, int n);
 
@@ -1044,9 +1077,6 @@ using RectF = RectG<float>;
 
 Point ToPoint(PointF p);
 
-SizeF ToSizeFl(Size s);
-Size ToSize(SizeF s);
-
 RectF ToRectF(const Rect& r);
 Rect ToRect(const RectF& r);
 
@@ -1079,16 +1109,70 @@ int NormalizeRotation(int rotation);
 #if OS_WIN
 using ThreadId = DWORD;
 using ThreadHandle = HANDLE;
+#else
+using ThreadId = u64;
+ThreadId GetCurrentThreadId();
+#endif
+
+// Debug builds record which thread holds a Mutex / RecursiveMutex so code can
+// check a "caller holds X" precondition:
+// ReportDebugIf(!e->docLock.IsHeldByCurrentThread());
+// Release builds don't track it and IsHeldByCurrentThread() is always true.
+#if IS_DEBUG
+// only the holder writes it; depth > 1 for a re-entered RecursiveMutex
+struct LockOwner {
+    volatile ThreadId thread = 0;
+    int depth = 0;
+
+    void Enter() {
+        thread = GetCurrentThreadId();
+        depth++;
+    }
+    void Leave() {
+        if (--depth == 0) {
+            thread = 0;
+        }
+    }
+    bool IsCurrentThread() const { return thread == GetCurrentThreadId(); }
+};
+#define LOCK_OWNER_FIELD LockOwner owner;
+#define LOCK_OWNER_ENTER() owner.Enter()
+#define LOCK_OWNER_LEAVE() owner.Leave()
+#define LOCK_OWNER_IS_CURRENT() owner.IsCurrentThread()
+#else
+#define LOCK_OWNER_FIELD
+#define LOCK_OWNER_ENTER() (void)0
+#define LOCK_OWNER_LEAVE() (void)0
+#define LOCK_OWNER_IS_CURRENT() true
+#endif
+
+#if OS_WIN
 
 struct Mutex : NonCopyable {
     SRWLOCK lock = SRWLOCK_INIT;
+    LOCK_OWNER_FIELD
 
     Mutex() = default;
     ~Mutex() = default;
 
-    void Lock() { AcquireSRWLockExclusive(&lock); }
-    void Unlock() { ReleaseSRWLockExclusive(&lock); }
-    bool TryLock() { return TryAcquireSRWLockExclusive(&lock); }
+    void Lock() {
+        AcquireSRWLockExclusive(&lock);
+        LOCK_OWNER_ENTER();
+    }
+    void Unlock() {
+        LOCK_OWNER_LEAVE();
+        ReleaseSRWLockExclusive(&lock);
+    }
+    bool TryLock() {
+        if (!TryAcquireSRWLockExclusive(&lock)) {
+            return false;
+        }
+        LOCK_OWNER_ENTER();
+        return true;
+    }
+    bool IsHeldByCurrentThread() const { return LOCK_OWNER_IS_CURRENT(); }
+    void NoteLocked() { LOCK_OWNER_ENTER(); }
+    void NoteUnlocked() { LOCK_OWNER_LEAVE(); }
 };
 
 struct ConditionVariable : NonCopyable {
@@ -1097,7 +1181,12 @@ struct ConditionVariable : NonCopyable {
     ConditionVariable() = default;
     ~ConditionVariable() = default;
 
-    void Wait(Mutex* mutex) { SleepConditionVariableSRW(&cond, &mutex->lock, INFINITE, 0); }
+    // the wait releases the mutex, so it isn't held while asleep
+    void Wait(Mutex* mutex) {
+        mutex->NoteUnlocked();
+        SleepConditionVariableSRW(&cond, &mutex->lock, INFINITE, 0);
+        mutex->NoteLocked();
+    }
     void Wake() { WakeConditionVariable(&cond); }
     void WakeAll() { WakeAllConditionVariable(&cond); }
 };
@@ -1105,16 +1194,29 @@ struct ConditionVariable : NonCopyable {
 struct RecursiveMutex : NonCopyable {
     CRITICAL_SECTION lock;
 
+    LOCK_OWNER_FIELD
+
     RecursiveMutex() { InitializeCriticalSection(&lock); }
     ~RecursiveMutex() { DeleteCriticalSection(&lock); }
 
-    void Lock() { EnterCriticalSection(&lock); }
-    void Unlock() { LeaveCriticalSection(&lock); }
-    bool TryLock() { return TryEnterCriticalSection(&lock); }
+    void Lock() {
+        EnterCriticalSection(&lock);
+        LOCK_OWNER_ENTER();
+    }
+    void Unlock() {
+        LOCK_OWNER_LEAVE();
+        LeaveCriticalSection(&lock);
+    }
+    bool TryLock() {
+        if (!TryEnterCriticalSection(&lock)) {
+            return false;
+        }
+        LOCK_OWNER_ENTER();
+        return true;
+    }
+    bool IsHeldByCurrentThread() const { return LOCK_OWNER_IS_CURRENT(); }
 };
 #else
-using ThreadId = u64;
-
 struct ThreadHandlePosix;
 using ThreadHandle = ThreadHandlePosix*;
 
@@ -1124,9 +1226,26 @@ struct Mutex : NonCopyable {
     Mutex() = default;
     ~Mutex() = default;
 
-    void Lock() { pthread_mutex_lock(&lock); }
-    void Unlock() { pthread_mutex_unlock(&lock); }
-    bool TryLock() { return pthread_mutex_trylock(&lock) == 0; }
+    LOCK_OWNER_FIELD
+
+    void Lock() {
+        pthread_mutex_lock(&lock);
+        LOCK_OWNER_ENTER();
+    }
+    void Unlock() {
+        LOCK_OWNER_LEAVE();
+        pthread_mutex_unlock(&lock);
+    }
+    bool TryLock() {
+        if (pthread_mutex_trylock(&lock) != 0) {
+            return false;
+        }
+        LOCK_OWNER_ENTER();
+        return true;
+    }
+    bool IsHeldByCurrentThread() const { return LOCK_OWNER_IS_CURRENT(); }
+    void NoteLocked() { LOCK_OWNER_ENTER(); }
+    void NoteUnlocked() { LOCK_OWNER_LEAVE(); }
 };
 
 struct ConditionVariable : NonCopyable {
@@ -1135,7 +1254,12 @@ struct ConditionVariable : NonCopyable {
     ConditionVariable() = default;
     ~ConditionVariable() { pthread_cond_destroy(&cond); }
 
-    void Wait(Mutex* mutex) { pthread_cond_wait(&cond, &mutex->lock); }
+    // the wait releases the mutex, so it isn't held while asleep
+    void Wait(Mutex* mutex) {
+        mutex->NoteUnlocked();
+        pthread_cond_wait(&cond, &mutex->lock);
+        mutex->NoteLocked();
+    }
     void Wake() { pthread_cond_signal(&cond); }
     void WakeAll() { pthread_cond_broadcast(&cond); }
 };
@@ -1151,13 +1275,25 @@ struct RecursiveMutex : NonCopyable {
         pthread_mutexattr_destroy(&attr);
     }
     ~RecursiveMutex() { pthread_mutex_destroy(&lock); }
+    LOCK_OWNER_FIELD
 
-    void Lock() { pthread_mutex_lock(&lock); }
-    void Unlock() { pthread_mutex_unlock(&lock); }
-    bool TryLock() { return pthread_mutex_trylock(&lock) == 0; }
+    void Lock() {
+        pthread_mutex_lock(&lock);
+        LOCK_OWNER_ENTER();
+    }
+    void Unlock() {
+        LOCK_OWNER_LEAVE();
+        pthread_mutex_unlock(&lock);
+    }
+    bool TryLock() {
+        if (pthread_mutex_trylock(&lock) != 0) {
+            return false;
+        }
+        LOCK_OWNER_ENTER();
+        return true;
+    }
+    bool IsHeldByCurrentThread() const { return LOCK_OWNER_IS_CURRENT(); }
 };
-
-ThreadId GetCurrentThreadId();
 #endif
 
 // ng: counting semaphore. Windows has CreateSemaphore, posix has sem_t (with
@@ -1200,6 +1336,18 @@ void SleepInMs(int ms);
 // StartThread() runs the function inline and returns a handle that joins
 // immediately. RenderCache checks this and drains on the main thread instead.
 constexpr bool kHasThreads = OS_WASM == 0;
+
+// Without threads, long work runs on the UI thread in slices of about this
+// long, each posted with uitask::Post(), so the browser paints and handles
+// input in between
+constexpr int kUiSliceMs = 20;
+
+#if OS_WASM
+// A job that runs in slices stands in for a thread. This gives it a handle of
+// its own, so a slice can tell that its job was aborted or replaced. Close it
+// with SafeCloseThreadHandle(). WaitThread() doesn't wait for the job.
+ThreadHandle NewSlicedJobHandle();
+#endif
 
 void RunAsync(const Func0&, Str threadName = {});
 ThreadHandle StartThread(const Func0&, Str threadName = {});
@@ -1294,8 +1442,6 @@ struct Arena {
     u64 Pos();
     void PopTo(u64 pos);
     void Pop(u64 amt);
-    void* GetAvailableSpace(int* bufSizeOut);
-    void* CommitReserved(void* mem, int size);
 
     Arena() = delete;  // use ArenaNew()
     ~Arena() = delete; // use ArenaDelete()
@@ -1313,14 +1459,6 @@ void ArenaDelete(Arena* arena);
 
 ArenaSavepoint GetArenaSavepoint(Arena* arena);
 void RestoreArenaSavepoint(ArenaSavepoint temp);
-
-u32 ArenaPtrCompress(Arena* arena, void* ptr);
-void* ArenaPtrUncompress(Arena* arena, u32 compressed);
-
-template <typename T>
-inline T* ArenaPtrUncompress(Arena* arena, u32 compressed) {
-    return (T*)ArenaPtrUncompress(arena, compressed);
-}
 
 // Thread-local temporary arena, reset after each message loop iteration
 extern thread_local Arena* gTempArena;
@@ -1349,26 +1487,6 @@ struct AutoArenaSavepoint {
 extern Arena* gPermArena;
 Arena* GetPermArena();
 void DestroyPermArena();
-
-template <typename T>
-inline T* PushArrayNoZeroAligned(Arena* arena, u64 count, u64 align) {
-    return (T*)arena->Push(sizeof(T) * count, align, false);
-}
-
-template <typename T>
-inline T* PushArrayAligned(Arena* arena, u64 count, u64 align) {
-    return (T*)arena->Push(sizeof(T) * count, align, true);
-}
-
-template <typename T>
-inline T* PushArrayNoZero(Arena* arena, u64 count) {
-    return PushArrayNoZeroAligned<T>(arena, count, (alignof(T) > 8) ? alignof(T) : 8);
-}
-
-template <typename T>
-inline T* PushArray(Arena* arena, u64 count) {
-    return PushArrayAligned<T>(arena, count, (alignof(T) > 8) ? alignof(T) : 8);
-}
 
 void* Alloc(struct Arena* arena, int size);
 void Free(struct Arena* arena, void* mem);
@@ -1571,6 +1689,8 @@ int VecFind(const Vec<T>& v, const T& el, int startAt = 0);
 template <typename T>
 bool VecContains(const Vec<T>& v, const T& el);
 
+int FairShareCap(const Vec<int>& dx, int availDx);
+
 //--- the vec itself ---------------------------------------------------------
 
 template <typename T>
@@ -1607,7 +1727,12 @@ struct Vec {
         return *this;
     }
 
-    ~Vec() { VecReset(*this); }
+    ~Vec() {
+        // elements are copied and moved with memcpy / memmove; checked here, not at
+        // class scope, so a Vec of a not-yet-complete type can still be declared
+        static_assert(std::is_trivially_copyable_v<T>, "Vec<T> needs a trivially copyable T");
+        VecReset(*this);
+    }
 
     T& operator[](int idx) const {
         ReportIf(idx < 0);
@@ -1790,7 +1915,9 @@ void VecRemoveAt(Vec<T>& v, int idx) {
 
 template <typename T>
 T VecPopAt(Vec<T>& v, int idx) {
-    ReportIf(idx >= v.len);
+    if (ReportIf(idx < 0 || idx >= v.len)) {
+        return T{};
+    }
     T el = v.els[idx];
     VecRemoveAtN(v, idx, 1);
     return el;
@@ -1811,7 +1938,9 @@ void VecRemoveLast(Vec<T>& v) {
 
 template <typename T>
 T VecPop(Vec<T>& v) {
-    ReportIf(0 == v.len);
+    if (ReportIf(0 == v.len)) {
+        return T{};
+    }
     T el = v.els[v.len - 1];
     VecRemoveAtFast(v, v.len - 1);
     return el;
@@ -1850,6 +1979,9 @@ T& VecLast(const Vec<T>& v) {
 
 template <typename T>
 int VecFind(const Vec<T>& v, const T& el, int startAt) {
+    if (startAt < 0) {
+        startAt = 0;
+    }
     for (int i = startAt; i < v.len; i++) {
         if (v.els[i] == el) {
             return i;
@@ -1886,13 +2018,6 @@ void VecReverse(Vec<T>& v) {
     }
 }
 
-template <typename T, typename E>
-bool VecPush(Arena* arena, T& v, E el) {
-    if (!VecGrow(arena, v, 1)) return false;
-    v.els[v.len++] = el;
-    return true;
-}
-
 //--- Str.h ------------------------------------------------------------------
 
 #define kUtf8Bom "\xEF\xBB\xBF"
@@ -1901,10 +2026,6 @@ bool VecPush(Arena* arena, T& v, E el) {
 
 // Singly-linked string node; AllocStrNode places the string bytes immediately
 // after the node in one allocation (s.s points into that block).
-using StrArena = u32;
-StrArena StrArenaAlloc(Arena* a, int size);
-StrArena StrArenaDupStr(Arena* a, Str s);
-Str StrArenaToStr(Arena* a, StrArena sa);
 
 struct StrNode {
     StrNode* next = nullptr;
@@ -1994,7 +2115,6 @@ Str SliceFromCharLast(Str str, char c);
 int IndexOfChar(Str s, char c);
 int IndexOf(Str buf, Str toFind);
 int IndexOfI(Str s, Str toFind);
-int IndexOfAfter(Str s, Str needle);
 bool Cut(Str s, Str sep, Str* before, Str* after);
 bool CutChar(Str s, char c, Str* before, Str* after);
 bool CutCharLast(Str s, char c, Str* before, Str* after);
@@ -2022,7 +2142,6 @@ TempStr LFToCRLFTemp(Str s);
 int RemoveCharsInPlace(Str str, Str toRemove);
 
 int BufSet(Str dst, Str src);
-int BufAppend(Str dst, Str s);
 
 TempStr MemToHexTemp(Str buf);
 int HexDigitVal(char c);
@@ -2041,7 +2160,6 @@ int TrimWsBoth(Str& s);
 
 int BufSet(WCHAR* dst, int dstCchSize, Str src);
 
-WStr CastStrToWStr(Str s);
 } // namespace str
 
 namespace wstr {
@@ -2100,6 +2218,19 @@ TempStr GetFileNameTemp(Str url);
 
 using SeqStrings = const char*;
 
+// number of strings in a constexpr SeqStrings, for static_assert against an enum
+constexpr int SeqStrCount(SeqStrings s) {
+    int n = 0;
+    while (*s) {
+        while (*s) {
+            s++;
+        }
+        s++;
+        n++;
+    }
+    return n;
+}
+
 Str SeqStrFirst(SeqStrings strs);
 Str SeqStrNext(Str s);
 int SeqStrIndex(SeqStrings strs, Str toFind);
@@ -2123,9 +2254,7 @@ using SeqStrNum = const char*;
 
 TempStr SeqStrNumAt(SeqStrNum strs, int off, i64* numOut = nullptr);
 bool SeqStrNumAdvance(SeqStrNum strs, int& off, int* idxInOut = nullptr);
-int SeqStrNumIndex(SeqStrNum strs, Str toFind, i64* numOut);
 int SeqStrNumIndexIS(SeqStrNum strs, Str toFind, i64* numOut);
-TempStr SeqStrNumByIndex(SeqStrNum strs, int idx, i64* numOut);
 TempStr SeqStrNumStrByNumber(SeqStrNum strs, i64 num);
 
 // A Vec<C> that always keeps a NUL after the last char, so the storage is
@@ -2161,7 +2290,6 @@ struct BuilderT : Vec<C> {
     C RemoveAt(int idx, int count = 1);
     C RemoveLast();
     S TakeStr();
-    S TakeWStr() { return TakeStr(); }
     C LastChar() const;
     // Lend a buffer to start in, instead of the first allocation, the way
     // VecUseExternalBuffer() does. Must be empty with no storage yet. Appends
@@ -2183,13 +2311,11 @@ void BuilderUseExternalBuffer(Builder& b, WStr buf);
 bool BuilderReserve(Builder& b, int cap);
 } // namespace wstr
 
-void SeqStrNumAppend(str::Builder* b, Str s, i64 num);
-void SeqStrNumFinish(str::Builder* b);
-
 int ParseInt(Str s);
 i64 ParseInt64(Str s);
 bool IsValidProgramVersion(Str ver);
 int CompareProgramVersion(Str ver1, Str ver2);
+bool IsRtlCodepoint(int c);
 bool IsTextRtl(WStr s);
 bool IsTextRtl(Str s);
 
@@ -2220,6 +2346,7 @@ int utf8RuneLen(const u8* s);
 
 namespace str {
 void Utf8Encode(char* buf, int& off, int c);
+void AppendBase64(str::Builder& out, const u8* data, size_t size);
 int VsnprintfUtf8(Str buf, const char* fmt, va_list args);
 } // namespace str
 
@@ -2232,6 +2359,12 @@ int Utf8CodepointNext(Str s, int& byteIdx);
 int Utf8CodepointPrev(Str s, int& byteIdx);
 int Utf8CodepointToByteIndex(Str s, int codepointIdx);
 Str Utf8SliceByCodepoints(Str s, int startCodepoint, int nCodepoints);
+
+struct WordCount {
+    int words = 0;
+    int chars = 0; // without spaces
+};
+void CountWords(Str s, WordCount& wc);
 
 TempStr ShortenStringUtf8Temp(Str s, int maxRunes);
 TempStr ShortenStringUtf8InTheMiddleTemp(Str s, int maxRunes);
@@ -2505,7 +2638,6 @@ TempStr JoinTemp(StrVec* v, Str sep);
 //--- Strconv.h ------------------------------------------------------------------
 
 namespace strconv {
-WStr CodePageToWStr(uint codePage, Str s, Arena* a = nullptr);
 
 WStr Utf8ToWStr(Str s, Arena* a = nullptr);
 Str WStrToUtf8(WStr s, Arena* a = nullptr);
@@ -2518,8 +2650,11 @@ TempStr StrToUtf8Temp(Str src, uint codePage);
 
 TempStr UnknownToUtf8Temp(Str s);
 
-Str WStrToAnsi(WStr src);
-Str Utf8ToAnsi(Str s);
+enum class ByteOrder {
+    LittleEndian,
+    BigEndian,
+};
+TempStr Utf16ToUtf8Temp(Str bytes, ByteOrder order);
 
 TempWStr AnsiToWStrTemp(Str src);
 Str AnsiToUtf8(Str src);
@@ -2687,7 +2822,7 @@ constexpr bool ColorSkipsPaint(Color c) {
 }
 
 // PdfColor is aarrggbb, where 0xff alpha is opaque and 0x0 alpha is transparent
-// Color is ggrrbb (Win32 COLORREF layout) and typically has no alpha
+// Color is bbggrr (Win32 COLORREF layout) and typically has no alpha
 using PdfColor = uint64_t;
 
 // A color setting: the text the user wrote (e.g. "#ff0000", "checkered") and
@@ -2743,14 +2878,14 @@ float GetLightness(Color c);
 bool IsLightColor(Color c);
 Color AccentColor(Color col, int light, int dark = 0);
 Color EnsureContrast(Color fg, Color bg, int minDelta = 80);
+float ContrastRatio(Color a, Color b);
+Color EnsureContrastRatio(Color fg, Color bg, float minRatio);
 bool IsNearBlack(Color c);
 DWORD PremultiplyPixel(Color c, u8 alpha);
 
 // GDI+ only exists on Windows; portable code works with Color
 #if OS_WIN
-Gdiplus::Color Unblend(Color c, u8 alpha);
 Gdiplus::Color GdiRgbFromColor(Color c);
-Gdiplus::Color GdiRgbaFromColor(Color c);
 #endif
 
 constexpr Color RgbToColor(Color rgb) {

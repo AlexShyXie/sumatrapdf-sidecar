@@ -10,7 +10,7 @@ does and why. Whole files of our own that are compiled into the `mupdf` project
 are not patches: they live in `src/mupdf/` (see its README) and are not part
 of the vendored tree at all.
 
-**Base revision: mupdf `1.28.5`** (tag `1.28.5`, commit `8ad45e92f`), the
+**Base revision: mupdf `1.28.6`** (tag `1.28.6`, commit `da5f5eb89`), the
 version recorded for mupdf in `ext/versions.txt`. Paths in the patches are
 relative to `ext/mupdf`, so `-p1` from inside that directory.
 
@@ -61,8 +61,37 @@ relative to `ext/mupdf`, so `-p1` from inside that directory.
 | `0058-unwrap-display-list-image` | `fz_unwrap_display_list_image`: the one raster an SVG draws, so Save Image / copy keep its bytes and resolution (#6330) |
 | `0059-svg-text-path` | SVG `<textPath>` places glyphs along the referenced path; such text used to pile up at the origin (#6332) |
 | `0060-pdf-update-object-keeps-stream` | `pdf_update_object` carries a stream over when the entry moves to a new xref section; a stream added in the session lost its data on a `garbage=3` save |
+| `0061-stext-tall-font-glyph-ink` | a font box taller than 3em (Cambria Math bbox used as ascent/descent) takes glyph ink for the vertical selection edges (#6348) |
+| `0062-svg-rgba-font-face` | SVG `rgba()` colors and `@font-face` data URI fonts (WOFF/TTF) in `<style>`; such text drew black in Times (#6339) |
+| `0063-epub-fixed-layout-page` | an EPUB chapter whose viewport gives width and height is one page of exactly that size, without the `@page` margin; such books had blank pages between chapters (#1293) |
+| `0064-html-css-transform` | CSS `transform` / `transform-origin` on blocks and `position:absolute` on inline boxes; InDesign fixed-layout text (`scale(0.05)` around per-word positioned spans) ran off the page (#1293) |
+| `0065-grep-catch-bad-options` | `grep -S` / `-O` report an unknown option instead of aborting with no `fz_try` |
+| `0066-murun-name-tree-null` | `run` scripts: embedded-file and name-tree helpers work on PDFs without `/Names` and on trees with `/Kids` |
+| `0067-murun-get-array-index` | `run` scripts: multi-key `PDFObject.get()` indexes an array with its own key, not the first one |
+| `0068-rich-text-content-box-right-edge` | rich (`/DS`, `/RC`) free text pads the right side like the left; centered styled text sat left of center (#6385) |
+| `0069-type1-shading-sample-grid` | function-based (type 1) shadings: 64-cell sample grid refined where colors jump, draw no finer than ~2 device px; Edge-printed PDFs rendered 16x slower (#6402) |
+| `0070-css-content-strings-only` | pseudo-element `content` renders only a string; `counters(...)` rendered its function name (#6409) |
+| `0071-fallback-font-cache-bold` | bold system fallback fonts cached apart from regular; a bold heading made later regular CJK text bold (#6420) |
+| `0072-html-media-link` | `<video>` / `<audio>` drawn as its poster or a `[video: name]` label linking to the media file, which the app opens in the system player (#6421) |
+| `0073-epub-footnotes` | EPUB 3 `<aside epub:type="footnote">` moved to the end of its chapter; `<a epub:type="noteref">` links get `FZ_LINK_FLAG_NOTEREF` so the app shows the note in a popup (#6431) |
+| `0074-pdf-raw-key-password` | a password of `PDF_RAW_KEY_PASSWORD_PREFIX` + the key in hex unlocks a PDF, so tools can re-open one unlocked with a remembered key |
+| `0075-pdfbake-password` | `pdfbake -p`: it could not open a password-protected PDF |
+| `0076-pdfinfo-to-buffer-password` | `pdfinfo_to_buffer` takes a password, for PDF Info on a password-protected PDF |
+| `0077-html-image-first-on-empty-page` | a page-tall image first in a chapter no longer leaves a blank page before it |
+| `0078-css-invalid-color-ignored` | an invalid CSS color is ignored, not black: `background-color:whi` hid the text of LIT books |
+| `0079-html-word-width-cache` | word widths are cached while measuring, shaping dominated loading big books |
+| `0080-bidi-skip-ltr-only-text` | no bidi resolve passes for text with no RTL or explicit types |
+| `0081-html-pre-wraps` | `pre` defaults to `pre-wrap`: pages can't scroll, a book made from a text file lost most of each line |
+| `0082-html-table-margin-auto` | `margin-left` and `margin-right` `auto` center a table; RTF's `\trqc` needs it |
+| `0083-pdf-appearance-rtl-plain-text` | free text / form text lines get `dir="auto"`, so Persian, Arabic and Hebrew lines run right to left |
+| `0084-stext-rtl-clusters` | copied Arabic keeps diacritics and ligatures in logical order: RTL clusters survive the bidi run reversal (#6485) |
+| `0085-html-cjk-generic-font-and-justify` | CJK text in a generic font family uses the system CJK font for the whole run, so its punctuation is full width; justified CJK lines are spread between the chars (#6500) |
+| `0086-html-links-skip-offpage-boxes` | loading a page's links skips boxes above or below it instead of walking the whole document |
+| `0087-fitz-subsample-gray-fast-path` | subsampling a one component pixblock (a downscaled bitonal scan) uses a direct, vectorizable loop |
+| `0088-svg-clip-path` | SVG `clip-path` referencing a `<clipPath>` clips the element, so plots stay inside their axes (#6544) |
+| `0089-pdf-undo-purge-resource-cache` | undo / redo drop cached font / colorspace / image resources for the objects they swap, so a free text edited after an undo doesn't use a missing font (#6549) |
 
-That is the whole list: `ext/mupdf` is byte-for-byte `1.28.5` plus these
+That is the whole list: `ext/mupdf` is byte-for-byte `1.28.6` plus these
 patches, and nothing else.
 
 ## Backports
@@ -108,7 +137,7 @@ Applying every patch to a pristine base must reproduce `ext/mupdf` exactly:
 
 ```sh
 mkdir /tmp/check
-git -C ~/src/mupdf -c core.autocrlf=false -c core.eol=lf archive 1.28.5 | tar -x -C /tmp/check
+git -C ~/src/mupdf -c core.autocrlf=false -c core.eol=lf archive 1.28.6 | tar -x -C /tmp/check
 cd /tmp/check
 for p in ~/src/sumatrapdf/ext/patches/*.patch; do git -c core.autocrlf=false apply "$p" || echo "FAIL $p"; done
 diff -r /tmp/check ~/src/sumatrapdf/ext/mupdf   # only reports files we do not vendor

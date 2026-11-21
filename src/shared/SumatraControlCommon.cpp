@@ -3,6 +3,7 @@
 
 #include "base/Base.h"
 #include "base/UITask.h"
+#include "base/Pixmap.h"
 #include "gui/UIModels.h"
 #include "Settings.h"
 #include "DisplayMode.h"
@@ -21,6 +22,7 @@
 #include "SumatraPDF.h"
 #include "MainWindow.h"
 #include "AnnotPlacement.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "TextSelection.h"
 #include "Selection.h"
@@ -54,8 +56,17 @@
 #include "ReadingBar.h"
 #include "NavFilesInFolder.h"
 #include "PerfLog.h"
+#include "SumatraPDFCommon.h"
 #include "SumatraControl.h"
 #include "SumatraControlCommon.h"
+
+LayoutProbeState gLayoutProbe;
+
+void LayoutProbeNote(MainWindow* win) {
+    if (gLayoutProbe.active && gLayoutProbe.win == win) {
+        gLayoutProbe.count++;
+    }
+}
 
 // Parts of the -dbg-control channel that orig and ng have in common. ng has no
 // listener thread on wasm, so nothing calls them there.
@@ -99,6 +110,10 @@ TempStr PageBoxesResultTemp(int pageNo, int* exitCodeOut) {
         line.Append(fmt(" %s=%.2f,%.2f,%.2f,%.2f", Str(PdfPageBoxName(box.kind)), box.rect.x, box.rect.y, box.rect.dx,
                         box.rect.dy));
     }
+    RectF media = engine->PageMediabox(pageNo);
+    RectF content = engine->PageContentBox(pageNo);
+    line.Append(fmt(" engineMedia=%.2f,%.2f,%.2f,%.2f", media.x, media.y, media.dx, media.dy));
+    line.Append(fmt(" engineContent=%.2f,%.2f,%.2f,%.2f", content.x, content.y, content.dx, content.dy));
     return finish(ToStrTemp(line), 0);
 }
 
@@ -348,6 +363,15 @@ bool ParseArgList(PacketReader& r, Vec<ControlArg*>* args, bool explicitCount, u
     return true;
 }
 
+// Pause between polls of a Wait* loop: fine-grained at first, so a test's
+// timing of a short wait isn't quantized to 20 ms, coarser once it drags on
+// since each poll repaints
+void ControlPollSleep(u64 startMs) {
+    constexpr u64 kFineForMs = 200;
+    bool fine = GetTickCount64() - startMs < kFineForMs;
+    SleepInMs(fine ? 5 : 20);
+}
+
 // Block on the control thread until visible tiles are cached at target
 // resolution, or until timeoutMs. Optional first int arg is the timeout.
 void RunWaitRenderIdle(ControlRequest* req) {
@@ -356,7 +380,8 @@ void RunWaitRenderIdle(ControlRequest* req) {
     if (timeoutMs < 1) {
         timeoutMs = 1;
     }
-    u64 deadline = GetTickCount64() + (u64)timeoutMs;
+    u64 start = GetTickCount64();
+    u64 deadline = start + (u64)timeoutMs;
     for (;;) {
         req->done.Reset();
         uitask::Post(MkFunc0<ControlRequest>(SnapshotRenderIdle, req), "WaitRenderIdle");
@@ -370,7 +395,7 @@ void RunWaitRenderIdle(ControlRequest* req) {
             AppendTestResult(req, 1, req->idleInfo[0] ? fmt("%s %s", kind, Str(req->idleInfo)) : kind);
             return;
         }
-        SleepInMs(20);
+        ControlPollSleep(start);
     }
 }
 
@@ -381,7 +406,8 @@ void RunWaitSessionRestored(ControlRequest* req) {
     if (timeoutMs < 1) {
         timeoutMs = 1;
     }
-    u64 deadline = GetTickCount64() + (u64)timeoutMs;
+    u64 start = GetTickCount64();
+    u64 deadline = start + (u64)timeoutMs;
     for (;;) {
         req->done.Reset();
         uitask::Post(MkFunc0<ControlRequest>(SnapshotSessionRestore, req), "WaitSessionRestored");
@@ -394,7 +420,7 @@ void RunWaitSessionRestored(ControlRequest* req) {
             AppendTestResult(req, 1, req->idleInfo[0] ? fmt("timeout %s", Str(req->idleInfo)) : StrL("timeout"));
             return;
         }
-        SleepInMs(20);
+        ControlPollSleep(start);
     }
 }
 
@@ -434,32 +460,72 @@ static WStr FullPipeNameOwned(Str pipeName) {
     return ToWStr(fullName);
 }
 
+static WStr gControlPipeName;
+static volatile LONG gControlStop = 0;
+static HANDLE gControlListenerExited = nullptr;
+
+struct ControlConnArg {
+    HANDLE pipe;
+};
+
+// One thread per client: the async client stays connected while tests also
+// make short synchronous requests (scroll position) on a second connection.
+static void ControlConnThread(ControlConnArg* arg) {
+    HANDLE pipe = arg->pipe;
+    delete arg;
+    bool stop = ProcessControlConnection(pipe);
+    // DisconnectNamedPipe discards data the client hasn't read yet; wait
+    // until it has, or the Quit reply is lost and the client sees EPIPE
+    FlushFileBuffers(pipe);
+    DisconnectNamedPipe(pipe);
+    CloseHandle(pipe);
+    if (!stop) {
+        return;
+    }
+    // wake the listener blocked in ConnectNamedPipe so it can exit. It may be
+    // between instances (no pipe to open yet) or all instances busy: retry
+    InterlockedExchange(&gControlStop, 1);
+    for (int i = 0; i < 300; i++) {
+        if (WaitForSingleObject(gControlListenerExited, 0) == WAIT_OBJECT_0) {
+            return;
+        }
+        HANDLE h = CreateFileW(gControlPipeName.s, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+        }
+        WaitForSingleObject(gControlListenerExited, 10);
+    }
+}
+
 void SumatraControlThread(ControlThreadArg* arg) {
-    WStr pipeNameW = FullPipeNameOwned(arg->pipeName);
+    gControlPipeName = FullPipeNameOwned(arg->pipeName);
     str::FreePtr(&arg->pipeName);
     delete arg;
+    gControlListenerExited = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-    for (;;) {
-        HANDLE pipe = CreateNamedPipeW(pipeNameW.s, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                                       1, 64 * 1024, 64 * 1024, 0, nullptr);
+    constexpr DWORD kMaxConns = 8;
+    while (!gControlStop) {
+        HANDLE pipe =
+            CreateNamedPipeW(gControlPipeName.s, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                             kMaxConns, 64 * 1024, 64 * 1024, 0, nullptr);
         if (pipe == INVALID_HANDLE_VALUE) {
-            logf("CreateNamedPipeW failed for control pipe, err=%u\n", (unsigned)GetLastError());
-            return;
+            DWORD err = GetLastError();
+            // all kMaxConns instances connected: wait for one to disconnect
+            if (err == ERROR_PIPE_BUSY) {
+                SleepInMs(50);
+                continue;
+            }
+            logf("CreateNamedPipeW failed for control pipe, err=%u\n", (unsigned)err);
+            break;
         }
         BOOL connected = ConnectNamedPipe(pipe, nullptr) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-        bool stop = false;
-        if (connected) {
-            stop = ProcessControlConnection(pipe);
+        if (!connected || gControlStop) {
+            CloseHandle(pipe);
+            continue;
         }
-        // DisconnectNamedPipe discards data the client hasn't read yet; wait
-        // until it has, or the Quit reply is lost and the client sees EPIPE
-        FlushFileBuffers(pipe);
-        DisconnectNamedPipe(pipe);
-        CloseHandle(pipe);
-        if (stop) {
-            return;
-        }
+        RunAsync(MkFunc0(ControlConnThread, new ControlConnArg{pipe}), StrL("SumatraControlConn"));
     }
+    SetEvent(gControlListenerExited);
 }
 
 #endif // OS_WIN
@@ -489,6 +555,36 @@ ControlRequest* ReadControlRequest(ControlConn h) {
     return req;
 }
 
+ControlServeResult ServeControlRequest(ControlConn h, ControlExecFn execOnUi) {
+    ControlServeResult res;
+    ControlRequest* req = ReadControlRequest(h);
+    if (!req) {
+        return res;
+    }
+    res.hadRequest = true;
+    res.isQuit = ControlCmdEndsListener(req->cmd);
+    if (req->cmd == (u16)ControlFrameCmd::CrashMe) {
+        log(StrL("ControlCmd::CrashMe\n"));
+        CrashMe();
+    }
+    switch (ControlFrameActionFor(req->cmd)) {
+        case ControlFrameAction::WaitRenderIdle:
+            RunWaitRenderIdle(req);
+            break;
+        case ControlFrameAction::WaitSessionRestored:
+            RunWaitSessionRestored(req);
+            break;
+        case ControlFrameAction::RunOnUi:
+            if (execOnUi) {
+                execOnUi(req);
+            }
+            break;
+    }
+    res.wrote = WriteControlResponse(h, req);
+    DeleteControlRequest(req);
+    return res;
+}
+
 bool WriteControlResponse(ControlConn h, ControlRequest* req) {
     str::Builder payload;
     AppendU16(payload, req->reqId);
@@ -498,6 +594,106 @@ bool WriteControlResponse(ControlConn h, ControlRequest* req) {
     AppendU32(packet, (u32)len(payload));
     packet.Append(ToStr(payload));
     return WriteExact(h, ToStr(packet));
+}
+
+// "OK page=<n> x=<x> y=<y> visible=<n>": the first window's scroll position, in
+// page units, and how many pages are on screen (0 = the view is blank)
+TempStr ScrollStateResultTemp(int* exitCodeOut) {
+    *exitCodeOut = 2;
+    MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
+    DisplayModel* dm = win && win->IsDocLoaded() ? win->AsFixed() : nullptr;
+    if (!dm) {
+        return fmt("NOTREADY no-doc\n");
+    }
+    ScrollState ss = dm->GetScrollState();
+    int nVisible = 0;
+    for (int pageNo = 1; pageNo <= dm->PageCount(); pageNo++) {
+        if (dm->PageVisible(pageNo)) {
+            nVisible++;
+        }
+    }
+    *exitCodeOut = 0;
+    return fmt("OK page=%d x=%g y=%g visible=%d\n", ss.page, ss.x, ss.y, nVisible);
+}
+
+// "CmdToggleMirror on" => "OK hasState=1 known=1 on=0": whether the definition
+// kept its state argument, and the command's state in the first window
+TempStr ToggleCmdResultTemp(Str definition, int* exitCodeOut) {
+    *exitCodeOut = 2;
+    MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
+    if (!win) {
+        return fmt("NOTREADY no-window\n");
+    }
+    CustomCommand* cmd = CreateCommandFromDefinition(definition);
+    if (!cmd) {
+        return fmt("ERROR can't parse '%s'\n", definition);
+    }
+    bool hasState = GetCommandArg(cmd, kCmdArgState) != nullptr;
+    bool on = false;
+    bool known = ToggleCmdState(win, cmd, cmd->origId, on);
+    *exitCodeOut = 0;
+    return fmt("OK hasState=%d known=%d on=%d\n", (int)hasState, (int)known, (int)on);
+}
+
+// "OK differ=N": pixels of page 1 that a Clone() of the current document
+// renders differently from the document itself. Printing renders from a clone.
+TempStr CloneRenderDiffTemp(int* exitCodeOut) {
+    *exitCodeOut = 2;
+    MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
+    WindowTab* tab = win ? win->CurrentTab() : nullptr;
+    EngineBase* engine = tab ? tab->GetEngine() : nullptr;
+    if (!engine) {
+        return fmt("NOTREADY no-doc\n");
+    }
+    EngineBase* clone = engine->Clone();
+    if (!clone) {
+        return fmt("ERROR clone failed\n");
+    }
+    RenderPageArgs args(1, 1.f, 0, nullptr, RenderTarget::Export);
+    Pixmap* a = engine->RenderPage(args);
+    Pixmap* b = clone->RenderPage(args);
+    Pixmap* ra = EnsureReadablePixmap(a);
+    Pixmap* rb = EnsureReadablePixmap(b);
+    TempStr res;
+    if (!ra || !rb || ra->width != rb->width || ra->height != rb->height) {
+        res = fmt("ERROR render failed\n");
+    } else {
+        int differ = 0;
+        for (int y = 0; y < ra->height; y++) {
+            const u8* pa = ra->data + ((size_t)y * (size_t)ra->stride);
+            const u8* pb = rb->data + ((size_t)y * (size_t)rb->stride);
+            for (int x = 0; x < ra->width * 4; x += 4) {
+                differ += (pa[x] != pb[x] || pa[x + 1] != pb[x + 1] || pa[x + 2] != pb[x + 2]) ? 1 : 0;
+            }
+        }
+        *exitCodeOut = 0;
+        res = fmt("OK differ=%d\n", differ);
+    }
+    if (ra != a) {
+        FreePixmap(ra);
+    }
+    if (rb != b) {
+        FreePixmap(rb);
+    }
+    FreePixmap(a);
+    FreePixmap(b);
+    SafeEngineRelease(&clone);
+    return res;
+}
+
+// "OK errors=1 shown=0": whether the current document has load errors and
+// whether the "Errors in document" notification shows them
+TempStr DocErrorsResultTemp(int* exitCodeOut) {
+    *exitCodeOut = 2;
+    MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
+    DisplayModel* dm = win && win->IsDocLoaded() ? win->AsFixed() : nullptr;
+    if (!dm) {
+        return str::DupTemp(StrL("NOTREADY no-doc\n"));
+    }
+    *exitCodeOut = 0;
+    int errors = dm->GetEngine()->HasErrors() ? 1 : 0;
+    int shown = IsDocErrorsNotifShown(win) ? 1 : 0;
+    return fmt("OK errors=%d shown=%d\n", errors, shown);
 }
 
 TempStr FavoriteNavResultTemp(Str action, int pageNo, int* exitCodeOut) {
@@ -554,6 +750,17 @@ TempStr FavoriteNavResultTemp(Str action, int pageNo, int* exitCodeOut) {
         GoToNextFavorite(win, false);
     } else if (str::EqI(action, StrL("page"))) {
         // report only
+    } else if (str::EqI(action, StrL("list"))) {
+        // the current file's favorites in order: "OK manual=1 Intro@2,-@1"
+        FileState* fs = FileHistoryFindByPath(win->ctrl->GetFilePath());
+        out.Append(fmt("OK manual=%d ", gSettings->favoritesManualOrder ? 1 : 0));
+        int n = (fs && fs->favorites) ? len(*fs->favorites) : 0;
+        for (int i = 0; i < n; i++) {
+            Favorite* f = (*fs->favorites)[i];
+            out.Append(i > 0 ? StrL(",") : StrL(""));
+            out.Append(fmt("%s@%d", len(f->name) > 0 ? f->name : StrL("-"), ParseStoredPagePos(f->pageNo).pageNo));
+        }
+        return finish({}, 0);
     } else if (ControlFavoritesMenu(win, action, &menuIds)) {
         return finish(menuIds, 0);
     } else {
@@ -569,6 +776,57 @@ TempStr FavoriteNavResultTemp(Str action, int pageNo, int* exitCodeOut) {
         cur = ss.page;
     }
     return finish(fmt("OK page=%d y=%d", cur, y), 0);
+}
+
+// the first window's word count notification (#6489): "OK <text>", "OK" while there's none
+TempStr WordCountResultTemp(int* exitCodeOut) {
+    *exitCodeOut = 2;
+    if (len(gWindows) == 0 || !gWindows[0]->IsDocLoaded()) {
+        return str::DupTemp(StrL("NOTREADY no-doc\n"));
+    }
+    *exitCodeOut = 0;
+    TempStr msg = WordCountNotifMsgTemp(gWindows[0]);
+    return fmt("OK %s\n", msg);
+}
+
+// the first window's Show Selected Text notification (#6496): "OK <text>"
+TempStr SelectedTextResultTemp(int* exitCodeOut) {
+    *exitCodeOut = 2;
+    if (len(gWindows) == 0 || !gWindows[0]->IsDocLoaded()) {
+        return str::DupTemp(StrL("NOTREADY no-doc\n"));
+    }
+    *exitCodeOut = 0;
+    return fmt("OK %s", SelectedTextNotifMsgTemp(gWindows[0]));
+}
+
+// the first window's page info tip (#6492): "OK <text>", "OK" while it's not shown
+TempStr PageInfoTextResultTemp(int* exitCodeOut) {
+    *exitCodeOut = 2;
+    if (len(gWindows) == 0 || !gWindows[0]->IsDocLoaded()) {
+        return str::DupTemp(StrL("NOTREADY no-doc\n"));
+    }
+    *exitCodeOut = 0;
+    NotificationWnd* wnd = GetNotificationForGroup(gWindows[0], kNotifPageInfo);
+    TempStr msg = wnd ? NotificationGetMessageTemp(wnd) : TempStr{};
+    return fmt("OK %s\n", msg);
+}
+
+// the first window's page info bar (#6494): where it is and what it says
+TempStr PageInfoBarResultTemp(int* exitCodeOut) {
+    *exitCodeOut = 2;
+    if (len(gWindows) == 0 || !gWindows[0]->IsDocLoaded()) {
+        return str::DupTemp(StrL("NOTREADY no-doc\n"));
+    }
+    *exitCodeOut = 0;
+    MainWindow* win = gWindows[0];
+    Str place = StrL("none");
+    if (PageInfoBarShown(win)) {
+        place = GetPageInfoBarMode() == PageInfoBarMode::Bottom ? StrL("row") : StrL("overlay");
+    }
+    TempStr left;
+    TempStr right;
+    PageInfoBarTextTemp(win, &left, &right);
+    return fmt("OK place=%s %s\nleft=%s\nright=%s\n", place, PageInfoBarGeometryTemp(win), left, right);
 }
 
 // action: "get" | "r2l" | "presentation" | "fullscreen"
@@ -594,6 +852,27 @@ TempStr DisplayModeResultTemp(Str action, int* exitCodeOut) {
     }
 
     bool reportR2L = str::EqI(action, StrL("r2l"));
+    // "pages": the pages shown, for stepping one page in facing view (#6487)
+    if (str::EqI(action, StrL("pages"))) {
+        DisplayModel* dm = win->AsFixed();
+        if (!dm) {
+            return finish(StrL("ERROR not-fixed-page"), 1);
+        }
+        out.Append(fmt("OK mode=%s step=%d current=%d shown=", DisplayModeToString(dm->GetDisplayMode()),
+                       dm->GetFacingStepOne() ? 1 : 0, dm->CurrentPageNo()));
+        bool first = true;
+        for (int pageNo = 1; pageNo <= dm->PageCount(); pageNo++) {
+            if (!dm->PageShown(pageNo)) {
+                continue;
+            }
+            if (!first) {
+                out.AppendChar(',');
+            }
+            out.Append(fmt("%d", pageNo));
+            first = false;
+        }
+        return finish(StrL(""), 0);
+    }
     if (str::EqI(action, StrL("zoom-real"))) {
         return finish(fmt("OK zoomReal=%g", win->ctrl->GetZoomVirtual(true)), 0);
     }
@@ -622,7 +901,7 @@ TempStr DisplayModeResultTemp(Str action, int* exitCodeOut) {
     Str zoomLabel;
     ZoomToString(&zoomLabel, win->ctrl->GetZoomVirtual(false), nullptr);
     TempStr res = fmt("OK mode=%s presentation=%d fullscreen=%d zoom=%s", mode, win->InPresentation() ? 1 : 0,
-                      win->isFullScreen ? 1 : 0, zoomLabel);
+                      win->IsFullScreen() ? 1 : 0, zoomLabel);
     str::Free(zoomLabel);
     return finish(res, 0);
 }

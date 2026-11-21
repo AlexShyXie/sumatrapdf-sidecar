@@ -28,6 +28,7 @@
 #include "Notifications.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "gui/AppShell.h"
 #include "gui/DocCanvas.h"
@@ -46,42 +47,13 @@ struct SelectionToolbar {
     MainWindow* win = nullptr;
     WindowTab* tab = nullptr; // tab the current selection belongs to
     bool visible = false;
-    // ms still to wait before the debounced show
-    int showPendingMs = -1;
+    // the debounced show
+    Countdown showPending;
     Vec<SelectionToolbarButton> buttons;
     // where the card ended up last frame; gpui reports it one frame late, which
     // is enough to center the card on the selection from the second frame on
     gp::Bounds measured;
 };
-
-// selection handlers that asked for a button with SelectToolbarNameOrSvg
-void AppendSelectionHandlerButtons(Vec<SelectionToolbarButton>& buttons, const AppCommandCtx& ctx) {
-    Vec<CustomCommand*> cmds;
-    GetCommandsWithOrigId(cmds, CmdSelectionHandler);
-    for (CustomCommand* cmd : cmds) {
-        Str s = GetCommandStringArg(cmd, kCmdArgSelectToolbar, {});
-        if (str::IsEmptyOrWhiteSpace(s)) {
-            continue;
-        }
-        CommandVisibility v = GetCommandVisibility(cmd->id, ctx, CommandSurface::Toolbar);
-        if (CommandShouldRemove(v)) {
-            continue;
-        }
-        SelectionToolbarButton b;
-        b.cmdId = cmd->id;
-        if (str::StartsWithI(s, StrL("<svg"))) {
-            b.userLabel = cmd->name;
-            b.svgIcon = s;
-        } else {
-            b.userLabel = s;
-        }
-        b.enabled = !CommandShouldDisable(v);
-        if (len(b.userLabel) == 0) {
-            continue;
-        }
-        VecAppend(buttons, b);
-    }
-}
 
 static SelectionToolbar* GetOrCreateToolbar(MainWindow* win) {
     if (!win->selectionToolbar) {
@@ -123,6 +95,10 @@ static void ShowSelectionToolbarNow(MainWindow* win) {
     if (len(tb->buttons) == 0) {
         return;
     }
+    if (!tb->visible) {
+        // the buttons may differ from last time: measure them again
+        tb->measured = {};
+    }
     tb->visible = true;
     str::Builder labels;
     for (const SelectionToolbarButton& b : tb->buttons) {
@@ -147,28 +123,23 @@ void ShowSelectionToolbar(MainWindow* win, SelToolbarShow when) {
         return;
     }
     if (when == SelToolbarShow::Now) {
-        tb->showPendingMs = -1;
+        tb->showPending.Cancel();
         ShowSelectionToolbarNow(win);
         return;
     }
-    if (tb->showPendingMs >= 0) {
+    if (tb->showPending.IsArmed()) {
         return;
     }
-    tb->showPendingMs = kShowDelayInMs;
+    tb->showPending.Arm(kShowDelayInMs);
 }
 
 // ng: orig waits out kSelectionToolbarShowTimerID; the shell's tick counts it
 // down instead
 void SelectionToolbarOnShowTimer(MainWindow* win, int elapsedMs) {
     SelectionToolbar* tb = win ? win->selectionToolbar : nullptr;
-    if (!tb || tb->showPendingMs < 0) {
+    if (!tb || !tb->showPending.Tick(elapsedMs)) {
         return;
     }
-    tb->showPendingMs -= elapsedMs;
-    if (tb->showPendingMs > 0) {
-        return;
-    }
-    tb->showPendingMs = -1;
     // the selection may be gone or still being dragged by now; both self-guard
     if (IsActivelySelecting(win)) {
         return;
@@ -180,7 +151,7 @@ void SelectionToolbarOnShowTimer(MainWindow* win, int elapsedMs) {
 static void CancelPendingShow(MainWindow* win) {
     SelectionToolbar* tb = win ? win->selectionToolbar : nullptr;
     if (tb) {
-        tb->showPendingMs = -1;
+        tb->showPending.Cancel();
     }
 }
 
@@ -357,6 +328,12 @@ gp::El* SelectionToolbarBuild(MainWindow* win, gp::Ctx* cx) {
     y = std::min(y, canvasH - h);
     y = std::max(y, 0.f);
     card->Absolute()->Left(x)->Top(y);
+    if (tb->measured.w <= 0) {
+        // placed from a guessed size: show it from the next frame, placed from
+        // its measured one, so it does not jump
+        card->Opacity(0);
+        AppShellInvalidate(win);
+    }
     return card;
 }
 

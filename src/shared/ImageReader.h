@@ -11,11 +11,13 @@ constexpr i64 kMaxDecodedPixmapBytes = 512LL * 1024 * 1024;
 struct fz_context;
 fz_context* fz_new_context_windows(size_t maxStore = kFzStoreUnlimited);
 void fz_drop_context_windows(fz_context* ctx);
+void FreeImageCtxPool();
 
 struct Pixmap;
 struct RenderedBitmap;
 
 bool ImageDecodedPixmapWouldBeHuge(Str);
+int FzOrientationToExif(u8 fzOrientation);
 
 Pixmap* PixmapFromDataFz(Str);
 
@@ -27,7 +29,3 @@ Str EncodeGifFromPixmap(const Pixmap* px);
 bool DecodeJpegToCmyk(Str jpeg, int& w, int& h, int& stride, Vec<u8>& samples);
 
 Vec<Pixmap*> PixmapsFromData(Str);
-
-Size ImageSizeFromData(Str);
-
-RenderedBitmap* LoadRenderedBitmap(Str path);

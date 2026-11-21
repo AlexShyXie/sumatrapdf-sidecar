@@ -388,7 +388,7 @@ function pkgConfig(kind: "--cflags" | "--libs", names: string[]): string[] {
   if (r.exitCode !== 0) {
     console.error(r.stderr.toString().trim());
     console.error(
-      `pkg-config ${kind} ${names.join(" ")} failed. sudo apt install libx11-dev libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libglib2.0-dev libssl-dev`,
+      `pkg-config ${kind} ${names.join(" ")} failed. sudo apt install libx11-dev libxcursor-dev libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libglib2.0-dev libssl-dev`,
     );
     process.exit(1);
   }
@@ -404,6 +404,13 @@ function linuxDeps(): { cflags: string[]; libs: string[] } {
   if (curl.exitCode === 0) {
     cflags.push(...pkgConfig("--cflags", ["libcurl"]), "-DGPUI_HAVE_CURL=1");
     libs.push(...pkgConfig("--libs", ["libcurl"]));
+  }
+  // gpui's image cursors (drag hand, laser dot, placement icons); without
+  // libxcursor-dev the canvas shows stand-in shapes
+  const xcursor = Bun.spawnSync(["pkg-config", "--exists", "xcursor"], { stdout: "pipe", stderr: "pipe" });
+  if (xcursor.exitCode === 0) {
+    cflags.push(...pkgConfig("--cflags", ["xcursor"]), "-DGPUI_HAVE_XCURSOR=1");
+    libs.push(...pkgConfig("--libs", ["xcursor"]));
   }
   linuxDepsMemo = { cflags, libs };
   return linuxDepsMemo;
@@ -897,6 +904,9 @@ function linkCmd(
       ld.push("-sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32,HEAPF32,FS,addRunDependency,removeRunDependency");
       const shell = wasmShellFile(dir);
       ld.push("--shell-file", shell);
+      // function index -> name, to symbolicate the wasm-function[N] frames of a
+      // crash in a build without names (docs/wasm-host-api.md, onCrash)
+      ld.push("--emit-symbol-map");
       const preload = wasmPreloadArgs(t, fail);
       ld.push(...preload);
       extraKey = [readFileSync(shell, "utf8"), ...preload.map((a) => `${a}:${mtime(a.split("@")[0]!)}`)].join("\n");

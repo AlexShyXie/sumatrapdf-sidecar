@@ -64,10 +64,6 @@ constexpr int kAdvHeaderShiftDy = 4;
 constexpr int kAdvSwatchDx = 12;
 constexpr int kAdvDotDx = 6;
 
-static PlatformFont* UiFont(int px) {
-    return DlgUiFont(px);
-}
-
 struct ListBoxModelSettings : ListBoxModel {
     Vec<SettingItem*>* items = nullptr;       // not owned
     Vec<SettingSection*>* sections = nullptr; // not owned
@@ -315,7 +311,7 @@ static void AdvSettingsItemColumns(const Rect& rc, Rect& rcName, Rect& rcVal) {
 // a header row: the section's name with its comment fainter after it, set
 // low in the row so it reads as the title of the rows under it
 static void DrawSectionRow(Gfx* gfx, Rect rc, SettingSection* sec, Color colMuted, bool isRtl) {
-    PlatformFont* font = UiFont(kAdvMetaFontPx);
+    PlatformFont* font = DlgUiFont(kAdvMetaFontPx);
     int shift = DpiScale(kAdvHeaderShiftDy);
     Rect r = rc;
     r.SubLR(DpiScale(kAdvInsetDx), DpiScale(kAdvInsetDx));
@@ -359,7 +355,7 @@ void AdvancedSettingsWnd::DrawListBoxItem(VirtListBox::DrawItemEvent* ev) {
     if (IsSpecialColor(colText)) {
         colText = GetSysColor(COLOR_WINDOWTEXT);
     }
-    Color colMuted = ThemeWindowTextDisabledColor();
+    Color colMuted = ThemeWindowDarkerTextColor();
     gfx->FillRect(rc, colBg);
     bool isRtl = HwndIsRtl(lb->GetHwnd());
 
@@ -950,16 +946,18 @@ void AdvancedSettingsWnd::OnKeyDown(KeyEvent* ev) {
 // following WM_DESTROY never reaches onDestroy - leaving gAdvancedSettingsWnd
 // dangling and blocking reopen. CloseEvent::didHandle defaults to true, so
 // returning from here skips that default Destroy().
-static void OnClose(WindowBase::CloseEvent* /*ev*/) {
+static void ScheduleAdvDelete() {
     if (gAdvancedSettingsWnd) {
         gAdvancedSettingsWnd->ScheduleDelete();
     }
 }
 
+static void OnClose(WindowBase::CloseEvent* /*ev*/) {
+    ScheduleAdvDelete();
+}
+
 static void OnDestroy(WindowBase::DestroyEvent* /*ev*/) {
-    if (gAdvancedSettingsWnd) {
-        gAdvancedSettingsWnd->ScheduleDelete();
-    }
+    ScheduleAdvDelete();
 }
 
 // last client size chosen by the user (or initial layout); reused when the
@@ -1048,11 +1046,11 @@ void AdvancedSettingsWnd::UpdateHints() {
     }
     VecReset(hintRow->children);
     Color colBg = ThemeWindowControlBackgroundColor();
-    Color colMuted = ThemeWindowTextDisabledColor();
+    Color colMuted = ThemeWindowDarkerTextColor();
     AdvHint hints[kAdvMaxHints];
     int n = AdvSettingsHints(state, hints);
     for (int i = 0; i < n; i++) {
-        hintRow->AddChild(NewKeyHint(UiFont(kAdvHintFontPx), hints[i].key, hints[i].desc, colMuted, colBg));
+        hintRow->AddChild(NewKeyHint(DlgUiFont(kAdvHintFontPx), hints[i].key, hints[i].desc, colMuted, colBg));
     }
     if (hwnd && layout) {
         DoLayout();
@@ -1098,11 +1096,11 @@ bool AdvancedSettingsWnd::Create(MainWindow* mainWin) {
     if (!hwnd) {
         return false;
     }
-    fontBold = GetBoldPlatformFont(UiFont(kAdvTextFontPx));
+    fontBold = GetBoldPlatformFont(DlgUiFont(kAdvTextFontPx));
 
     auto colBg = ThemeWindowControlBackgroundColor();
     auto colTxt = ThemeWindowTextColor();
-    auto colMuted = ThemeWindowTextDisabledColor();
+    auto colMuted = ThemeWindowDarkerTextColor();
     SetColors(colTxt, colBg);
     bool isRtl = IsUIRtl();
 
@@ -1117,7 +1115,7 @@ bool AdvancedSettingsWnd::Create(MainWindow* mainWin) {
         args.isMultiLine = false;
         args.withBorder = false;
         args.cueText = Tr("Filter settings");
-        args.font = UiFont(kAdvQueryFontPx);
+        args.font = DlgUiFont(kAdvQueryFontPx);
         args.isRtl = isRtl;
         auto* c = new Edit();
         c->SetColors(colTxt, colBg);
@@ -1133,7 +1131,7 @@ bool AdvancedSettingsWnd::Create(MainWindow* mainWin) {
         row->gap = DpiScale(kAdvGapDx);
         row->rtl = isRtl;
         row->AddChild(c, 1);
-        countText = NewVirtText({.s = {}, .font = UiFont(kAdvMetaFontPx), .textColor = colMuted, .isRtl = isRtl});
+        countText = NewVirtText({.s = {}, .font = DlgUiFont(kAdvMetaFontPx), .textColor = colMuted, .isRtl = isRtl});
         row->AddChild(countText);
         vbox->AddChild(new Padding(row, DpiScaledInsets(kAdvQueryPadDy, kAdvPadDx)));
         vbox->AddChild(new VirtLine());
@@ -1142,7 +1140,7 @@ bool AdvancedSettingsWnd::Create(MainWindow* mainWin) {
     {
         auto* c = new AdvSettingsListBox();
         c->dpi = GetDpi();
-        c->font = UiFont(kAdvTextFontPx);
+        c->font = DlgUiFont(kAdvTextFontPx);
         c->itemDy = DpiScale(kAdvRowDy);
         c->SetColor(kColListText, colTxt);
         c->SetColor(kColListBg, colBg);
@@ -1172,11 +1170,11 @@ bool AdvancedSettingsWnd::Create(MainWindow* mainWin) {
         head->rtl = isRtl;
         helpName = NewVirtText({.s = {}, .font = fontBold, .textColor = colTxt, .isRtl = isRtl, .ellipsis = true});
         head->AddChild(helpName, 1);
-        helpDefault = NewVirtText({.s = {}, .font = UiFont(kAdvMetaFontPx), .textColor = colMuted, .isRtl = isRtl});
+        helpDefault = NewVirtText({.s = {}, .font = DlgUiFont(kAdvMetaFontPx), .textColor = colMuted, .isRtl = isRtl});
         head->AddChild(helpDefault);
 
         auto* c = new VirtFixedLinesText();
-        c->font = UiFont(kAdvTextFontPx);
+        c->font = DlgUiFont(kAdvTextFontPx);
         c->nLines = kAdvHelpLines;
         c->SetColor(kColRichText, colMuted);
         c->SetColor(kColRichLink, colMuted);
@@ -1195,7 +1193,6 @@ bool AdvancedSettingsWnd::Create(MainWindow* mainWin) {
     // the footer: the key hints and the quiet actions on the left, the unsaved
     // count, Cancel and Save on the right
     {
-        vbox->AddChild(new VirtLine());
         auto* row = new HBox();
         row->alignMain = MainAxisAlign::MainStart;
         row->alignCross = CrossAxisAlign::CrossCenter;
@@ -1209,7 +1206,7 @@ bool AdvancedSettingsWnd::Create(MainWindow* mainWin) {
         row->AddChild(hintRow);
         UpdateHints();
 
-        PlatformFont* btnFont = UiFont(kAdvTextFontPx);
+        PlatformFont* btnFont = DlgUiFont(kAdvTextFontPx);
         btnOpenSettingsFile = NewDlgButton(hwnd, Tr("Open Settings File"), btnFont, DlgButtonStyle::Ghost, false);
         btnOpenSettingsFile->onClick =
             MkMethod1<AdvancedSettingsWnd, VirtMouseEvent*, &AdvancedSettingsWnd::OnOpenSettingsFile>(this);
@@ -1230,7 +1227,7 @@ bool AdvancedSettingsWnd::Create(MainWindow* mainWin) {
         unsavedDot->SetFlag(vwfNoHitTest, true);
         unsavedDot->SetIsVisible(false);
         unsaved->AddChild(unsavedDot);
-        unsavedText = NewVirtText({.s = {}, .font = UiFont(kAdvMetaFontPx), .textColor = colTxt, .isRtl = isRtl});
+        unsavedText = NewVirtText({.s = {}, .font = DlgUiFont(kAdvMetaFontPx), .textColor = colTxt, .isRtl = isRtl});
         unsavedText->SetIsVisible(false);
         unsaved->AddChild(unsavedText);
         unsaved->SetVisibility(Visibility::Collapse);
@@ -1262,7 +1259,7 @@ bool AdvancedSettingsWnd::Create(MainWindow* mainWin) {
     dx = std::max(dx, minDx);
     LayoutAndSizeToContent(layout, dx, dy, hwnd);
     // pick up the virtual controls so we paint them and they get their input
-    DoLayout(HwndClientRect(hwnd).Size());
+    DoLayout();
     gAdvSettingsLastClientDx = HwndClientRect(hwnd).dx;
     gAdvSettingsLastClientDy = HwndClientRect(hwnd).dy;
     PositionDialog(hwnd, win->hwndFrame);
@@ -1740,9 +1737,7 @@ bool RestrictedUseWnd::Create(MainWindow* mainWin) {
 
     layout = new Padding(vbox, DpiScaledInsets(4, 8));
     UpdateButtons();
-    LayoutAndSizeToContent(layout, DpiScale(520), 0, hwnd);
-    DoLayout(HwndClientRect(hwnd).Size());
-    HwndCenterDialog(hwnd, win ? win->hwndFrame : nullptr);
+    SizeToLayout(this, layout, DpiScale(520), 0, win ? win->hwndFrame : nullptr);
     UpdateTheme();
     SetIsVisible(true);
     vroot->SetFocus(list);

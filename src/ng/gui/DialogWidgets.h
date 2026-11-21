@@ -34,6 +34,7 @@ struct DialogSelect {
                          float fontPx = 0);
     // set once a row was picked, until asked; lets a dialog react to a pick
     bool TakeComboPicked();
+    void OpenCombo();
     // the same for a pick with the mouse out of the dropped list only
     bool TakeComboListPick();
 
@@ -50,10 +51,11 @@ struct DialogSelect {
     float comboScrollY = 0;
 };
 
-// ng: a gpui context menu does not take the focus, so the shell cannot tell
-// from the key event that one is open. Every context / drop-down menu goes
-// through TrackPopup() when built (a DialogSelect tracks itself); while one is
-// open the shell leaves the keys to it (win32's modal menu loop) and Esc
+// ng: OpenPopupMenuAt focuses the trigger before PopupMenuOpen, so a picked
+// item runs from the element that opened the menu. The menu's trap then takes
+// the keyboard, which is where arrows, Enter and Escape dispatch. Every
+// context / drop-down menu goes through TrackPopup() when built (a DialogSelect
+// tracks itself); while one is open the shell leaves those keys to it and Esc
 // closes only the popup.
 gpui::component::PopupMenu* TrackPopup(gpui::Ctx* cx, gpui::component::PopupMenu* menu);
 bool IsTrackedPopupOpen(gpui::Ctx* cx);
@@ -76,6 +78,7 @@ void HoverTooltipShow(gpui::Ctx* cx, Str tip, gpui::Bounds at);
 void HoverTooltipShowIn(gpui::App* app, gpui::Window* win, Str tip, gpui::Bounds at);
 void HoverTooltipHideIn(gpui::Window* win);
 void HoverTooltipHide(gpui::Ctx* cx);
+void HoverTooltipHideBar(gpui::Window* barFrame, bool hovered, bool inBarWindow, gpui::Ctx* cx);
 bool DismissTrackedPopup(gpui::Ctx* cx);
 
 // gpui draws a ScrollY() box at the offset it is handed and reports the wheel
@@ -102,6 +105,8 @@ gpui::Str DlgAccelClick(gpui::Ctx* cx, Str label, gpui::Listener onClick, bool d
 gpui::Str DlgAccelInput(gpui::Ctx* cx, Str label, gpui::InputState* input);
 // the label of a drop-down: the key focuses it
 gpui::Str DlgAccelSelect(gpui::Ctx* cx, Str label, DialogSelect* select);
+// the label of a control with a gpui focus id (a slider): the key focuses it
+gpui::Str DlgAccelFocus(gpui::Ctx* cx, Str label, int focusId);
 // the label alone: stripped and underlined, the key does nothing
 gpui::Str DlgAccelNone(gpui::Ctx* cx, Str label);
 // underlines the access key of `text` (what a DlgAccel*() call returned) in
@@ -169,6 +174,7 @@ struct DlgWindowSpec {
 ToolWindow* DlgWindowOpen(const DlgWindowSpec& spec, MainWindow* win);
 // closes it and clears *tw
 void DlgWindowClose(ToolWindow** tw);
+void DlgWindowsCloseFor(MainWindow* win);
 // true while `cx` is such a window's
 bool DlgWindowIsHost(gpui::Ctx* cx);
 // the window whose build / close / key callback is running, for a dialog
@@ -176,40 +182,47 @@ bool DlgWindowIsHost(gpui::Ctx* cx);
 ToolWindow* DlgWindowCurrent();
 gpui::El* DlgIntoEl(gpui::Ctx* cx, gpui::component::Dialog* dlg);
 
-// orig's dialog layout for the content of such a window. Sizes at 96 dpi, as
-// orig's layout code has them: the 12 px app font with its 15 px line, a 23
-// high edit, 19 high list rows, 25 high buttons (5 / 12 around the label) an
-// average character apart
+// orig's dialog sizes at 96 dpi: the 12 px app font and a 23 high edit
 constexpr float kDlgWinFontPx = 12;
-constexpr float kDlgWinLineDy = 15;
 constexpr float kDlgWinEditDy = 23;
-constexpr float kDlgWinRowDy = 19;
-constexpr float kDlgWinBtnDy = 25;
-constexpr float kDlgWinBtnPadDx = 12;
-constexpr float kDlgWinBtnGap = 7;
-// sets the window's fonts to orig's and returns the size for Font()
-float DlgWinFont(gpui::Ctx* cx);
 // the width of `label` (its '&' dropped) in the app font, in dips
 float DlgWinTextDx(gpui::Ctx* cx, Str label);
-// orig's VirtButton: as wide as its label plus the padding
-gpui::El* DlgWinButton(gpui::Ctx* cx, gpui::Str id, Str label, gpui::Listener onClick, bool isDefault,
-                       bool disabled = false);
-// the selected row of orig's VirtListBox; darker while the list has the focus
-gpui::Rgba DlgWinListSelBg(bool listFocused);
-// orig's VirtText: one line of `text` (what a DlgAccel*() call returned, or
-// plain text) with `padB` under it
-gpui::El* DlgWinLabel(gpui::Ctx* cx, gpui::Str text, float font, float padB);
-// orig's Edit with a border: 23 high, as wide as its parent
-gpui::El* DlgWinEdit(gpui::Ctx* cx, gpui::Str id, gpui::InputState* edit);
-// orig's Checkbox: `box` (a gpui Checkbox element) in a 21 high row with
-// `padT` above it, the label 2 after the box
-constexpr float kDlgWinCheckDy = 21;
-gpui::El* DlgWinCheck(gpui::Ctx* cx, gpui::El* box, float padT);
-// the row of buttons at the bottom: at the right, `padY` above and below
-gpui::El* DlgWinButtonRow(gpui::Ctx* cx, float padY);
 // in place of DlgIntoEl(): `col` is the whole content, laid out by the
 // dialog; the window gets spec.clientDx and the column's height
 gpui::El* DlgWinContent(gpui::Ctx* cx, gpui::El* col);
+
+// the redrawn dialogs' pieces, in the tool dialogs' layout (PdfToolsCommon.h)
+enum class DlgField {
+    Plain,
+    Underlined,
+    Password
+};
+gpui::El* DlgCaption(gpui::Ctx* cx, Str s);
+gpui::El* DlgLine(gpui::Ctx* cx, Str label, float labelDx, Str id, gpui::InputState* edit, DlgField kind);
+gpui::El* DlgFooter(gpui::Ctx* cx, Str okLabel, gpui::Listener onOk, gpui::Listener onCancel, gpui::El* extra = nullptr,
+                    bool okDisabled = false);
+// a list's rows: the text on a rounded selection, in line with the fields
+constexpr float kDlgListRowDy = 24;
+gpui::El* DlgListRow(gpui::Ctx* cx, Str id, Str text, bool selected, gpui::Listener onClick, Str meta = {});
+gpui::El* DlgListBox(gpui::Ctx* cx, gpui::El* list);
+// a row of controls as tall as a list's row; a muted label for it, `dx` wide
+// (0: its own width); what a label of `s` takes in that font
+gpui::El* DlgFieldRow(gpui::Ctx* cx);
+gpui::El* DlgFieldLabel(gpui::Ctx* cx, Str s, float dx);
+float DlgFieldLabelDx(gpui::Ctx* cx, Str s);
+// a muted heading inside a section
+gpui::El* DlgSectionHeader(gpui::Ctx* cx, Str s);
+// controls between two hairlines, padded as the tool dialogs pad them
+gpui::El* DlgSection(gpui::Ctx* cx);
+// a checkbox or a radio button, with orig's access key
+enum class DlgCheckKind {
+    Checkbox,
+    Radio
+};
+gpui::El* DlgCheck(gpui::Ctx* cx, Str id, Str label, bool checked, gpui::Listener onClick,
+                   DlgCheckKind kind = DlgCheckKind::Checkbox, bool disabled = false);
+gpui::El* DlgToolContent(gpui::Ctx* cx, gpui::El* col, Str title, float dx, gpui::Listener onCancel);
+gpui::El* DlgFrameCard(gpui::Ctx* cx, gpui::El* col, Str title, float dx, gpui::Listener onClose);
 
 // the dialog window that has the input of `win`'s program: a modal one, or
 // the active one. -dbg-control's TestInput and TestUiState follow it
@@ -249,7 +262,12 @@ constexpr float kDlgBtnPadDx = 12;
 constexpr float kDlgBtnRadius = 4;
 constexpr float kDlgBtnFontPx = 13;
 constexpr int kDlgBtnShift = 28;
-gpui::El* DlgFilledButton(gpui::Ctx* cx, gpui::Str id, Str label, gpui::Listener onClick, bool disabled = false);
+// fontPx: in the window's rem, for a window that changes it
+gpui::El* DlgFilledButton(gpui::Ctx* cx, gpui::Str id, Str label, gpui::Listener onClick, bool disabled = false,
+                          float fontPx = kDlgBtnFontPx);
+// a quiet one: muted words that fill on hover
+gpui::El* DlgGhostButton(gpui::Ctx* cx, gpui::Str id, Str label, gpui::Listener onClick, bool disabled = false,
+                         float fontPx = kDlgBtnFontPx);
 // a bare input over a line in `underline`; the caller sizes the box
 gpui::El* DlgUnderlineInput(gpui::Ctx* cx, gpui::Str id, gpui::InputState* edit, float fontPx, Color underline,
                             bool masked = false, bool disabled = false);
@@ -275,3 +293,5 @@ gpui::El* DialogFooter(gpui::Ctx* cx, gpui::El* extra, gpui::Entity<V> ent, Str 
                           okText, gpui::ListenTo(ent, onOk)));
     return row;
 }
+bool MenuCuesAlways();
+TempStr InputTextTemp(gpui::InputState* e);

@@ -17,19 +17,39 @@ static char gPickedPath[1024];
 // NOLINTNEXTLINE
 EM_JS(void, WasmJsPickFile, (const char* dir, int dirLen, char* out, int outCap), {
     var dirPath = UTF8ToString(dir, dirLen);
-    var input = document.createElement("input");
-    input.type = "file";
-    input.style.display = "none";
-    document.body.appendChild(input);
+    var input = null;
     var settled = false;
     var done = function(path) {
         if (settled) return;
         settled = true;
-        input.remove();
+        if (input) input.remove();
         stringToUTF8(path ? path : "", out, outCap);
         _sumatra_wasm_file_picked();
         if (Module.sumatraFocusCanvas) Module.sumatraFocusCanvas();
     };
+    // WasmShell.js picks the name (no silent overwrite) and saves to OPFS
+    var store = function(name, bytes) {
+        Module.sumatraStoreUpload(dirPath, name, bytes)
+            .then(
+                done, function(e) {
+                    console.error("storing " + name + " failed", e);
+                    done(null);
+                });
+    };
+    var fromHost = function(file) {
+        if (!file || !file.name || !file.bytes) {
+            done(null);
+            return;
+        }
+        store(String(file.name), file.bytes);
+    };
+    if (Module.sumatraHostCall && Module.sumatraHostCall("pickFile", fromHost)) {
+        return;
+    }
+    input = document.createElement("input");
+    input.type = "file";
+    input.style.display = "none";
+    document.body.appendChild(input);
     input.addEventListener("cancel", function() { done(null); });
     input.addEventListener(
         "change", function() {
@@ -39,28 +59,7 @@ EM_JS(void, WasmJsPickFile, (const char* dir, int dirLen, char* out, int outCap)
                 return;
             }
             file.arrayBuffer().then(
-                function(bytes) {
-                    var path = dirPath + "/" + file.name;
-                    try {
-                        FS.writeFile(path, new Uint8Array(bytes));
-                    } catch (e) {
-                        console.error("writing " + path + " failed", e);
-                        done(null);
-                        return;
-                    }
-                    var save = Module.sumatraStorageSave;
-                    if (!save) {
-                        console.error("saving " + path + " to OPFS failed", "storage is not initialized");
-                        done(path);
-                        return;
-                    }
-                    save(function(err) {
-                        if (err) {
-                            console.error("saving " + path + " to OPFS failed", err);
-                        }
-                        done(path);
-                    });
-                },
+                function(bytes) { store(file.name, bytes); },
                 function(e) {
                     console.error("reading the picked file failed", e);
                     done(null);
@@ -74,24 +73,31 @@ EM_JS(void, WasmJsPickFile, (const char* dir, int dirLen, char* out, int outCap)
 EM_JS(void, WasmJsDownload, (const char* path, int pathLen, const char* name, int nameLen), {
     var filePath = UTF8ToString(path, pathLen);
     var fileName = UTF8ToString(name, nameLen);
-    var bytes;
-    try {
-        bytes = FS.readFile(filePath);
-    } catch (e) {
-        console.error("reading " + filePath + " failed", e);
-        return;
-    }
-    var url = URL.createObjectURL(new Blob([bytes], {
-        type:
-            "application/octet-stream"
-    }));
-    var a = document.createElement("a");
-    a.href = url;
-    a.download = fileName;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
+    // bytes() copies out of MEMFS, so a host that declines doesn't pay for it
+    var hostArg = {name : fileName, path : filePath, bytes : function(){return FS.readFile(filePath); }
+}
+;
+if (Module.sumatraHostCall && Module.sumatraHostCall("download", hostArg)) {
+    return;
+}
+var bytes;
+try {
+    bytes = FS.readFile(filePath);
+} catch (e) {
+    console.error("reading " + filePath + " failed", e);
+    return;
+}
+var url = URL.createObjectURL(new Blob([bytes], {
+type:
+    "application/octet-stream"
+}));
+var a = document.createElement("a");
+a.href = url;
+a.download = fileName;
+document.body.appendChild(a);
+a.click();
+a.remove();
+setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
 });
 
 // NOLINTNEXTLINE
@@ -135,6 +141,88 @@ void WasmPickFile(const Func1<Str>& onPicked) {
     gPickedPath[0] = 0;
     Str dir((char*)kWasmUploadDir);
     WasmJsPickFile(dir.s, dir.len, gPickedPath, (int)dimof(gPickedPath));
+}
+
+// Open from URL: the fetches in flight, each with the buffer its stored path
+// comes back in ("" when it failed)
+struct WasmUrlFetch {
+    Func1<Str> onStored;
+    char path[1024];
+};
+static WasmUrlFetch gUrlFetches[8];
+
+// NOLINTNEXTLINE
+EM_JS(void, WasmJsFetchUrl,
+      (const char* url, int urlLen, const char* name, int nameLen, int slot, char* out, int outCap), {
+          var u = UTF8ToString(url, urlLen);
+          var n = UTF8ToString(name, nameLen);
+          var settled = false;
+          var done = function(path) {
+              if (settled) return;
+              settled = true;
+              stringToUTF8(path ? path : "", out, outCap);
+              _sumatra_wasm_url_fetched(slot);
+          };
+          // stored like a dropped file: a taken name gets a numbered one
+          var store = function(file) {
+              if (!file || !file.bytes) {
+                  done(null);
+                  return;
+              }
+              Module.sumatraStoreUpload("/uploads", String(file.name || n), file.bytes)
+                  .then(
+                      done, function(e) {
+                          console.error("storing " + n + " failed", e);
+                          done(null);
+                      });
+          };
+          // a host can fetch it another way, e.g. through its server for a site
+          // that doesn't allow cross-origin requests (docs/wasm-host-api.md)
+          if (Module.sumatraHostCall && Module.sumatraHostCall("fetchUrl", {url : u, name : n, done : store})) {
+              return;
+          }
+          fetch(u)
+              .then(function(r) {
+                  if (!r.ok) throw new Error("HTTP " + r.status);
+                  return r.arrayBuffer();
+              })
+              .then(
+                  function(bytes) { store({name : n, bytes : bytes}); },
+                  function(e) {
+                      console.error("fetching " + u + " failed", e);
+                      done(null);
+                  });
+      });
+
+extern "C" EMSCRIPTEN_KEEPALIVE void sumatra_wasm_url_fetched(int slot) {
+    if (slot < 0 || slot >= (int)dimof(gUrlFetches)) {
+        return;
+    }
+    WasmUrlFetch& f = gUrlFetches[slot];
+    Func1<Str> cb = f.onStored;
+    f.onStored = {};
+    TempStr path = str::DupTemp(Str(f.path));
+    f.path[0] = 0;
+    logf("sumatra_wasm_url_fetched: '%s'\n", path);
+    cb.Call(path);
+}
+
+// fetches url (or has the host fetch it) and stores it in kWasmUploadDir under
+// name; onStored gets its path, "" when it failed
+void WasmFetchUrl(Str url, Str name, const Func1<Str>& onStored) {
+    dir::CreateAll(Str((char*)kWasmUploadDir));
+    for (int i = 0; i < (int)dimof(gUrlFetches); i++) {
+        WasmUrlFetch& f = gUrlFetches[i];
+        if (f.onStored.IsValid()) {
+            continue;
+        }
+        f.onStored = onStored;
+        f.path[0] = 0;
+        WasmJsFetchUrl(url.s, url.len, name.s, name.len, i, f.path, (int)dimof(f.path));
+        return;
+    }
+    logf("WasmFetchUrl: too many downloads at once\n");
+    onStored.Call(Str());
 }
 
 bool WasmDownloadFile(Str path) {
@@ -277,9 +365,75 @@ bool WasmPrintPdf(Str path) {
     return WasmJsPrintPdf(path.s, path.len) != 0;
 }
 
+// NOLINTNEXTLINE
+EM_JS(int, WasmJsOpenHtml, (const char* path, int pathLen), {
+    var filePath = UTF8ToString(path, pathLen);
+    var bytes;
+    try {
+        bytes = FS.readFile(filePath);
+    } catch (e) {
+        console.error("reading " + filePath + " failed", e);
+        return 0;
+    }
+    var url = URL.createObjectURL(new Blob([bytes], {
+        type:
+            "text/html"
+    }));
+    // no "noopener": with it window.open answers null, so a blocked tab
+    // couldn't be told apart
+    var w = window.open(url, "_blank");
+    setTimeout(function() { URL.revokeObjectURL(url); }, 60000);
+    if (!w) return 0;
+    w.opener = null;
+    return 1;
+});
+
+bool WasmOpenHtmlFile(Str path) {
+    if (!file::Exists(path)) {
+        return false;
+    }
+    return WasmJsOpenHtml(path.s, path.len) != 0;
+}
+
 void WasmPersistSettings() {
     Str dir((char*)kWasmSettingsDir);
     WasmJsPersist(dir.s, dir.len);
+}
+
+// NOLINTNEXTLINE
+EM_JS(void, WasmJsExit, (), {
+    // the app is gone: no more flushes, and no prompt when the host navigates
+    Module.__exited = true;
+    // without a host nothing navigates away, and the canvas would stay up,
+    // frozen on the last frame
+    var showClosed = function() {
+        var canvas = document.getElementById("gpui-canvas");
+        if (canvas) canvas.style.display = "none";
+        var div = document.createElement("div");
+        div.style.cssText = "font: 16px system-ui, sans-serif; padding: 48px; text-align: center";
+        div.textContent = "SumatraPDF was closed. ";
+        var a = document.createElement("a");
+        a.href = location.href;
+        a.textContent = "Open it again";
+        div.appendChild(a);
+        document.body.appendChild(div);
+    };
+    var notify = function(err) {
+        if (err) console.error("saving to OPFS before exit failed", err);
+        var handled = Module.sumatraHostCall && Module.sumatraHostCall("exit", {saved : !err});
+        if (!handled) showClosed();
+    };
+    if (Module.sumatraStorageSave) {
+        Module.sumatraStorageSave(notify);
+        return;
+    }
+    notify("storage is not initialized");
+});
+
+// The app is quitting and its settings are in MEMFS: finish the write to OPFS,
+// then tell the host, which may navigate away.
+void WasmNotifyExit() {
+    WasmJsExit();
 }
 
 // NOLINTNEXTLINE
@@ -301,6 +455,45 @@ EM_JS(void, WasmJsFocusCanvas, (), {
 // #gpui-canvas is the only element whose keys gpui receives.
 void WasmFocusCanvas() {
     WasmJsFocusCanvas();
+}
+
+// NOLINTNEXTLINE
+EM_JS(int, WasmJsTakeDropped, (char* out, int outCap), {
+    var paths = Module.__droppedPaths;
+    if (!paths || paths.length == 0) return 0;
+    stringToUTF8(paths.shift(), out, outCap);
+    return 1;
+});
+
+void WasmTakeDroppedPathsTemp(Vec<Str>& out) {
+    char buf[1024];
+    while (WasmJsTakeDropped(buf, (int)dimof(buf))) {
+        VecAppend(out, (Str)str::DupTemp(Str(buf)));
+    }
+}
+
+// NOLINTNEXTLINE
+EM_JS(void, WasmJsStorageError, (char* out, int outCap), { stringToUTF8(Module.__storageError || "", out, outCap); });
+
+TempStr WasmStorageErrorTemp() {
+    char buf[512];
+    WasmJsStorageError(buf, (int)dimof(buf));
+    return str::DupTemp(Str(buf));
+}
+
+// NOLINTNEXTLINE
+EM_JS(void, WasmJsStorageLoadError, (char* out, int outCap), {
+    var s = window.__sumatraStorage || "";
+    stringToUTF8(s == "ready" ? "" : s, out, outCap);
+});
+
+TempStr WasmStorageLoadErrorTemp() {
+    char buf[512];
+    WasmJsStorageLoadError(buf, (int)dimof(buf));
+    if (buf[0] == 0) {
+        return {};
+    }
+    return str::DupTemp(Str(buf));
 }
 
 TempStr WasmQueryFileTemp() {

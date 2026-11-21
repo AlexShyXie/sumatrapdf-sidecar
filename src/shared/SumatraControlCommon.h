@@ -110,6 +110,7 @@ struct PacketReader {
     }
 };
 bool ParseArgList(PacketReader& r, Vec<ControlArg*>* args, bool explicitCount, u16 count = 0);
+void ControlPollSleep(u64 startMs);
 void RunWaitRenderIdle(ControlRequest* req);
 void RunWaitSessionRestored(ControlRequest* req);
 
@@ -139,14 +140,52 @@ bool ReadExact(int fd, void* data, u32 n);
 bool WriteExact(int fd, Str data);
 #endif
 
+// wire ids shared by both apps' ControlCmd. 101/102 differ, so they stay per app.
+enum class ControlFrameCmd : u16 {
+    Quit = 2,
+    WaitRenderIdle = 54,
+    CrashMe = 93,
+    WaitSessionRestored = 103,
+};
+
+enum class ControlFrameAction : u8 {
+    RunOnUi = 0,
+    WaitRenderIdle = 1,
+    WaitSessionRestored = 2,
+};
+
+struct ControlServeResult {
+    bool hadRequest = false;
+    bool wrote = false;
+    bool isQuit = false;
+};
+
+ControlFrameAction ControlFrameActionFor(u16 cmd);
+bool ControlCmdEndsListener(u16 cmd);
+using ControlExecFn = void (*)(ControlRequest*);
+ControlServeResult ServeControlRequest(ControlConn h, ControlExecFn execOnUi);
+
 struct LayoutProbeState {
     MainWindow* win = nullptr;
     int count = 0;
     bool active = false;
 };
 
+extern LayoutProbeState gLayoutProbe;
+void LayoutProbeNote(MainWindow* win);
+
 ControlRequest* ReadControlRequest(ControlConn h);
 bool WriteControlResponse(ControlConn h, ControlRequest* req);
 
 TempStr FavoriteNavResultTemp(Str action, int pageNo, int* exitCodeOut);
+TempStr ScrollStateResultTemp(int* exitCodeOut);
+TempStr ToggleCmdResultTemp(Str definition, int* exitCodeOut);
+TempStr CloneRenderDiffTemp(int* exitCodeOut);
+TempStr DocErrorsResultTemp(int* exitCodeOut);
 TempStr DisplayModeResultTemp(Str action, int* exitCodeOut);
+TempStr WordCountResultTemp(int* exitCodeOut);
+TempStr PageInfoTextResultTemp(int* exitCodeOut);
+TempStr PageInfoBarResultTemp(int* exitCodeOut);
+TempStr SelectedTextResultTemp(int* exitCodeOut);
+// implemented by each app
+TempStr TocRowsResultTemp(int* exitCodeOut);

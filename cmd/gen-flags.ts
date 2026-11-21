@@ -26,12 +26,8 @@ const args = [
     "WithSearch", "with-search",
     "WithPreview", "with-preview",
     "Rand", "rand",
-    "Regress", "regress",
     "Extract", "x",
-    "Tester", "tester",
-    "TestApp", "testapp",
     "TestPlugin", "test-plugin",
-    "TestPreview", "test-preview",
     "NewWindow", "new-window",
     "Log", "log",
     "LogToFile", "log-to-file",
@@ -81,7 +77,6 @@ const args = [
     "Adobe", "a",
     "DDE", "dde",
     "Pwd", "pwd",
-    "EngineDump", "engine-dump",
     "SetColorRange", "set-color-range",
     "UpgradeFrom", "upgrade-from",
     "ForTesting", "for-testing",
@@ -95,11 +90,11 @@ const args = [
     "ForAi", "for-ai",
     "NewWindowTabs", "new-window-tabs",
     "HtmlBackend", "html-backend",
-    "InstallRegRoot", "install-reg-root",
     "NoDesktopShortcut", "no-desktop-shortcut",
     "StartPerfLog", "start-perf-log",
     "LogPerfFile", "log-perf-file",
     "ConfigureRestrictedUse", "configure-restricted-use",
+    "WithThumbnails", "with-thumbnails",
 ];
 
 function generateCode(): string {

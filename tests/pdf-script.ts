@@ -1,15 +1,14 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { ControlCommand, type ControlClient } from "./control.ts";
 import { websiteDocsDir } from "../cmd/util.ts";
 import { IS_MAC } from "./host.ts";
 import { cmdId, EXE, pollUntil, runStandalone, tmpPath, USE_NG } from "./util.ts";
-import { clickAt, killAndWait, launchControlled, sendCommand } from "./win-automation.ts";
+import { killAndWait, launchControlled, sendCommand } from "./win-automation.ts";
 import {
   enumChildWindows,
   enumWindows,
   getClassName,
-  getClientRect,
   getControlText,
   getWindowPid,
   getWindowLong,
@@ -17,12 +16,7 @@ import {
   getWindowText,
   isWindowVisible,
   sendText,
-  clientToScreen,
   captureWindowDCRegionPixels,
-  postMessage,
-  WM_KEYDOWN,
-  VK_DOWN,
-  VK_HOME,
 } from "./winapi.ts";
 
 const PDF = resolve(import.meta.dir, "issue-1189.pdf");
@@ -74,6 +68,14 @@ async function checkExamples(): Promise<void> {
   }
 }
 
+// position in the embedded bundle; gen-pdf-scripts.ts orders it, so adding a script shifts indices
+function exampleIndex(info: string): number {
+  const scripts = readFileSync(resolve(import.meta.dir, "../.work/scripts.js"), "utf8").split("\n// ---\n");
+  const idx = scripts.findIndex((s) => s.includes(`// Info: ${info}\n`));
+  if (idx < 0) throw new Error(`no example script '${info}'`);
+  return idx;
+}
+
 type Node = { x: number; y: number; w: number; h: number; role: number; label: string; value: string };
 
 function nodes(raw: string): Node[] {
@@ -110,18 +112,23 @@ async function ngUi(client: ControlClient) {
       const fields = list.filter((n) => n.role === 17);
       const selector = list.find((n) => n.role === 31)!;
       const last = fields[fields.length - 1]!;
-      return (selector.y - selector.h / 2 - (last.y + last.h / 2)) / last.h;
+      // Add argument sits under the last row; the gap is what follows it
+      const add = list.find((n) => n.label === "Add argument");
+      const bottom = add ? add.y + add.h / 2 : last.y + last.h / 2;
+      return (selector.y - selector.h / 2 - bottom) / last.h;
     },
     async argumentHeight() {
       const list = await layout();
-      return list.find((n) => n.role === 31)!.y - list.find((n) => n.role === 17)!.y;
+      // the editor's top: it shrinks once there is output, which moves its center up
+      const editor = list.find((n) => n.role === 31)!;
+      return editor.y - editor.h / 2 - list.find((n) => n.role === 17)!.y;
     },
     async checkBorder() {},
     async add() {
       await click((await layout()).find((n) => n.label === "Add argument")!);
     },
     async remove() {
-      const buttons = (await layout()).filter((n) => n.label === "x");
+      const buttons = (await layout()).filter((n) => n.label === "Remove");
       await click(buttons[buttons.length - 1]!);
     },
     async setArg(text: string) {
@@ -152,7 +159,7 @@ async function ngUi(client: ControlClient) {
     async examples() {
       await click((await layout()).find((n) => n.label === "Example Scripts")!);
     },
-    async pickExample(index: number, name: string) {
+    async pickExample(name: string) {
       name = name.replace(/\.$/, "");
       const list = await pollUntil(
         layout,
@@ -173,7 +180,7 @@ async function ngUi(client: ControlClient) {
   };
 }
 
-async function originalUi(pid: number) {
+async function originalUi(pid: number, client: ControlClient) {
   let dialog = 0;
   await pollUntil(
     () => {
@@ -195,6 +202,14 @@ async function originalUi(pid: number) {
     });
     return list;
   };
+  // TestPdfScript does what the drawn buttons do. Its reply has the Add
+  // argument button's screen rect.
+  const scriptCmd = async (action: string, idx = -1) => {
+    const res = await client.request(ControlCommand.TestPdfScript, [action, idx]);
+    const raw = String(res[1] ?? "");
+    if (res[0] !== 0) throw new Error(`TestPdfScript ${action}: ${raw}`);
+    return raw;
+  };
   const argEdits = () => edits().filter((h) => !(getWindowLong(h, -16) & 4));
   const scriptEdit = () => edits().find((h) => getWindowLong(h, -16) & 4 && !(getWindowLong(h, -16) & 0x800))!;
   const outputEdit = () => edits().find((h) => getWindowLong(h, -16) & 0x800)!;
@@ -209,7 +224,11 @@ async function originalUi(pid: number) {
     async argumentGap() {
       const fields = argEdits();
       const last = getWindowRect(fields[fields.length - 1]!);
-      return (getWindowRect(scriptEdit()).top - last.bottom) / (last.bottom - last.top);
+      // Add argument sits under the last row; the gap is what follows it
+      const add = /add=(-?\d+),(-?\d+),(\d+),(\d+)/.exec(await scriptCmd("state"));
+      if (!add) throw new Error("no Add argument rect");
+      const addBottom = Number(add[2]) + Number(add[4]);
+      return (getWindowRect(scriptEdit()).top - addBottom) / (last.bottom - last.top);
     },
     async checkBorder() {
       const fields = argEdits();
@@ -234,14 +253,10 @@ async function originalUi(pid: number) {
       return getWindowRect(scriptEdit()).top - getWindowRect(argEdits()[0]!).top;
     },
     async add() {
-      const origin = clientToScreen(dialog, 0, 0);
-      await clickAt(dialog, getClientRect(dialog).right - 40, getWindowRect(scriptEdit()).top - origin.y - 20, 0);
+      await scriptCmd("add");
     },
     async remove() {
-      const fields = argEdits();
-      const rc = getWindowRect(fields[fields.length - 1]!);
-      const origin = clientToScreen(dialog, 0, 0);
-      await clickAt(dialog, getClientRect(dialog).right - 26, (rc.top + rc.bottom) / 2 - origin.y, 0);
+      await scriptCmd("remove");
     },
     async setArg(text: string) {
       const fields = argEdits();
@@ -251,8 +266,7 @@ async function originalUi(pid: number) {
       sendText(scriptEdit(), text);
     },
     async run() {
-      const rc = getClientRect(dialog);
-      await clickAt(dialog, rc.right - 50, rc.bottom - 20, 0);
+      await scriptCmd("run");
     },
     async output() {
       const h = outputEdit();
@@ -261,17 +275,13 @@ async function originalUi(pid: number) {
     async args() {
       return argEdits().map((h) => getControlText(h));
     },
+    // the list's buttons and rows are drawn, not windows: the control channel
+    // does what clicking them does
     async examples() {
-      const origin = clientToScreen(dialog, 0, 0);
-      const editor = getWindowRect(scriptEdit());
-      await clickAt(dialog, editor.left - origin.x + 70, getClientRect(dialog).bottom - 20, 0);
+      await scriptCmd("examples");
     },
-    async pickExample(index: number, name: string) {
-      const origin = clientToScreen(dialog, 0, 0);
-      const editor = getWindowRect(scriptEdit());
-      await clickAt(dialog, editor.right - origin.x + 24, 18, 0);
-      postMessage(dialog, WM_KEYDOWN, VK_HOME, 0);
-      for (let i = 0; i < index; i++) postMessage(dialog, WM_KEYDOWN, VK_DOWN, 0);
+    async pickExample(name: string) {
+      await scriptCmd("pick", exampleIndex(name));
     },
     async script() {
       return getControlText(scriptEdit());
@@ -291,7 +301,7 @@ export async function testit(): Promise<void> {
   try {
     await client.waitForRenderIdle();
     sendCommand(frame, cmdId("CmdRunPDFScript"));
-    const ui = USE_NG ? await ngUi(client) : await originalUi(proc.pid!);
+    const ui = USE_NG ? await ngUi(client) : await originalUi(proc.pid!, client);
     if (existsSync(join(websiteDocsDir, "scripts"))) {
       if (!(await ui.script()).includes("\n")) throw new Error("initial script lost its line breaks");
       if (!(await ui.script()).startsWith("// Info: Print the page count of a PDF.")) {
@@ -300,8 +310,15 @@ export async function testit(): Promise<void> {
       const firstArgs = await ui.args();
       if (firstArgs.length !== 1 || firstArgs[0] !== input)
         throw new Error("initial example needs only its input argument");
+      // the usual dialog run: one input path and no output argument
+      await ui.run();
+      await pollUntil(
+        () => ui.output(),
+        (s) => s.trim() === "1",
+        { timeoutMs: 10000, error: (s) => `one-argument script: ${JSON.stringify(s)}` },
+      );
       await ui.examples();
-      await ui.pickExample(1, "Add a free-text annotation to the first page.");
+      await ui.pickExample("Add a free-text annotation to the first page.");
       await pollUntil(
         () => ui.script(),
         (s) => s.includes("Add a free-text annotation to the first page."),
@@ -310,7 +327,8 @@ export async function testit(): Promise<void> {
         },
       );
       if (!(await ui.script()).startsWith("// Info:")) throw new Error("example script starts with empty lines");
-      if ((await ui.argumentRowGap()) > 0.5) throw new Error("argument fields still have label rows");
+      // a label row over each field would put a field's height between them
+      if ((await ui.argumentRowGap()) > 1) throw new Error("argument fields still have label rows");
       const argumentIds = (await ui.argumentIds()).slice(0, 1);
       await ui.examples();
       await ui.add();
@@ -321,10 +339,10 @@ export async function testit(): Promise<void> {
       );
       await ui.setArg("discard this value");
       await ui.examples();
-      await ui.pickExample(2, "Render every page as a PNG at 96 DPI.");
+      await ui.pickExample("Render every page as a PNG at 96 DPI.");
       await pollUntil(
         () => ui.args(),
-        (args) => args.length === 2 && args[1] === dirname(input) + "/" + basename(stem) + "-[page].png",
+        (args) => args.length === 2 && args[1] === join(dirname(input), basename(stem) + "-[page].png"),
         {
           error: (args) => `DIR and BASE hints: ${JSON.stringify(args)}`,
         },
@@ -332,7 +350,7 @@ export async function testit(): Promise<void> {
       if (JSON.stringify((await ui.argumentIds()).slice(0, 1)) !== JSON.stringify(argumentIds)) {
         throw new Error("selecting an example recreated its first argument control");
       }
-      await ui.pickExample(4, "Copy bookmarks from another document.");
+      await ui.pickExample("Copy bookmarks from another document.");
       await pollUntil(
         () => ui.args(),
         (args) => args.length === 3 && args[2] === "",
@@ -340,7 +358,7 @@ export async function testit(): Promise<void> {
           error: (args) => `empty hinted argument: ${JSON.stringify(args)}`,
         },
       );
-      await ui.pickExample(5, "Create a PDF with one blank page.");
+      await ui.pickExample("Create a PDF with one blank page.");
       await pollUntil(
         () => ui.args(),
         (args) => args.length === 1 && args[0] === stem + ".3.pdf",
@@ -348,7 +366,7 @@ export async function testit(): Promise<void> {
           error: (args) => `output-only example: ${JSON.stringify(args)}`,
         },
       );
-      await ui.pickExample(10, "Crop page margins using rendered content bounds.");
+      await ui.pickExample("Crop page margins using rendered content bounds.");
       await pollUntil(
         () => ui.args(),
         (args) => args.length === 4 && args[2] === "6" && args[3] === "all",
@@ -356,7 +374,7 @@ export async function testit(): Promise<void> {
           error: (args) => `numeric and text defaults: ${JSON.stringify(args)}`,
         },
       );
-      await ui.pickExample(1, "Add a free-text annotation to the first page.");
+      await ui.pickExample("Add a free-text annotation to the first page.");
       await pollUntil(
         () => ui.args(),
         (args) => args.length === 2,
@@ -377,7 +395,12 @@ export async function testit(): Promise<void> {
         await ui.setArg(value);
       }
     }
-    const args = await ui.args();
+    // ng reads the fields off the last frame, which may not have the last char yet
+    const args = await pollUntil(
+      () => ui.args(),
+      (got) => got.length === 2 && got[0] === input && got[1] === stem + ".3.pdf",
+      { timeoutMs: 3000, error: (got) => `bad default arguments: ${JSON.stringify(got)}` },
+    );
     const initialHeight = await ui.argumentHeight();
     const gap = await ui.argumentGap();
     const maxGapRows = 2;

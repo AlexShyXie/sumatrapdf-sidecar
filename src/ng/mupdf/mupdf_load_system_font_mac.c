@@ -3,6 +3,7 @@
 
 #include "mupdf/fitz.h"
 #include "mupdf/ucdn.h"
+#include "mupdf/font_common.h"
 
 #include <CoreText/CoreText.h>
 
@@ -56,7 +57,9 @@ static void free_tables(mac_font_table* tables, int count) {
     free(tables);
 }
 
-static fz_font* load_ct_font_data(fz_context* ctx, const char* name, CTFontRef ct_font) {
+// ct_font's tables as one sfnt file, malloc'ed; NULL on failure
+static unsigned char* ct_font_sfnt(CTFontRef ct_font, size_t* total_out) {
+    *total_out = 0;
     CFArrayRef tags = CTFontCopyAvailableTables(ct_font, kCTFontTableOptionNoOptions);
     if (!tags) {
         return NULL;
@@ -150,7 +153,17 @@ static fz_font* load_ct_font_data(fz_context* ctx, const char* name, CTFontRef c
     if (head_offset) {
         write_be32(font_data + head_offset + 8, 0xb1b0afba - table_checksum(font_data, total));
     }
+    free_tables(tables, count);
+    *total_out = total;
+    return font_data;
+}
 
+static fz_font* load_ct_font_data(fz_context* ctx, const char* name, CTFontRef ct_font) {
+    size_t total = 0;
+    unsigned char* font_data = ct_font_sfnt(ct_font, &total);
+    if (!font_data) {
+        return NULL;
+    }
     fz_buffer* buffer = NULL;
     fz_font* font = NULL;
     fz_try(ctx) {
@@ -159,14 +172,11 @@ static fz_font* load_ct_font_data(fz_context* ctx, const char* name, CTFontRef c
     }
     fz_always(ctx) {
         fz_drop_buffer(ctx, buffer);
+        free(font_data);
     }
     fz_catch(ctx) {
-        free(font_data);
-        free_tables(tables, count);
         fz_rethrow(ctx);
     }
-    free(font_data);
-    free_tables(tables, count);
     return font;
 }
 
@@ -240,6 +250,23 @@ static CFStringRef string_for_rune(unsigned int rune) {
     return CFStringCreateWithCharacters(NULL, chars, count);
 }
 
+static int ct_font_has_rune(CTFontRef font, unsigned int rune) {
+    UniChar chars[2];
+    CGGlyph glyphs[2] = {0, 0};
+    CFIndex count = 1;
+    if (rune <= 0xffff) {
+        chars[0] = (UniChar)rune;
+    } else {
+        unsigned int r = rune - 0x10000;
+        chars[0] = (UniChar)(0xd800 + (r >> 10));
+        chars[1] = (UniChar)(0xdc00 + (r & 0x3ff));
+        count = 2;
+    }
+    return CTFontGetGlyphsForCharacters(font, chars, glyphs, count) && glyphs[0] != 0;
+}
+
+// A font that has rune, or NULL. CoreText falls back to the base font when no
+// font has it; that one would draw boxes instead of mupdf's own fallback font.
 static CTFontRef create_fallback_font(int serif, int bold, int italic, unsigned int rune) {
     CTFontRef base = create_named_font(serif ? "Times" : "Helvetica", bold, italic, 0);
     if (!base || !rune) {
@@ -250,15 +277,31 @@ static CTFontRef create_fallback_font(int serif, int bold, int italic, unsigned 
     if (text) {
         CFRelease(text);
     }
-    if (!font) {
-        return base;
-    }
     CFRelease(base);
+    if (font && !ct_font_has_rune(font, rune)) {
+        CFRelease(font);
+        font = NULL;
+    }
     return font;
 }
 
+// Chinese text: Songti SC and PingFang SC, CoreText's picks, have half-width
+// curly quotes, which set Chinese text too tight (#6500); Hiragino Sans GB's
+// are full width, like Microsoft YaHei's on Windows
+static CTFontRef create_han_font(int serif, int bold, int italic) {
+    CTFontRef font = create_named_font("Hiragino Sans GB", bold, italic, 1);
+    if (font && ct_font_has_rune(font, 0x4e00)) {
+        return font;
+    }
+    if (font) {
+        CFRelease(font);
+    }
+    return create_fallback_font(serif, bold, italic, 0x4e00);
+}
+
 static fz_font* load_mac_font(fz_context* ctx, const char* name, int bold, int italic, int exact) {
-    CTFontRef font = create_named_font(name, bold, italic, exact);
+    CTFontRef font = is_cjk_body_font_alias(name, &bold) ? create_han_font(0, bold, italic)
+                                                         : create_named_font(name, bold, italic, exact);
     if (!font) {
         return NULL;
     }
@@ -274,7 +317,14 @@ static fz_font* load_mac_cjk_font(fz_context* ctx, const char* name, int orderin
     } else if (ordering == FZ_ADOBE_KOREA) {
         rune = 0xac00;
     }
-    CTFontRef font = name && *name ? create_named_font(name, 0, 0, 0) : create_fallback_font(serif, 0, 0, rune);
+    CTFontRef font = name && *name ? create_named_font(name, 0, 0, 0) : NULL;
+    if (font && !ct_font_has_rune(font, rune)) {
+        CFRelease(font);
+        font = NULL;
+    }
+    if (!font) {
+        font = rune == 0x4e00 ? create_han_font(serif, 0, 0) : create_fallback_font(serif, 0, 0, rune);
+    }
     if (!font) {
         return NULL;
     }
@@ -283,76 +333,57 @@ static fz_font* load_mac_cjk_font(fz_context* ctx, const char* name, int orderin
     return result;
 }
 
-static unsigned int fallback_rune(int script) {
-    switch (script) {
-        case UCDN_SCRIPT_ARABIC:
-            return 0x0627;
-        case UCDN_SCRIPT_ARMENIAN:
-            return 0x0531;
-        case UCDN_SCRIPT_BENGALI:
-            return 0x0985;
-        case UCDN_SCRIPT_CYRILLIC:
-            return 0x0410;
-        case UCDN_SCRIPT_DEVANAGARI:
-            return 0x0905;
-        case UCDN_SCRIPT_ETHIOPIC:
-            return 0x1200;
-        case UCDN_SCRIPT_GEORGIAN:
-            return 0x10d0;
-        case UCDN_SCRIPT_GREEK:
-            return 0x0391;
-        case UCDN_SCRIPT_GUJARATI:
-            return 0x0a85;
-        case UCDN_SCRIPT_GURMUKHI:
-            return 0x0a05;
-        case UCDN_SCRIPT_HANGUL:
-            return 0xac00;
-        case UCDN_SCRIPT_HEBREW:
-            return 0x05d0;
-        case UCDN_SCRIPT_HIRAGANA:
-        case UCDN_SCRIPT_KATAKANA:
-            return 0x3042;
-        case UCDN_SCRIPT_KANNADA:
-            return 0x0c85;
-        case UCDN_SCRIPT_KHMER:
-            return 0x1780;
-        case UCDN_SCRIPT_LAO:
-            return 0x0e81;
-        case UCDN_SCRIPT_MALAYALAM:
-            return 0x0d05;
-        case UCDN_SCRIPT_MYANMAR:
-            return 0x1000;
-        case UCDN_SCRIPT_ORIYA:
-            return 0x0b05;
-        case UCDN_SCRIPT_SINHALA:
-            return 0x0d85;
-        case UCDN_SCRIPT_TAMIL:
-            return 0x0b85;
-        case UCDN_SCRIPT_TELUGU:
-            return 0x0c05;
-        case UCDN_SCRIPT_THAI:
-            return 0x0e01;
-        case UCDN_SCRIPT_TIBETAN:
-            return 0x0f40;
-        case UCDN_SCRIPT_YI:
-            return 0xa000;
-        case UCDN_SCRIPT_HAN:
-        case UCDN_SCRIPT_BOPOMOFO:
-            return 0x4e00;
-        default:
-            return 0x0041;
-    }
-}
-
 static fz_font* load_mac_fallback_font(fz_context* ctx, int script, int language, int serif, int bold, int italic) {
     (void)language;
-    CTFontRef font = create_fallback_font(serif, bold, italic, fallback_rune(script));
+    unsigned int rune = fallback_rune(script);
+    if (!rune) {
+        return NULL;
+    }
+    CTFontRef font = script == UCDN_SCRIPT_HAN ? create_han_font(serif, bold, italic)
+                                               : create_fallback_font(serif, bold, italic, rune);
     if (!font) {
         return NULL;
     }
     fz_font* result = load_ct_font_data(ctx, NULL, font);
     CFRelease(font);
     return result;
+}
+
+// whether CoreText has outlines for the font: Apple Color Emoji has only
+// bitmaps (sbix), which mupdf doesn't draw
+static int ct_font_has_outlines(CTFontRef font) {
+    const CTFontTableTag tags[] = {0x676c7966 /* glyf */, 0x43464620 /* CFF */, 0x43464632 /* CFF2 */};
+    for (size_t i = 0; i < sizeof(tags) / sizeof(tags[0]); i++) {
+        CFDataRef data = CTFontCopyTable(font, tags[i], kCTFontTableOptionNoOptions);
+        if (data) {
+            CFRelease(data);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The bytes of a system font that has rune, malloc'ed, or NULL. For the
+// built-in font loader (EmbeddedResources.cpp), e.g. Apple Symbols for the
+// symbols mupdf would otherwise download Noto fonts for.
+unsigned char* sumatra_system_font_data_for_rune(unsigned int rune, int* size) {
+    *size = 0;
+    CTFontRef font = create_fallback_font(0, 0, 0, rune);
+    if (!font) {
+        return NULL;
+    }
+    unsigned char* data = NULL;
+    size_t total = 0;
+    if (ct_font_has_outlines(font)) {
+        data = ct_font_sfnt(font, &total);
+    }
+    CFRelease(font);
+    if (!data || total > INT32_MAX) {
+        free(data);
+        return NULL;
+    }
+    *size = (int)total;
+    return data;
 }
 
 void install_load_mac_font_funcs(fz_context* ctx) {

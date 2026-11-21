@@ -28,6 +28,7 @@
 #include "MainWindow.h"
 #include "ReadingBar.h"
 #include "ReadingAutoScroll.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Commands.h"
 #include "Favorites.h"
@@ -80,6 +81,14 @@ static MenuDef menuDefSelection[] = {
     {
         TrN("&Zoom To Selection"),
         CmdZoomToSelection,
+    },
+    {
+        TrN("Count &Words"),
+        CmdCountWords,
+    },
+    {
+        TrN("Show Selected Te&xt"),
+        CmdShowSelectedText,
     },
     {
         StrL(kMenuSeparator),
@@ -158,6 +167,14 @@ static MenuDef menuDefContext[] = {
     {
         TrN("Sh&ow Toolbar"),
         CmdToggleToolbar,
+    },
+    {
+        TrN("Show Caption"),
+        CmdToggleCaption,
+    },
+    {
+        TrN("Auto-hide Sidebar"),
+        CmdToggleSidebarAutoHide,
     },
     {
         StrL(kMenuSeparator),
@@ -520,9 +537,11 @@ MenuModel* BuildMenuFromDef(MenuDef* menuDef, BuildMenuCtx* ctx) {
         }
         // custom selection handlers go before the built-in translate / search submenus
         if (md.idOrSubmenu == (UINT_PTR)menuDefTranslateWith) {
-            if (menuDef == menuDefMainSelection) {
+            // handlers run on selected text; comics and images have none
+            bool canSelectText = !ctx || !ctx->isImageCollection;
+            if (canSelectText && menuDef == menuDefMainSelection) {
                 AppendSelectionHandlersToMenu(menu, true);
-            } else if (menuDef == menuDefSelection) {
+            } else if (canSelectText && menuDef == menuDefSelection) {
                 AppendSelectionHandlersToMenu(menu, ctx ? ctx->hasSelection : false);
             }
         }
@@ -674,8 +693,21 @@ static void SetMenuChecks(MenuModel* menu, MainWindow* win) {
             it.checked = gSettings && gSettings->comicBookUI.autoRotateWidePages;
             continue;
         }
+        if (it.cmdId == CmdToggleMirror) {
+            DisplayModel* dmMirror = win->AsFixed();
+            it.checked = dmMirror && dmMirror->GetMirror();
+            continue;
+        }
         if (it.cmdId == CmdTogglePageGrid) {
             it.checked = ShowPageGrid();
+            continue;
+        }
+        if (it.cmdId == CmdToggleCaption) {
+            it.checked = gSettings->showCaption;
+            continue;
+        }
+        if (it.cmdId == CmdToggleSidebarAutoHide) {
+            it.checked = gSettings->sidebarAutoHide;
             continue;
         }
         if (it.cmdId == CmdToggleBookmarks || it.cmdId == CmdToggleTableOfContents) {
@@ -700,6 +732,10 @@ static void SetMenuChecks(MenuModel* menu, MainWindow* win) {
         }
         if (it.cmdId == CmdToggleTransparencyGrid) {
             it.checked = ShowTransparencyGrid();
+            continue;
+        }
+        if (it.cmdId == CmdMeasure) {
+            it.checked = win->measurementToolbar != nullptr;
             continue;
         }
         if (it.cmdId == CmdToggleImages) {
@@ -907,7 +943,7 @@ MenuModel* BuildWindowContextMenu(MainWindow* win, Point cursorPos) {
     MenuModel* popup = BuildMenuFromDef(menuDefContext, ctx);
 
     // in fullscreen, add "Menu" as first item containing the full menu bar
-    bool isFullScreen = win->isFullScreen || win->presentation;
+    bool isFullScreen = win->IsFullScreenOrPresentation();
     if (isFullScreen) {
         MenuModel* bar = BuildMenuFromDef(menuDefMenubar, ctx);
         SetMenuChecks(bar, win);
@@ -970,6 +1006,7 @@ MenuModel* BuildWindowContextMenu(MainWindow* win, Point cursorPos) {
     MenuSetChecked(popup, CmdToggleThumbnails, SidebarContentVisible(win, SidebarContent::Thumbnails));
 
     MenuSetEnabled(popup, CmdFavoriteToggle, HasFavorites());
+    MenuSetEnabled(popup, CmdEditFavorites, HasFavorites());
     MenuSetChecked(popup, CmdFavoriteToggle, SidebarContentVisible(win, SidebarContent::Favorites));
 
     Str filePath = win->ctrl->GetFilePath();
@@ -1146,11 +1183,11 @@ void WindowContextMenuCommand(MainWindow* win, int cmdId) {
             }
             IPageDestination* elDest = pageEl->AsLink();
             auto* pd = (PageDestination*)elDest;
-            if (!pd || pd->embedObjNum <= 0) {
+            if (!pd) {
                 return;
             }
             // attachments are arbitrary binary
-            Str data = EngineMupdfLoadAnnotAttachment(engine, pd->embedObjNum);
+            Str data = EngineMupdfLoadEmbedded(engine, pd);
             if (len(data) == 0) {
                 return;
             }
@@ -1164,10 +1201,17 @@ void WindowContextMenuCommand(MainWindow* win, int cmdId) {
         }
         case CmdCopyImage: {
             if (pageEl) {
+#if OS_WIN
                 RenderedBitmap* bmp = engine->GetImageForPageElement(pageEl);
                 if (bmp) {
                     CopyRenderedBitmapToClipboard(win, bmp);
                 }
+#else
+                // ng: off Windows the clipboard takes the image as a PNG
+                Str png = engine->GetImagePngForPageElement(pageEl);
+                CopyPngToClipboard(win, png);
+                str::Free(png);
+#endif
             }
             return;
         }
@@ -1256,7 +1300,7 @@ void ToggleMenuBar(MainWindow* win, bool showTemporarily) {
     if (showTemporarily) {
         return;
     }
-    if (win->isFullScreen) {
+    if (win->IsFullScreen()) {
         gSettings->fullscreen.showMenubar = !gSettings->fullscreen.showMenubar;
         win->isMenuBarVisible = gSettings->fullscreen.showMenubar;
     } else {

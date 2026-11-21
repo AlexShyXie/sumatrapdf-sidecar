@@ -5,6 +5,7 @@
 #include "gui/Dpi.h"
 #include "base/File.h"
 #include "base/Win.h"
+#include "base/UITask.h"
 
 #include "gui/UIModels.h"
 #include "gui/Layout.h"
@@ -24,6 +25,7 @@
 #include "SumatraPDF.h"
 #include "DocumentProperties.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Commands.h"
 #include "CommandAvailability.h"
@@ -37,9 +39,12 @@
 #include "FileHistory.h"
 #include "Theme.h"
 #include "Translations.h"
+#include "HomePage.h"
+#include "AppTools.h"
 #include "Tabs.h"
 #include "MenuDefs.h"
 #include "TabsCommon.h"
+#include "StripGroups.h"
 
 void UpdateTabPageText(WindowTab* tab) {
     if (!tab || !tab->win || !tab->win->tabsCtrl) {
@@ -61,6 +66,11 @@ static void UpdateTabTitle(WindowTab* tab) {
         dirty = EngineHasUnsavedAnnotations(tab->AsFixed()->GetEngine());
     }
     TempStr tooltip = MakeTabTooltipTemp(tab->filePath, dirty);
+    // a "+" Home tab a document was opened in is sized like the other documents
+    TabInfo* ti = win->tabsCtrl->GetTab(idx);
+    if (ti) {
+        ti->fitToLabel = tab->IsAboutTab();
+    }
     win->tabsCtrl->SetTextAndTooltip(idx, title, tooltip);
     UpdateTabPageText(tab);
 }
@@ -94,13 +104,14 @@ void UpdateTabWidth(MainWindow* win) {
     // even when it is the only tab left.
     bool onlyHomeTab = nTabs == 1 && win->GetTab(0)->IsAboutTab();
     bool showSingleTab = SettingsUseTabs() || win->tabsInTitlebar;
-    bool showTabs = !onlyHomeTab && ((nTabs > 1) || (showSingleTab && (nTabs > 0)));
+    bool showTabs = !onlyHomeTab && !win->isQuickLook && ((nTabs > 1) || (showSingleTab && (nTabs > 0)));
     // TabWidth is stored in logical (96-DPI) units, same as other layout
     // settings; convert to physical pixels so HiDPI monitors honor the value
     // (issue #3850). Height already uses DpiScale via GetTabbarHeight.
     if (win->tabsCtrl) {
         HWND hwnd = win->tabsCtrl->hwnd ? win->tabsCtrl->hwnd : win->hwndFrame;
         win->tabsCtrl->tabDefaultDx = DpiScale(gSettings->tabWidth);
+        win->tabsCtrl->equalWidth = gSettings->tabsEqualWidth;
     }
     // Lay out only when the bar stays visible. Hiding it right after
     // TabCtrl_SetItemSize invalidated the control leaves a pending WM_PAINT for
@@ -113,6 +124,11 @@ void UpdateTabWidth(MainWindow* win) {
     if (win->tabsCtrl) {
         win->tabsCtrl->LayoutTabs();
     }
+}
+
+// posted: the click comes from the button that adding a tab rebuilds
+static void OnTabsPlusClick(MainWindow* win) {
+    HwndPostCommand(win->hwndFrame, CmdNewTab);
 }
 
 void RemoveTab(WindowTab* tab) {
@@ -143,6 +159,8 @@ void RemoveTab(WindowTab* tab) {
     // when the last document closes (formerly a special case; now UpdateTabWidth
     // itself treats Home-only as "no tabs").
     UpdateTabWidth(win);
+    // the tab's strip group may have no tabs left
+    StripGroupsFix(win);
 
     int nTabs = win->TabCount();
     if (nTabs < 1) {
@@ -152,26 +170,13 @@ void RemoveTab(WindowTab* tab) {
         return;
     }
     // if the removed tab was the current one, select another
-#if 0
-    WindowTab* curr = win->CurrentTab();
-    WindowTab* newCurrent = curr;
-    if (!curr || newCurrent == tab) {
-        // TODO(tabs): why do I need win->tabSelectionHistory.Size() > 0
-        if (win->tabSelectionHistory->Size() > 0) {
-            newCurrent = win->tabSelectionHistory->Pop();
-        } else {
-            newCurrent = win->GetTab(0);
-        }
-    }
-    int newIdx = win->GetTabIdx(newCurrent);
-    win->tabsCtrl->SetSelected(newIdx);
-    tab = win->CurrentTab();
-    LoadModelIntoTab(tab);
-#else
     // select tab to the right or to the left if nothing to the right
-    int newIdx = idx;
-    int lastIdx = nTabs - 1;
-    newIdx = std::min(newIdx, lastIdx);
+    int newIdx = std::min(idx, nTabs - 1);
+    // not one hidden in a collapsed strip group
+    int visibleIdx = StripGroupNextVisible(win, newIdx);
+    if (visibleIdx >= 0) {
+        newIdx = visibleIdx;
+    }
     win->tabsCtrl->SetSelected(newIdx);
     tab = win->CurrentTab();
     // seen in crash report that tab was WindowTab::Type::None
@@ -179,7 +184,6 @@ void RemoveTab(WindowTab* tab) {
     if (tab && tab->type != WindowTab::Type::None) {
         LoadModelIntoTab(tab);
     }
-#endif
 }
 
 static void MaybeMigrateTab(WindowTab* tab, MainWindow* newWin, Point releasePt) {
@@ -262,9 +266,15 @@ static void MaybeMigrateTab(WindowTab* tab, MainWindow* newWin, Point releasePt)
     args.forceReuse = true;
     args.noSavePrefs = true;
     LoadDocument(&args);
+    // newTab owns the file now: don't let ~WindowTab delete an open-cache copy
+    str::FreePtr(&tab->filePath);
     delete tab;
 
     CloseWindowIfNoDocuments(oldWin);
+}
+
+void MaybeMigrateTab(WindowTab* tab, MainWindow* newWin) {
+    MaybeMigrateTab(tab, newWin, Point{});
 }
 
 // Selects the given tab (0-based index)
@@ -298,12 +308,6 @@ void TabsSelect(MainWindow* win, int tabIndex) {
     LoadModelIntoTab(tab);
 }
 
-// clang-format off
-extern bool SaveAnnotationsToExistingFile(WindowTab*);
-extern bool SaveAnnotationsToMaybeNewPdfFile(WindowTab*);
-
-// clang-format on
-
 void CloseAllTabs(MainWindow* win) {
     if (!win) {
         return;
@@ -321,15 +325,59 @@ void CloseAllTabs(MainWindow* win) {
     };
     // can't close while iterating over the tabs so collect them first
     Vec<WindowTab*> toClose;
-    int nTabs = win->TabCount();
-    for (int i = 0; i < nTabs; i++) {
-        WindowTab* t = win->GetTab(i);
-        if (t->IsAboutTab()) {
-            continue;
-        }
-        VecAppend(toClose, t);
-    }
+    CollectClosableTabs(win, toClose);
     CloseCollectedTabs(win, toClose);
+}
+
+// a submenu of `items` right after the item with `afterCmdId`; none if empty
+static void InsertSubmenuAfter(HMENU menu, int afterCmdId, Str title, const Vec<StripGroupMenuItem>& items) {
+    if (len(items) == 0) {
+        return;
+    }
+    int n = GetMenuItemCount(menu);
+    int pos = 0;
+    while (pos < n && (int)GetMenuItemID(menu, pos) != afterCmdId) {
+        pos++;
+    }
+    if (pos == n) {
+        return;
+    }
+    HMENU sub = CreatePopupMenu();
+    for (const StripGroupMenuItem& it : items) {
+        UINT flags = MF_STRING | (it.checked ? MF_CHECKED : 0);
+        AppendMenuW(sub, flags, it.cmdId, ToWStrTemp(it.title).s);
+    }
+    InsertMenuW(menu, pos + 1, MF_BYPOSITION | MF_POPUP, (UINT_PTR)sub, ToWStrTemp(title).s);
+}
+
+// right-click on a strip group's chip: the commands act on its first tab
+static void StripGroupContextMenu(MainWindow* win, int groupId, VirtMouseEvent* ev) {
+    StripGroup* g = StripGroupFind(win, groupId);
+    WindowTab* tab = StripGroupFirstTab(win, groupId);
+    if (!g || !tab) {
+        return;
+    }
+    BuildMenuCtx* ctx = NewBuildMenuCtx(tab, Point{0, 0});
+    ctx->tab = tab;
+    ctx->isDocLoaded = true;
+    StripGroupSetFlags(*ctx);
+    HMENU popup = BuildMenuFromDef(menuDefStripGroup, CreatePopupMenu(), ctx);
+    DeleteBuildMenuCtx(ctx);
+    if (g->collapsed) {
+        MenuSetText(popup, CmdStripGroupToggle, Tr("Expand Group"));
+    }
+    Vec<StripGroupMenuItem> items;
+    StripGroupColorItems(win, tab, items);
+    InsertSubmenuAfter(popup, CmdStripGroupToggle, Tr("Group Color"), items);
+
+    ev->didHandle = true;
+    Point pt = HwndClientToScreen(win->tabsCtrl->hwnd, ev->ptWindow);
+    int cmdId = TrackPopupMenu(popup, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, win->hwndFrame, nullptr);
+    DestroyMenu(popup);
+    if (!IsMainWindowValidAndNotClosing(win) || win->GetTabIdx(tab) < 0) {
+        return;
+    }
+    StripGroupCmd(win, tab, cmdId);
 }
 
 // TODO: add "Move to another window" sub-menu
@@ -339,6 +387,10 @@ static void TabsContextMenu(TabsCtrl* tabsCtrl, VirtMouseEvent* ev) {
         return;
     }
     TabsCtrl::MouseState tabState = tabsCtrl->TabStateFromMousePosition(ev->ptWindow);
+    if (tabState.headerGroupId != 0) {
+        StripGroupContextMenu(win, tabState.headerGroupId, ev);
+        return;
+    }
     int tabIdx = tabState.tabIdx;
     if (tabIdx < 0) {
         return;
@@ -371,8 +423,14 @@ static void TabsContextMenu(TabsCtrl* tabsCtrl, VirtMouseEvent* ev) {
     ctx->canCloseOtherTabs = len(toCloseOther) > 0;
     ctx->canCloseTabsToRight = len(toCloseRight) > 0;
     ctx->canCloseTabsToLeft = len(toCloseLeft) > 0;
+    StripGroupSetFlags(*ctx);
 
     HMENU popup = BuildMenuFromDef(menuDefContextTab, CreatePopupMenu(), ctx);
+    if (ctx->tabCanGroup) {
+        Vec<StripGroupMenuItem> items;
+        StripGroupAddToItems(win, tabUnderMouse, items);
+        InsertSubmenuAfter(popup, CmdStripGroupNew, Tr("Add Tab to Group"), items);
+    }
     DeleteBuildMenuCtx(ctx);
 
     if (!tabUnderMouse->ctrl) {
@@ -387,11 +445,18 @@ static void TabsContextMenu(TabsCtrl* tabsCtrl, VirtMouseEvent* ev) {
         DeleteMenu(popup, CmdDiscardChanges, MF_BYCOMMAND);
         RemoveBadMenuSeparators(popup);
     }
-    MarkMenuOwnerDraw(popup);
+    // handled: the menu loop can close the window and free tabsCtrl, so the
+    // event must not bubble up to it
+    ev->didHandle = true;
     uint flags = TPM_RETURNCMD | TPM_RIGHTBUTTON;
     int cmdId = TrackPopupMenu(popup, flags, pt.x, pt.y, 0, win->hwndFrame, nullptr);
-    FreeMenuOwnerDrawInfoData(popup);
     DestroyMenu(popup);
+    if (!IsMainWindowValidAndNotClosing(win)) {
+        return;
+    }
+    if (StripGroupCmd(win, tabUnderMouse, cmdId)) {
+        return;
+    }
     switch (cmdId) {
         case CmdClose: {
             CloseTab(tabUnderMouse, false);
@@ -424,6 +489,10 @@ static void TabsContextMenu(TabsCtrl* tabsCtrl, VirtMouseEvent* ev) {
         }
         case CmdDuplicateInNewWindow: {
             DuplicateTabInNewWindow(tabUnderMouse);
+            return;
+        }
+        case CmdDuplicateInNewTab: {
+            DuplicateTabInNewTab(tabUnderMouse);
             return;
         }
         case CmdProperties: {
@@ -474,6 +543,31 @@ static void MainWindowTabSelectionChanged(MainWindow* win, TabsCtrl::SelectionCh
     LoadModelIntoTab(tab);
 }
 
+static void MainWindowTabDragged(MainWindow* win, TabsCtrl::DraggedEvent* ev) {
+    StripGroupDropTab(win, ev->tab1, ev->tab2, ev->groupId);
+}
+
+struct StripGroupToggle {
+    MainWindow* win;
+    int groupId;
+};
+
+static void RunStripGroupToggle(StripGroupToggle* t) {
+    if (IsMainWindowValidAndNotClosing(t->win)) {
+        StripGroup* g = StripGroupFind(t->win, t->groupId);
+        if (g) {
+            StripGroupSetCollapsed(t->win, g->id, !g->collapsed);
+        }
+    }
+    delete t;
+}
+
+// posted: toggling rebuilds the strip, deleting the chip being clicked
+static void MainWindowGroupClick(MainWindow* win, TabsCtrl::GroupClickEvent* ev) {
+    auto* t = new StripGroupToggle{win, ev->groupId};
+    uitask::Post(MkFunc0<StripGroupToggle>(RunStripGroupToggle, t), "StripGroupToggle");
+}
+
 static void MainWindowTabMigration(MainWindow* win, TabsCtrl::MigrationEvent* ev) {
     WindowTab* tab = win->GetTab(ev->tabIdx);
     MainWindow* releaseWnd = nullptr;
@@ -498,6 +592,7 @@ void CreateTabbar(MainWindow* win) {
     args.font = GetAppFont();
     // logical TabWidth → physical (see UpdateTabWidth / issue #3850)
     args.tabDefaultDx = DpiScale(gSettings->tabWidth);
+    args.equalWidth = gSettings->tabsEqualWidth;
     args.isRtl = false; // LTR hwnd; RTL tab order follows parent frame (see UpdateWindowRtlLayout)
 
     TabsCtrl* tabsCtrl = new TabsCtrl();
@@ -506,6 +601,9 @@ void CreateTabbar(MainWindow* win) {
     tabsCtrl->onSelectionChanged = MkFunc1(MainWindowTabSelectionChanged, win);
     tabsCtrl->onContextMenu = MkFunc1(TabsContextMenu, tabsCtrl);
     tabsCtrl->onTabMigration = MkFunc1(MainWindowTabMigration, win);
+    tabsCtrl->onTabDragged = MkFunc1(MainWindowTabDragged, win);
+    tabsCtrl->onGroupClick = MkFunc1(MainWindowGroupClick, win);
+    tabsCtrl->onPlusClick = MkFunc0<MainWindow>(OnTabsPlusClick, win);
     tabsCtrl->Create(args);
     win->tabsCtrl = tabsCtrl;
     win->tabSelectionHistory = new Vec<WindowTab*>();
@@ -520,19 +618,10 @@ static NO_INLINE void VerifyWindowTab(MainWindow* win, WindowTab* tdata) {
     if (tdata->IsNonDocumentTab()) {
         return;
     }
-#if 0
-    // disabling this check. best I can tell, external apps can change window
-    // title and trigger this
-    auto winTitle = win::GetTextTemp(win->hwndFrame);
-    if (!str::Eq(winTitle.Get(), tdata->frameTitle.Get())) {
-        logf(L"VerifyWindowTab: winTitle: '%s', tdata->frameTitle: '%s'\n", winTitle.Get(), tdata->frameTitle.Get());
-        ReportIf(!str::Eq(winTitle.Get(), tdata->frameTitle));
-    }
-#endif
     bool expectedTocVisibility = tdata->showToc; // if not in presentation mode
-    if (PM_DISABLED != win->presentation) {
-        expectedTocVisibility = false; // PM_BLACK_SCREEN, PM_WHITE_SCREEN
-        if (PM_ENABLED == win->presentation) {
+    if (win->InPresentation()) {
+        expectedTocVisibility = false; // WindowMode::PresentationBlack, WindowMode::PresentationWhite
+        if (win->windowMode == WindowMode::Presentation) {
             expectedTocVisibility = tdata->showTocPresentation;
         }
     }
@@ -586,29 +675,20 @@ void SaveCurrentWindowTab(MainWindow* win) {
     VecAppend(*win->tabSelectionHistory, tab);
 }
 
-// Home is always the first tab
-static WindowTab* InsertHomeTab(MainWindow* win, bool deferUpdate) {
-    WindowTab* homeTab = new WindowTab(win);
-    homeTab->type = WindowTab::Type::About;
-    homeTab->canvasRc = win->canvasRc;
+static WindowTab* InsertHomeTab(MainWindow* win, int idx, HomeTabKind kind, bool deferUpdate) {
+    WindowTab* homeTab = NewHomeTab(win, kind);
+    bool isPinned = kind == HomeTabKind::Pinned;
     TabInfo* newTab = new TabInfo();
     newTab->text = str::Dup(StrL("Home"));
     newTab->tooltip = {};
-    newTab->isPinned = true;
+    newTab->isPinned = isPinned;
     newTab->canClose = true;
+    // every Home tab is sized to its label; the extra ones keep room for a ✕ (#6469)
+    newTab->fitToLabel = true;
     newTab->userData = (UINT_PTR)homeTab;
-    int insertedIdx = win->tabsCtrl->InsertTab(0, newTab, !deferUpdate);
-    ReportIf(insertedIdx != 0);
+    int insertedIdx = win->tabsCtrl->InsertTab(idx, newTab, !deferUpdate);
+    ReportIf(insertedIdx != idx);
     return homeTab;
-}
-
-static WindowTab* FindHomeTab(MainWindow* win) {
-    for (WindowTab* tab : win->Tabs()) {
-        if (tab->IsAboutTab()) {
-            return tab;
-        }
-    }
-    return nullptr;
 }
 
 // select the Home tab, creating it when NoHomeTab left the window without one
@@ -619,14 +699,35 @@ void GoToHomeTab(MainWindow* win) {
     WindowTab* homeTab = FindHomeTab(win);
     if (homeTab) {
         TabsSelect(win, win->GetTabIdx(homeTab));
+        HomePageFocusSearch(win);
         return;
     }
 
     // InsertTab selects without TCN_SELCHANGE, so save / load the models here
     SaveCurrentWindowTab(win);
-    homeTab = InsertHomeTab(win, false);
+    homeTab = InsertHomeTab(win, 0, HomeTabKind::Pinned, false);
     UpdateTabWidth(win);
     LoadModelIntoTab(homeTab);
+    HomePageFocusSearch(win);
+}
+
+// the "+" button: another Home tab after the last one. It stays out of the
+// session, which only stores documents
+void AddExtraHomeTab(MainWindow* win) {
+    if (!win || !win->tabsCtrl || !SettingsUseTabs()) {
+        return;
+    }
+    // the first Home tab is pinned, unless NoHomeTab: a file opened from it must
+    // not leave a Home tab behind
+    if (win->TabCount() == 0 && !gSettings->noHomeTab) {
+        GoToHomeTab(win);
+        return;
+    }
+    SaveCurrentWindowTab(win);
+    WindowTab* homeTab = InsertHomeTab(win, win->TabCount(), HomeTabKind::Extra, false);
+    UpdateTabWidth(win);
+    LoadModelIntoTab(homeTab);
+    HomePageFocusSearch(win);
 }
 
 WindowTab* AddTabToWindow(MainWindow* win, WindowTab* tab, bool deferUpdate) {
@@ -644,19 +745,23 @@ WindowTab* AddTabToWindow(MainWindow* win, WindowTab* tab, bool deferUpdate) {
     bool noHomeTab = gSettings->noHomeTab;
     bool createHomeTab = useTabs && !noHomeTab && (idx == 0);
     if (createHomeTab) {
-        InsertHomeTab(win, deferUpdate);
+        InsertHomeTab(win, 0, HomeTabKind::Pinned, deferUpdate);
         idx++;
     }
 
     tab->canvasRc = win->canvasRc;
+    StripGroupOnTabAdded(win, tab);
     TabInfo* newTab = new TabInfo();
     newTab->text = str::Dup(tab->GetTabTitle());
     newTab->pageText = str::Dup(TabPageSuffixTemp(tab));
     // same full path + size as UpdateTabTitle (was path-only, so size missing until
     // TabsOnChangedDoc for the active tab)
-    newTab->tooltip = str::Dup(MakeTabTooltipTemp(tab->filePath, false));
+    // a lazy tab (a session's, not loaded yet) leaves its file alone: no size
+    bool lazy = !tab->ctrl && tab->tabState;
+    newTab->tooltip = str::Dup(lazy ? PathForDisplayTemp(tab->filePath) : MakeTabTooltipTemp(tab->filePath, false));
     newTab->userData = (UINT_PTR)tab;
     newTab->tabColor = tab->tabColor;
+    newTab->groupId = tab->stripGroupId;
     // a failed load can arrive in a tab created for it (ShowLoadErrorInTab)
     newTab->isError = tab->loadState == WindowTab::LoadState::Error;
 
@@ -755,19 +860,54 @@ void SetTabsInTitlebar(MainWindow* win, bool inTitleBar) {
 }
 
 void MoveTab(MainWindow* win, int dir) {
-    if (!win) {
+    if (win && win->tabsCtrl) {
+        StripGroupMoveTab(win, dir);
+    }
+}
+
+// the strip shows `order`; the selected tab stays selected
+void TabsSetOrder(MainWindow* win, const Vec<WindowTab*>& order) {
+    TabsCtrl* tabsCtrl = win->tabsCtrl;
+    if (!tabsCtrl || len(order) != tabsCtrl->TabCount()) {
+        ReportIf(true);
         return;
     }
-    int nTabs = win->TabCount();
-    int idx = win->tabsCtrl->GetSelected();
-    int newIdx = idx + dir;
-    if (newIdx < 0) {
+    TabInfo* selected = tabsCtrl->GetTab(tabsCtrl->GetSelected());
+    Vec<TabInfo*> infos;
+    for (WindowTab* tab : order) {
+        TabInfo* ti = tabsCtrl->GetTab(win->GetTabIdx(tab));
+        if (!ti) {
+            ReportIf(true);
+            return;
+        }
+        VecAppend(infos, ti);
+    }
+    tabsCtrl->tabs = infos;
+    tabsCtrl->selectedIdx = selected ? VecFind(tabsCtrl->tabs, selected) : -1;
+    TabsStripGroupsChanged(win);
+}
+
+// pushes the window's strip groups into the tab control, which paints them
+void TabsStripGroupsChanged(MainWindow* win) {
+    TabsCtrl* tabsCtrl = win->tabsCtrl;
+    if (!tabsCtrl) {
         return;
     }
-    if (newIdx >= nTabs) {
-        return;
+    tabsCtrl->ClearGroups();
+    for (StripGroup* g : win->stripGroups) {
+        auto* gi = new TabGroupInfo();
+        gi->id = g->id;
+        gi->label = str::Dup(StripGroupLabelTemp(win, g));
+        gi->color = g->color;
+        gi->collapsed = g->collapsed;
+        VecAppend(tabsCtrl->groups, gi);
     }
-    win->tabsCtrl->SwapTabs(idx, newIdx);
-    win->tabsCtrl->SetSelected(newIdx);
-    win->tabsCtrl->LayoutTabs();
+    int n = tabsCtrl->TabCount();
+    for (int i = 0; i < n; i++) {
+        WindowTab* tab = win->GetTab(i);
+        tabsCtrl->GetTab(i)->groupId = tab ? tab->stripGroupId : 0;
+    }
+    tabsCtrl->RebuildTabCtrls();
+    tabsCtrl->LayoutTabs();
+    tabsCtrl->ScheduleRepaint();
 }

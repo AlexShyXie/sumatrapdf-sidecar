@@ -12,9 +12,11 @@ enum {
 extern bool gDontSaveSettings;
 
 extern Vec<SessionData*>* gInitialSessionData;
+extern int gInitialSessionDataGen;
 extern void (*gRememberSessionStateFn)();
 
 struct PlatformFont;
+class EngineBase;
 
 TempStr GetSettingsPathTemp();
 TempStr GetSettingsFileNameTemp();
@@ -23,6 +25,7 @@ bool LoadSettings();
 void OpenSettingsFile();
 void ScheduleSaveSettings();
 void FlushScheduledSaveSettings();
+void SaveSettingsNow();
 void ForceReloadSettings();
 void ReloadDeferredSettings();
 void ApplySettingsToOpenWindows();
@@ -33,12 +36,13 @@ int GetAppFontSize();
 int GetAppFontSizeForDpi(int dpi);
 PlatformFont* GetAppFont();
 PlatformFont* GetAppFontForDpi(int dpi);
-int GetAppMenuFontSize();
 int GetAppMenuFontSizeForDpi(int dpi);
 bool IsAppFontSizeDefault();
 PlatformFont* GetAppMenuFont();
 PlatformFont* GetAppMenuFontForDpi(int dpi);
 PlatformFont* GetAppBiggerFont();
+int GetAnnotPopupFontSize();
+PlatformFont* GetAnnotPopupFontForDpi(int dpi);
 PlatformFont* GetAppBiggerFontForDpi(int dpi);
 PlatformFont* GetAppTreeFont();
 PlatformFont* GetAppTreeFontForDpi(int dpi);
@@ -53,6 +57,7 @@ TempStr SerializeColorList(const Vec<Color>&);
 
 TempStr ZoomLevelStr(float zoom);
 TempStr ZoomLevelStrExact(float zoom);
+float ParseZoomText(Str text, const Vec<float>& levels, float fallback);
 // the command for each level the zoom buttons step through, in that order
 Vec<int>* GetZoomStepCmdIds();
 void CollectZoomLevels(Vec<float>& out, bool forChm);
@@ -93,7 +98,8 @@ Favorite* NewFavorite(int pageNo, Str name = {}, Str pageLabel = {});
 void DeleteFavorite(Favorite* fav);
 
 Settings* NewSettings(Str);
-Str SerializeSettings(Settings* prefs, Str prevData);
+enum class SerializeOpt;
+Str SerializeSettings(Settings* prefs, Str prevData, SerializeOpt opt);
 void DeleteSettings(Settings*);
 
 SessionData* NewSessionData();
@@ -126,3 +132,4 @@ Themes* ParseThemes(Str);
 void FreeParsedThemes(Themes*);
 
 #define GetPrefsColor(name) GetParsedColor(name)
+ParsedColor& CanvasBgColSetting(EngineBase* engine);

@@ -40,8 +40,8 @@
 #include "DocumentPropertiesCommon.h"
 
 // The properties as selectable monospaced text on the dialog's background,
-// a hairline, then the footer: the certificate actions as quiet buttons on
-// the left, the one filled Copy To Clipboard on the right
+// then the footer: the certificate actions as quiet buttons on the left, the
+// one filled Copy To Clipboard on the right
 constexpr int kPropsPadDy = 14;
 
 struct PropertiesWnd : WindowBase {
@@ -57,6 +57,9 @@ struct PropertiesWnd : WindowBase {
     str::Builder propsText;
     Point initialPos;
     PdfSigCert* certs = nullptr;
+    HWND parentHwnd = nullptr;
+    // kept apart so a rebuilt text can put it back
+    str::Builder fontsText;
 
     ~PropertiesWnd() override;
     bool Create(HWND parent);
@@ -137,143 +140,6 @@ void DeletePropertiesWindow(HWND hwndParent) {
     w->ScheduleDelete();
 }
 
-// See: http://www.verypdf.com/pdfinfoeditor/pdf-date-format.htm
-// Format:  "D:YYYYMMDDHHMMSSxxxxxxx"
-// Example: "D:20091222171933-05'00'"
-static bool PdfDateParseA(Str date, SYSTEMTIME* timeOut, int* timeZoneOut) {
-    if (len(date) == 0) return false;
-
-    ZeroMemory(timeOut, sizeof(SYSTEMTIME));
-    *timeZoneOut = 0;
-
-    Str slice = date;
-    // "D:" at the beginning is optional
-    str::TrimPrefix(slice, StrL("D:"));
-    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
-    Str end = str::Parse(slice,
-                         "%4d%2d%2d"
-                         "%2d%2d%2d",
-                         &year, &month, &day, &hour, &minute, &second);
-    if (!end.s) {
-        return false;
-    }
-    timeOut->wYear = (WORD)year;
-    timeOut->wMonth = (WORD)month;
-    timeOut->wDay = (WORD)day;
-    timeOut->wHour = (WORD)hour;
-    timeOut->wMinute = (WORD)minute;
-    timeOut->wSecond = (WORD)second;
-    // parse optional timezone: Z, +HH'MM', -HH'MM' (or +HH'MM, +HHMM, +HH)
-    if (end.s[0] == 'Z') {
-        *timeZoneOut = 0;
-    } else if (end.s[0] == '+' || end.s[0] == '-') {
-        int sign = (end.s[0] == '+') ? 1 : -1;
-        int tzHour = 0;
-        int tzMin = 0;
-        Str tz = Str(end.s + 1, end.len - 1);
-        Str tzEnd = str::Parse(tz, "%2d'%2d", &tzHour, &tzMin);
-        if (!tzEnd.s) {
-            tzEnd = str::Parse(tz, "%2d:%2d", &tzHour, &tzMin);
-        }
-        if (!tzEnd.s) {
-            str::Parse(tz, "%2d", &tzHour);
-        }
-        *timeZoneOut = sign * ((tzHour * 100) + tzMin);
-    }
-    return true;
-    // don't bother about the day of week, we won't display it anyway
-}
-
-// See: ISO 8601 specification
-// Format:  "YYYY-MM-DDTHH:MM:SSZ"
-// Example: "2011-04-19T22:10:48Z"
-static bool IsoDateParse(Str date, SYSTEMTIME* timeOut, int* timeZoneOut) {
-    if (len(date) == 0) return false;
-
-    ZeroMemory(timeOut, sizeof(SYSTEMTIME));
-    *timeZoneOut = 0;
-
-    int year = 0, month = 0, day = 0;
-    Str end = str::Parse(date, "%4d-%2d-%2d", &year, &month, &day);
-    if (end.s) { // time is optional
-        timeOut->wYear = (WORD)year;
-        timeOut->wMonth = (WORD)month;
-        timeOut->wDay = (WORD)day;
-        int hour = 0, minute = 0, second = 0;
-        Str timeEnd = str::Parse(end, "T%2d:%2d:%2d", &hour, &minute, &second);
-        if (timeEnd.s) {
-            timeOut->wHour = (WORD)hour;
-            timeOut->wMinute = (WORD)minute;
-            timeOut->wSecond = (WORD)second;
-            // parse optional timezone: Z, +HH:MM, -HH:MM
-            if (timeEnd.s[0] == 'Z') {
-                *timeZoneOut = 0;
-            } else if (timeEnd.s[0] == '+' || timeEnd.s[0] == '-') {
-                int sign = (timeEnd.s[0] == '+') ? 1 : -1;
-                int tzHour = 0;
-                int tzMin = 0;
-                Str tz = Str(timeEnd.s + 1, timeEnd.len - 1);
-                Str tzEnd = str::Parse(tz, "%2d:%2d", &tzHour, &tzMin);
-                if (!tzEnd.s) {
-                    str::Parse(tz, "%2d%2d", &tzHour, &tzMin);
-                }
-                *timeZoneOut = sign * ((tzHour * 100) + tzMin);
-            }
-        }
-    }
-    return end.s != nullptr;
-    // don't bother about the day of week, we won't display it anyway
-}
-
-static TempStr FormatSystemTimeTemp(SYSTEMTIME& date, int timeZone) {
-    WCHAR bufW[512]{};
-    int cchBufLen = dimof(bufW);
-    int ret = GetDateFormatW(LOCALE_USER_DEFAULT, DATE_SHORTDATE, &date, nullptr, bufW, cchBufLen);
-    if (ret < 2) { // GetDateFormat() failed or returned an empty result
-        return {};
-    }
-
-    // don't add 00:00:00 for dates without time
-    if (0 == date.wHour && 0 == date.wMinute && 0 == date.wSecond) {
-        TempStr res = ToUtf8Temp(bufW);
-        return AddTimeZone(res, timeZone);
-    }
-
-    WCHAR* tmp = bufW + ret;
-    tmp[-1] = ' ';
-    ret = GetTimeFormatW(LOCALE_USER_DEFAULT, 0, &date, nullptr, tmp, cchBufLen - ret);
-    if (ret < 2) { // GetTimeFormat() failed or returned an empty result
-        tmp[-1] = '\0';
-    }
-    TempStr res = ToUtf8Temp(bufW);
-    return AddTimeZone(res, timeZone);
-}
-
-// Convert a date in PDF or XPS format, e.g. "D:20091222171933-05'00'" to a display
-// format e.g. "12/22/2009 5:19:33 PM"
-// See: http://www.verypdf.com/pdfinfoeditor/pdf-date-format.htm
-// The conversion happens in place
-// static TempStr ConvDateToDisplayTemp(SYSTEMTIME* timeOut) {
-//    return
-//}
-
-// clang-format on
-
-void AppendDateProp(str::Builder& out, Str key, Str val, bool isPdfDate) {
-    SYSTEMTIME date;
-    int timeZone = 0;
-    bool ok = false;
-    if (len(val) == 0) return;
-    if (isPdfDate) {
-        ok = PdfDateParseA(val, &date, &timeZone);
-    } else {
-        ok = IsoDateParse(val, &date, &timeZone);
-    }
-    if (!ok) return;
-    TempStr dateStr = FormatSystemTimeTemp(date, timeZone);
-    AppendProp(out, key, dateStr);
-}
-
 void PropertiesWnd::CopyToClipboard(VirtMouseEvent*) {
     CopyTextToClipboard(ToStr(propsText));
 }
@@ -284,7 +150,7 @@ PropertiesWnd::~PropertiesWnd() {
 }
 
 // CryptUIDlgViewContext lives in cryptui.dll, loaded only when a certificate is viewed
-static void ViewCertDer(HWND parent, Str der) {
+void ViewCertDer(HWND parent, Str der) {
     if (len(der) == 0) {
         return;
     }
@@ -303,15 +169,6 @@ static void ViewCertDer(HWND parent, Str der) {
         FreeLibrary(h);
     }
     CertFreeCertificateContext(cert);
-}
-
-TempStr FileTimeLocalTemp(const FILETIME& ft) {
-    FILETIME local{};
-    SYSTEMTIME st{};
-    if (!FileTimeToLocalFileTime(&ft, &local) || !FileTimeToSystemTime(&local, &st)) {
-        return {};
-    }
-    return FormatSystemTimeTemp(st, 0);
 }
 
 void PropertiesWnd::ViewCertificate(VirtMouseEvent*) {
@@ -343,8 +200,36 @@ void PropertiesWnd::ViewCertificate(VirtMouseEvent*) {
     }
 }
 
+// the signatures' text depends on the list, the fonts part doesn't
+static void RebuildPropsText(PropertiesWnd* w) {
+    MainWindow* win = FindMainWindowByHwnd(w->parentHwnd);
+    if (!win || !win->ctrl) {
+        return;
+    }
+    str::Builder text;
+    GetPropsText(win->ctrl, text);
+    AppendCertsText(text, w->certs);
+    AlignPropertiesText(text);
+    Str props = ToStr(w->propsText);
+    int fonts = len(w->fontsText) > 0 ? str::IndexOf(props, ToStr(w->fontsText)) : -1;
+    EndWithSingleNewline(text);
+    if (fonts >= 0) {
+        text.Append(ToStr(w->fontsText));
+    }
+    w->propsText.Reset();
+    w->propsText.Append(ToStr(text));
+    w->SetPropsText(ToStr(w->propsText));
+}
+
 void OnEutlUpdateDone(EutlUpdateJob* job) {
-    if (job->hwnd && IsWindow(job->hwnd)) {
+    if (job->refreshed) {
+        for (PropertiesWnd* w : gPropertiesWindows) {
+            if (w->certs) {
+                RebuildPropsText(w);
+            }
+        }
+    }
+    if (!job->silent && job->hwnd && IsWindow(job->hwnd)) {
         MessageBoxW(job->hwnd, CWStrTemp(job->msg), L"EU Trusted List",
                     MB_OK | (job->ok ? MB_ICONINFORMATION : MB_ICONWARNING));
     }
@@ -403,17 +288,25 @@ void PropertiesWnd::SizeToContent() {
     int footerDy = footer->MinIntrinsicHeight(footerDx) + (2 * DpiScale(kToolDlgFootPadDy));
     int textDx = maxLineDx + editProps->GetLeftTextMargin() + sbDx;
     int wantedDx = std::max(textDx, footerDx) + (2 * padDx);
-    int textDy = (nLines + 1) * PlatformFontLineHeight(propsFont);
-    int wantedDy = textDy + (2 * padDy) + 1 + footerDy;
 
     Rect wr = HwndWindowRect(hwnd);
     Rect cr = HwndClientRect(hwnd);
     Rect work = GetWorkAreaRect(wr, hwnd);
     int maxDx = (work.dx * 80 / 100) - (wr.dx - cr.dx);
     int maxDy = (work.dy * 80 / 100) - (wr.dy - cr.dy);
-    ShowScrollBar(editProps->hwnd, SB_VERT, wantedDy > maxDy);
-    ResizeHwndToClientArea(hwnd, std::min(wantedDx, maxDx), std::min(wantedDy, maxDy), false);
-    DoLayout();
+    auto sizeForLines = [&](int lines) {
+        int wantedDy = ((lines + 1) * PlatformFontLineHeight(propsFont)) + (2 * padDy) + footerDy;
+        ShowScrollBar(editProps->hwnd, SB_VERT, wantedDy > maxDy);
+        HwndResizeClientSize(hwnd, std::min(wantedDx, maxDx), std::min(wantedDy, maxDy));
+        DoLayout();
+    };
+    sizeForLines(nLines);
+
+    // a value wider than the window (an EPUB description) wraps into more lines
+    int wrappedLines = (int)SendMessageW(editProps->hwnd, EM_GETLINECOUNT, 0, 0);
+    if (wrappedLines > nLines) {
+        sizeForLines(wrappedLines);
+    }
 }
 
 void PropertiesWnd::ApplyDarkMode() {
@@ -523,7 +416,6 @@ bool PropertiesWnd::Create(HWND parent) {
         Insets pad = DpiScaledInsets(kPropsPadDy, 0, kPropsPadDy, kToolDlgPadDx);
         vbox->AddChild(new Padding(editProps, pad), 1);
     }
-    vbox->AddChild(new VirtLine());
 
     {
         footer = new HBox();
@@ -565,6 +457,8 @@ void OnGetFontsFinished(GetFontsResult* result) {
         // fontsText starts with "\n" to separate it with a single empty line
         EndWithSingleNewline(w->propsText);
         w->propsText.Append(ToStr(result->fontsText));
+        w->fontsText.Reset();
+        w->fontsText.Append(ToStr(result->fontsText));
         w->SetPropsText(ToStr(w->propsText));
         w->SizeToContent();
     }
@@ -583,12 +477,22 @@ void ShowProperties(HWND parent, DocController* ctrl) {
     }
 
     auto* wnd = new PropertiesWnd();
+    wnd->parentHwnd = parent;
     VecAppend(gPropertiesWindows, wnd);
     DisplayModel* dm = ctrl->AsFixed();
     EngineBase* engine = dm ? dm->GetEngine() : nullptr;
     if (EngineMupdfIsPdf(engine)) {
         EutlRegisterLookup();
         wnd->certs = EngineMupdfGetSignatureCerts(engine);
+    }
+    if (wnd->certs && !gForTesting && HasPermission(Perm::InternetAccess)) {
+        // both only refresh what the text says: it's there already
+        auto* job = new EutlUpdateJob;
+        job->silent = true;
+        job->update = EutlNeedsUpdate();
+        job->engine = engine;
+        engine->AddRef();
+        RunAsync(MkFunc0<EutlUpdateJob>(EutlUpdateThread, job), StrL("SigOnlineChecks"));
     }
     GetPropsText(ctrl, wnd->propsText);
     AppendCertsText(wnd->propsText, wnd->certs);

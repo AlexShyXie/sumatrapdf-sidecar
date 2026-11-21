@@ -31,6 +31,9 @@ struct PageInfo {
     /* data that is calculated when needed. actual content size within a page (View target) */
     RectF contentBox;
     bool contentBoxCalculated = false;
+    // Read Columns: x of the gutter between the page's two columns, in page units
+    float columnGutterX = 0;
+    bool columnGutterKnown = false;
 
     /* data that changes when zoom and rotation changes */
     /* position and size within total area after applying zoom and rotation.
@@ -187,10 +190,11 @@ struct DisplayModel : DocController {
     float MaxZoomForDocument() const;
     void Relayout(float zoomVirtual, int rotation);
     bool ViewportReadyForRelayout() const;
+    // bumped when the user changes display mode, zoom, rotation or trim: canvas
+    // offsets computed before (e.g. a smooth scroll's target) no longer apply
+    int viewChanges = 0;
 
     Rect GetViewPort() const;
-    bool IsHScrollbarVisible() const;
-    bool IsVScrollbarVisible() const;
     bool NeedHScroll() const;
     bool NeedVScroll() const;
     bool CanScrollRight() const;
@@ -212,6 +216,13 @@ struct DisplayModel : DocController {
     void ScrollXBy(int dx);
     void ScrollYTo(int yOff);
     void ScrollYBy(int dy, bool changePage);
+    bool ScrollFollowsRotation() const;
+    bool ContentScrollHorizontal() const;
+    int ContentScrollSign() const;
+    int ContentScrollPos() const;
+    bool AtContentEdge(int forward) const;
+    void ScrollContentBy(int forward, bool changePage);
+    void ScrollContentToEdge(bool toEnd);
 
     int yOffset();
 
@@ -252,10 +263,28 @@ struct DisplayModel : DocController {
     bool GetUniformPageWidth() const;
     void SetTrimEmptyMargins(bool enable);
     bool GetTrimEmptyMargins() const;
+    void SetUserCrop(RectF box);
+    RectF GetUserCrop() const;
+    void SetAutoScrollSpeed(float speed);
+    void SetReadColumns(bool enable);
+    bool GetReadColumns() const;
+    void FitColumnToWindow();
+    void ToggleColumnsWholePage();
+    bool ReadsColumnsNow() const;
+    bool ShowsColumnsWholePage() const;
+    float ColumnGutterX(int pageNo);
+    float GetAutoScrollSpeed() const;
+    void TrimPagesToRect(int pageNo, RectF rect);
     void SetFreePan(bool enable);
     bool GetFreePan() const;
+    void SetFacingStepOne(bool enable);
+    bool GetFacingStepOne() const;
+    void SetMirror(bool enable);
+    bool GetMirror() const;
+    void SetPageAdjust(int brightness, int contrast);
     Size PanSlack() const;
     bool EnsureTrimEmptyMarginsForVisiblePages();
+    void RelayoutForTrim();
     bool GoToPageHorizontal(bool toRight);
 
     bool ShouldCacheRendering(int pageNo) const;
@@ -273,8 +302,10 @@ struct DisplayModel : DocController {
     SizeF PageSizeAfterRotation(int pageNo, bool fitToContent = false, float contentPad = 0) const;
     bool ShouldTreatLandscapeAsSpread() const;
     void EnsureSpreadFlags() const;
+    bool StepsOnePage() const;
     int FirstPageInRow(int pageNo) const;
     int LastPageInRow(int pageNo) const;
+    int RowStartForPage(int pageNo) const;
     void ChangeStartPage(int startPage);
     Point GetContentStart(int pageNo) const;
     void RecalcVisibleParts() const;
@@ -380,7 +411,32 @@ struct DisplayModel : DocController {
     bool uniformPageWidth = false;
     bool trimEmptyMargins = false;
     bool inTrimMarginsUpdate = false;
+    // part of every page shown, as fractions of its media box; empty: whole page
+    RectF userCrop;
+    // Automatically Scroll px/s for this document; 0: the global setting
+    float autoScrollSpeed = 0;
+    // Read Columns: scrolling goes down a page's left column, then its right one
+    bool readColumns = false;
+    bool inColumnScroll = false;
+    // ToggleColumnsWholePage(): the whole page is shown for a moment
+    bool columnsWholePage = false;
+    float columnsZoom = 0;
+    ScrollState columnsScroll;
+    RectF ColumnRect(int pageNo, int col);
+    bool CurrentColumn(int* pageNo, int* col);
+    bool ColumnScroll(int dy, bool changePage);
+    void ShowColumn(int pageNo, int col, bool top);
+    // -100..100, applied to rendered pages (see AdjustPagePixmap)
+    int brightness = 0;
+    int contrast = 0;
     bool freePan = false;
+    // facing / book view moves one page at a time (#6487)
+    bool facingStepOne = false;
+    // CmdToggleMirror: pages shown mirrored left to right
+    bool mirror = false;
+    // set by GoToNextPage() when stepping one page: GoToPage() starts the row
+    // at the page even though it's already shown
+    bool landOnPage = false;
     // set while SetScrollState() restores a view exactly: GoToPage() may then
     // land in free pan's slack past the page edges
     bool restoringExactPan = false;
@@ -399,6 +455,7 @@ struct DisplayModel : DocController {
     bool pauseRendering = false;
 
     bool pendingRelayout = false;
+    bool inSetViewPortSize = false;
     bool hasPendingScroll = false;
     ScrollState pendingScroll;
 

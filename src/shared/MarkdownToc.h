@@ -10,7 +10,7 @@ struct MarkdownHeadingItem {
 struct MarkdownFileToc {
     Str filePath;
     Str relPath;
-    Vec<MarkdownHeadingItem> headings;
+    Vec<MarkdownHeadingItem>* headings; // owned; a pointer so Vec<MarkdownFileToc> stays memcpy-safe
 };
 
 // htmlMode collects/parses sibling .html/.htm files instead of .md/.markdown
@@ -19,3 +19,5 @@ void CollectMarkdownFiles(Str baseDir, Str openedFile, bool htmlMode, StrVec& fi
 void ParseMarkdownTocsParallel(StrVec& files, bool htmlMode, Vec<MarkdownFileToc>& tocsOut);
 
 Str MarkdownToHtmlPage(Str markdown);
+Str MermaidRunJs();
+Str CodeRunJs();

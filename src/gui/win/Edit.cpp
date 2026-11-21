@@ -88,46 +88,6 @@ void PostDelayedEditSelectAll(HWND hwnd) {
     uitask::Post(MkFunc0(DelayedEditSelectAll, hwnd), "DelayedEditSelectAll");
 }
 
-// Delete the word behind the cursor after Ctrl+Backspace inserts its temporary glyph.
-static void EditImplementCtrlBack(HWND hwnd) {
-    // we calc selection in WCHAR space because it's easier
-    TempWStr text = HwndGetTextWTemp(hwnd);
-    int selStart = 0;
-    int selEnd = 0;
-    EditGetSelection(hwnd, selStart, selEnd);
-    selEnd = selStart;
-    // remove the rectangle produced by Ctrl+Backspace
-    if (selStart > 0 && text.s[selStart - 1] == '\x7F') {
-        memmove(text.s + selStart - 1, text.s + selStart, len(text.s + selStart - 1) * sizeof(WCHAR));
-        TempStr s = ToUtf8Temp(text);
-        HwndSetText(hwnd, s);
-        selStart = selEnd = selStart - 1;
-    }
-    // remove the previous word (and any spacing after it)
-    for (; selStart > 0 && wstr::IsWs(text.s[selStart - 1]); selStart--) {
-        ;
-    }
-    for (; selStart > 0 && !wstr::IsWs(text.s[selStart - 1]); selStart--) {
-        ;
-    }
-    EditSelectText(hwnd, selStart, selEnd);
-    SendMessageW(hwnd, WM_CLEAR, 0, 0); // delete selected text
-}
-
-// after WM_KEYDOWN so the edit does not insert the Ctrl+Backspace glyph first
-static void DelayedEditCtrlBack(HWND hwnd) {
-    if (hwnd && ::IsWindow(hwnd)) {
-        EditImplementCtrlBack(hwnd);
-    }
-}
-
-void PostDelayedEditCtrlBack(HWND hwnd) {
-    if (!hwnd) {
-        return;
-    }
-    uitask::Post(MkFunc0(DelayedEditCtrlBack, hwnd), "DelayedEditCtrlBack");
-}
-
 // https://docs.microsoft.com/en-us/windows/win32/controls/edit-controls
 
 // TODO:
@@ -318,6 +278,53 @@ HBRUSH Edit::CtlColorBrush(HDC hdc) {
     return br;
 }
 
+// Clipboard history and rdpclip open the clipboard the moment it changes, so
+// OpenClipboard right after a copy often fails. Same pause as OpenClipboardForUpdate.
+static bool OpenClipboardRetry(HWND hwnd) {
+    constexpr int kTries = 10;
+    constexpr int kPauseMs = 20;
+    for (int i = 0; i < kTries; i++) {
+        if (OpenClipboard(hwnd)) {
+            return true;
+        }
+        Sleep(kPauseMs);
+    }
+    return false;
+}
+
+static WStr GetClipboardTextTemp(HWND hwnd) {
+    if (!OpenClipboardRetry(hwnd)) {
+        return {};
+    }
+    WStr res;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    WCHAR* s = h ? (WCHAR*)GlobalLock(h) : nullptr;
+    if (s) {
+        res = str::DupTemp(WStr(s));
+        GlobalUnlock(h);
+    }
+    CloseClipboard();
+    return res;
+}
+
+// A multi-line edit only breaks lines on CRLF. Browsers (e.g. GitHub's copy
+// button) put LF-only text on the clipboard, which would paste as one line.
+// Returns false to let the edit paste as usual.
+static bool PasteWithCRLF(HWND hwnd) {
+    DWORD style = GetWindowStyle(hwnd);
+    if (!(style & ES_MULTILINE) || (style & ES_READONLY)) {
+        return false;
+    }
+    TempStr text = ToUtf8Temp(GetClipboardTextTemp(hwnd));
+    TempStr crlf = str::LFToCRLFTemp(text);
+    if (len(crlf) == len(text)) {
+        // no bare LF
+        return false;
+    }
+    SendMessageW(hwnd, EM_REPLACESEL, TRUE, (LPARAM)ToWStrTemp(crlf).s);
+    return true;
+}
+
 void Edit::WndProc(ControlBase::WndProcEvent* ev) {
     HWND hwnd = ev->hwnd;
     UINT msg = ev->msg;
@@ -333,6 +340,11 @@ void Edit::WndProc(ControlBase::WndProcEvent* ev) {
         }
 
         case WM_CHAR: {
+            if (EditHandleCtrlBack(hwnd, wp)) {
+                ev->result = 0;
+                ev->didHandle = true;
+                return;
+            }
             if (onChar.IsValid()) {
                 CharEvent ce;
                 ce.c = (int)wp;
@@ -396,11 +408,9 @@ void Edit::WndProc(ControlBase::WndProcEvent* ev) {
             break;
         }
 
-        case WM_KEYDOWN: {
-            bool isCtrlBack = (VK_BACK == wp) && IsCtrlPressed() && !IsShiftPressed();
-            if (isCtrlBack) {
-                PostDelayedEditCtrlBack(hwnd);
-                ev->result = true;
+        case WM_PASTE: {
+            if (PasteWithCRLF(hwnd)) {
+                ev->result = 0;
                 ev->didHandle = true;
                 return;
             }

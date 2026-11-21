@@ -11,16 +11,6 @@ struct PlatformFont;
 struct WindowTab;
 struct WebViewResourceResult;
 
-constexpr int kAIChatProviderCount = 4;
-
-enum class AIChatBackend {
-    Claude,
-    Grok,
-    Codex,
-    AntiGravity,
-    None,
-};
-
 struct AIChatSessionInfo {
     Str sessionId;
     Str display;
@@ -74,7 +64,10 @@ struct AIChatStreamCtx {
     HWND hwndFrame = nullptr;
     MainWindow* win = nullptr;
     int providerId = 0;
-    Str sessionId; // owned; the session the output belongs to
+    Str sessionId;  // owned; the session the output belongs to
+    int turnId = 0; // AIChatTabState::turnId of the turn this streams
+    // a one-shot request collects its output here instead of the chat panel
+    struct AIChatCaptureSink* capture = nullptr;
 };
 
 void AIChatPostUpdate(AIChatStreamCtx* ctx, AIChatUpdateType type, Str text);
@@ -140,7 +133,7 @@ struct AIChatProvider {
     // via AIChatPostUpdate / AIChatStreamSetSessionId
     virtual void ParseStreamLine(Str line, AIChatStreamCtx* ctx) = 0;
 
-    bool IsInstalled() { return len(FindExecutableTemp()) > 0; }
+    virtual bool IsInstalled() { return len(FindExecutableTemp()) > 0; }
 };
 
 bool IsAIChatAllowed();
@@ -217,7 +210,6 @@ TempStr AIChatModelDisplayNameTemp(Str model, Str defaultDisplay);
 
 TempStr AIChatFormatChatHtmlTemp(Str virtualHost, Str bgColor);
 Str AIChatStyleSnapshot();
-bool AIChatGetMarkedJsResource(void* ctx, Str path, WebViewResourceResult* res);
 
 void AIChatCloseProcess(void** processHandle, bool terminateIfRunning);
 bool AIChatLaunchProcessWithStdoutPipe(Str cmdLine, Str cwd, AIChatProcessLaunchResult* out);

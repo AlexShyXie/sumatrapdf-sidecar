@@ -109,10 +109,12 @@ PaperFormat GetPaperFormatFromSizeApprox(SizeF size) {
 #include "Notifications.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Selection.h"
 #include "SumatraDialogs.h"
 #include "Translations.h"
+#include "resource.h"
 #include "PrintWin11.h"
 
 #include "SumatraLog.h"
@@ -158,6 +160,8 @@ struct PrintData {
     Vec<SelectionOnPage> sel;   // empty when printing a page range
     Print_Advanced_Data advData;
     int rotation = 0;
+    // CmdToggleMirror: print as shown
+    bool mirror = false;
     ProgressUpdateCb progressCb;
     AbortCookieManager* abortCookie = nullptr;
     bool failedEngineClone = false;
@@ -298,7 +302,6 @@ static void AppendDeviceCapabilities(str::Builder& out, const WCHAR* nameW, cons
     // paper bins
     DWORD bins = DeviceCapabilitiesW(nameW, portW, DC_BINS, nullptr, nullptr);
     DWORD binNames = DeviceCapabilitiesW(nameW, portW, DC_BINNAMES, nullptr, nullptr);
-    ReportIf(bins != binNames);
     if (0 == bins) {
         out.Append(StrL("  no paper bins available\n"));
     } else if (bins == (DWORD)-1) {
@@ -306,8 +309,12 @@ static void AppendDeviceCapabilities(str::Builder& out, const WCHAR* nameW, cons
     } else {
         WORD* binValues = AllocArrayTemp<WORD>((int)bins);
         DeviceCapabilitiesW(nameW, portW, DC_BINS, (WCHAR*)binValues, nullptr);
-        WCHAR* binNameValues = AllocArrayTemp<WCHAR>(24 * (int)binNames);
-        DeviceCapabilitiesW(nameW, portW, DC_BINNAMES, binNameValues, nullptr);
+        // drivers can report a different number of names: missing ones stay empty
+        int nBinNames = (binNames == (DWORD)-1) ? 0 : (int)binNames;
+        WCHAR* binNameValues = AllocArrayTemp<WCHAR>(24 * std::max((int)bins, nBinNames));
+        if (nBinNames > 0) {
+            DeviceCapabilitiesW(nameW, portW, DC_BINNAMES, binNameValues, nullptr);
+        }
         for (DWORD j = 0; j < bins; j++) {
             TempStr s = ToUtf8Temp(WStr(binNameValues + (24 * (size_t)j)));
             out.Append(fmt("  bin %d: '%s' (%d)\n", (int)j, s, binValues[j]));
@@ -321,8 +328,11 @@ static void AppendDeviceCapabilities(str::Builder& out, const WCHAR* nameW, cons
         WORD* paperValues = AllocArrayTemp<WORD>((int)papers);
         DeviceCapabilitiesW(nameW, portW, DC_PAPERS, (WCHAR*)paperValues, nullptr);
         // paper names are 64 WCHARs each
-        WCHAR* paperNameValues = AllocArrayTemp<WCHAR>(64 * (int)paperNames);
-        DeviceCapabilitiesW(nameW, portW, DC_PAPERNAMES, paperNameValues, nullptr);
+        int nPaperNames = (paperNames == (DWORD)-1) ? 0 : (int)paperNames;
+        WCHAR* paperNameValues = AllocArrayTemp<WCHAR>(64 * std::max((int)papers, nPaperNames));
+        if (nPaperNames > 0) {
+            DeviceCapabilitiesW(nameW, portW, DC_PAPERNAMES, paperNameValues, nullptr);
+        }
         // paper sizes in tenths of a millimeter
         POINT* paperSizes = AllocArrayTemp<POINT>((int)papers);
         DeviceCapabilitiesW(nameW, portW, DC_PAPERSIZE, (WCHAR*)paperSizes, nullptr);
@@ -659,7 +669,7 @@ static void MessageBoxWarningCond(bool show, Str msg, Str title) {
         return;
     }
 #if defined(SUMATRA_NG)
-    MessageBoxWarningSimple(nullptr, ToWStrTemp(msg), ToWStrTemp(title));
+    MsgBoxWarning(nullptr, msg, title);
 #else
     MessageBoxWarning(nullptr, msg, title);
 #endif
@@ -818,7 +828,7 @@ PrintPageLayout CalculatePrintPageLayout(EngineBase& engine, int pageNo, const P
 // Returns true if at least one band was rendered and blitted.
 static bool PrintPageInBands(EngineBase& engine, HDC hdc, int pageNo, float zoom, int rotation,
                              const RectF& pageRectFull, Point offset, const Rect* stretchTo, RenderTarget target,
-                             AbortCookieManager* abortCookie, const ProgressUpdateCb& progressCb) {
+                             AbortCookieManager* abortCookie, const ProgressUpdateCb& progressCb, bool mirror = false) {
     if (!IsValidPrintZoom(zoom)) {
         logf("PrintPageInBands: rejecting zoom=%g page=%d\n", zoom, pageNo);
         return false;
@@ -857,7 +867,8 @@ static bool PrintPageInBands(EngineBase& engine, HDC hdc, int pageNo, float zoom
             }
             args.cookie_out = &abortCookie->cookie;
         }
-        Pixmap* bmp = engine.RenderPage(args);
+        // 24bpp: v4 (XPS) drivers render a 32bpp band as a slower RGBA PNG
+        Pixmap* bmp = PixmapToBgr(engine.RenderPage(args));
         if (abortCookie) {
             abortCookie->Clear();
         }
@@ -879,6 +890,10 @@ static bool PrintPageInBands(EngineBase& engine, HDC hdc, int pageNo, float zoom
         // place this band: device rows [dy0, dy0+h) of the full [0, fullH) output,
         // mapped into devTarget (1:1 when not stretching). Compute the bottom edge
         // the same way so adjacent bands meet with no seam.
+        // a band is the page's full width, so flipping it mirrors the page
+        if (mirror) {
+            FlipPixmapHorizontally(bmp);
+        }
         Rect rc;
         rc.x = devTarget.x;
         rc.dx = devTarget.dx;
@@ -892,6 +907,22 @@ static bool PrintPageInBands(EngineBase& engine, HDC hdc, int pageNo, float zoom
         dy0 += h;
     }
     return anyOk;
+}
+
+// Ranges come from the print dialog or -print-settings and can name pages past
+// the end, e.g. when the document was reloaded with fewer pages
+static Vec<PRINTPAGERANGE> ClampPageRanges(const Vec<PRINTPAGERANGE>& ranges, int nPages) {
+    Vec<PRINTPAGERANGE> res;
+    DWORD last = (DWORD)nPages;
+    for (PRINTPAGERANGE r : ranges) {
+        if (nPages < 1 || (r.nFromPage > last && r.nToPage > last)) {
+            continue;
+        }
+        r.nFromPage = limitValue(r.nFromPage, (DWORD)1, last);
+        r.nToPage = limitValue(r.nToPage, (DWORD)1, last);
+        VecAppend(res, r);
+    }
+    return res;
 }
 
 static bool PrintToDevice(const PrintData& pd) {
@@ -940,13 +971,18 @@ static bool PrintToDevice(const PrintData& pd) {
         di.lpszOutput = CWStrTemp(pd.printer->output);
     }
 
+    Vec<PRINTPAGERANGE> ranges = ClampPageRanges(pd.ranges, engine.PageCount());
     int current = 1, total = 0;
     if (len(pd.sel) == 0) {
-        for (int i = 0; i < len(pd.ranges); i++) {
-            if (pd.ranges[i].nToPage < pd.ranges[i].nFromPage) {
-                total += (int)pd.ranges[i].nFromPage - (int)pd.ranges[i].nToPage + 1;
+        if (len(ranges) == 0) {
+            logf("PrintToDevice: no pages in range, %d pages\n", engine.PageCount());
+            return false;
+        }
+        for (int i = 0; i < len(ranges); i++) {
+            if (ranges[i].nToPage < ranges[i].nFromPage) {
+                total += (int)ranges[i].nFromPage - (int)ranges[i].nToPage + 1;
             } else {
-                total += (int)pd.ranges[i].nToPage - (int)pd.ranges[i].nFromPage + 1;
+                total += (int)ranges[i].nToPage - (int)ranges[i].nFromPage + 1;
             }
         }
     } else {
@@ -1109,7 +1145,7 @@ static bool PrintToDevice(const PrintData& pd) {
                 }
 
                 PrintPageInBands(engine, hdc, pd.sel[i].pageNo, zoom, pd.rotation, *clipRegion, offset, nullptr,
-                                 RenderTarget::Print, abortCookie, progressCb);
+                                 RenderTarget::Print, abortCookie, progressCb, pd.mirror);
             }
             // TODO: abort if !ok?
 
@@ -1132,9 +1168,9 @@ static bool PrintToDevice(const PrintData& pd) {
     }
 
     // print all the pages the user requested
-    for (int i = 0; i < len(pd.ranges); i++) {
-        int dir = pd.ranges[i].nFromPage > pd.ranges[i].nToPage ? -1 : 1;
-        for (DWORD pageNo = pd.ranges[i].nFromPage; pageNo != pd.ranges[i].nToPage + dir; pageNo += dir) {
+    for (int i = 0; i < len(ranges); i++) {
+        int dir = ranges[i].nFromPage > ranges[i].nToPage ? -1 : 1;
+        for (DWORD pageNo = ranges[i].nFromPage; pageNo != ranges[i].nToPage + dir; pageNo += dir) {
             if ((PrintRangeAdv::Even == pd.advData.range && pageNo % 2 != 0) ||
                 (PrintRangeAdv::Odd == pd.advData.range && pageNo % 2 == 0)) {
                 continue;
@@ -1161,10 +1197,10 @@ static bool PrintToDevice(const PrintData& pd) {
             RectF mediabox = engine.PageMediabox((int)pageNo);
             if (layout.isStretch) {
                 PrintPageInBands(engine, hdc, (int)pageNo, layout.zoom, layout.rotation, mediabox, Point(0, 0),
-                                 &layout.stretch, RenderTarget::Print, abortCookie, progressCb);
+                                 &layout.stretch, RenderTarget::Print, abortCookie, progressCb, pd.mirror);
             } else {
                 PrintPageInBands(engine, hdc, (int)pageNo, layout.zoom, layout.rotation, mediabox, layout.offset,
-                                 nullptr, RenderTarget::Print, abortCookie, progressCb);
+                                 nullptr, RenderTarget::Print, abortCookie, progressCb, pd.mirror);
             }
 
             res = EndPage(hdc);
@@ -1204,7 +1240,8 @@ class PrintThreadData {
   public:
     NotificationWnd* wnd = nullptr;
     AbortCookieManager cookie;
-    bool isCanceled = false;
+    // set on the UI thread, read by the print thread
+    AtomicBool isCanceled = 0;
     MainWindow* win = nullptr;
 
     PrintData* data = nullptr;
@@ -1214,7 +1251,7 @@ class PrintThreadData {
     void OnNotifClosed(NotificationClosedEvent*) { RemovePrintNotification(); }
 
     void RemovePrintNotification() {
-        isCanceled = true;
+        AtomicBoolSet(&isCanceled, true);
         cookie.Abort();
         if (this->wnd && IsMainWindowValid(win)) {
             RemoveNotification(this->wnd);
@@ -1253,52 +1290,35 @@ class PrintThreadData {
         uitask::Post(fn, nullptr);
     }
 
-    bool WasCanceled() { return isCanceled || !IsMainWindowValidAndNotClosing(win) || win->printCanceled; }
+    bool WasCanceled() {
+        return AtomicBoolGet(&isCanceled) || !IsMainWindowValidAndNotClosing(win) || AtomicBoolGet(&win->printCanceled);
+    }
 };
 
 struct DeletePrinterThreadData {
     MainWindow* win;
-    ThreadHandle thread;
     PrintThreadData* threadData;
 };
 
 static void DeletePrinterThread(DeletePrinterThreadData* d) {
     auto* win = d->win;
-    if (IsMainWindowValid(win) && d->thread == win->printThread) {
+    if (IsMainWindowValid(win) && d->threadData->thread == win->printThread) {
         win->printThread = nullptr;
     }
     delete d->threadData;
     delete d;
 }
 
-static void UpdatePrintProgress(PrintThreadData* ftd, ProgressUpdateData* data) {
-    if (data->wasCancelled) {
-        bool wasCancelled = ftd->WasCanceled();
-        *data->wasCancelled = wasCancelled;
-        return;
-    }
-    ftd->UpdateProgress(data->current, data->total);
-}
-
 static void PrintThread(PrintThreadData* ptd) {
     MainWindow* win = ptd->win;
-    // wait for PrintToDeviceOnThread to return so that we
-    // close the correct handle to the current printing thread
-    while (!win->printThread) {
-        Sleep(1);
-    }
-
-    ThreadHandle thread = ptd->thread = win->printThread;
-
     PrintData* pd = ptd->data;
-    pd->progressCb = MkFunc1<PrintThreadData, ProgressUpdateData*>(UpdatePrintProgress, ptd);
+    pd->progressCb = MkFunc1<PrintThreadData, ProgressUpdateData*>(ForwardProgress<PrintThreadData>, ptd);
     ;
     pd->abortCookie = &ptd->cookie;
     PrintToDevice(*pd);
 
     auto* data = new DeletePrinterThreadData;
     data->win = win;
-    data->thread = thread;
     data->threadData = ptd;
     auto fn = MkFunc0<DeletePrinterThreadData>(DeletePrinterThread, data);
     uitask::Post(fn, "PrintDeleteThread");
@@ -1311,14 +1331,23 @@ static void PrintToDeviceOnThread(MainWindow* win, PrintData* data) {
     win->printThread = nullptr;
     auto fn = MkFunc0(PrintThread, threadData);
     win->printThread = StartThread(fn, StrL("PrintThread"));
+    if (!win->printThread) {
+        // the thread would have freed it and dropped its progress notification
+        logf("PrintToDeviceOnThread: couldn't start the print thread\n");
+        delete threadData;
+        return;
+    }
+    // read by DeletePrinterThread, which the thread posts to this (UI) thread,
+    // so it runs after this
+    threadData->thread = win->printThread;
 }
 
 void AbortPrinting(MainWindow* win) {
     if (win->printThread) {
-        win->printCanceled = true;
+        AtomicBoolSet(&win->printCanceled, true);
         WaitForSingleObject(win->printThread, INFINITE);
     }
-    win->printCanceled = false;
+    AtomicBoolSet(&win->printCanceled, false);
 }
 
 static HGLOBAL GlobalMemDup(const void* data, size_t n) {
@@ -1430,130 +1459,9 @@ static void SetDevModeCopies(HGLOBAL hDevMode, short copies) {
     }
 }
 
-#if defined(SUMATRA_NG)
-// ng: the ids of orig's resource.h; CheckRadioButton() needs each radio group
-// to stay contiguous
-enum {
-    IDC_SECTION_PRINT_RANGE = 1050,
-    IDC_PRINT_RANGE_ALL = 1051,
-    IDC_PRINT_RANGE_EVEN = 1052,
-    IDC_PRINT_RANGE_ODD = 1053,
-    IDC_SECTION_PRINT_SCALE = 1060,
-    IDC_PRINT_SCALE_SHRINK = 1061,
-    IDC_PRINT_SCALE_FIT = 1062,
-    IDC_PRINT_SCALE_NONE = 1063,
-    IDC_PRINT_SCALE_STRETCH = 1064,
-    IDC_PRINT_CENTER_HORIZONTALLY = 1065,
-    IDC_PRINT_PAPER_SOURCE_BY_SIZE = 1066,
-    IDC_PRINT_PER_PAGE_PAPER_SIZE = 1067,
-    IDC_PRINT_ROTATE_LABEL = 1068,
-    IDC_PRINT_ROTATE = 1069,
-};
-
 #ifndef ID_APPLY_NOW
 constexpr int ID_APPLY_NOW = 0x3021;
 #endif
-
-// the predefined window class atoms a DLGITEMTEMPLATE can name
-enum {
-    kAtomButton = 0x0080,
-    kAtomStatic = 0x0082,
-    kAtomComboBox = 0x0085,
-};
-
-// ng: orig loads IDD_PROPSHEET_PRINT_ADVANCED from its .rc. This port has no
-// resource compiler, so the DLGTEMPLATE is built in memory: same controls, same
-// ids, same dialog units as orig's resource. It also replaces orig's
-// GetRtLDlgTemplate() hack: for an RTL UI the extended style is simply set here.
-struct PrintAdvancedTemplate {
-    u8 buf[1024];
-    int pos = 0;
-    int nItems = 0;
-
-    void Align() {
-        while (pos & 3) {
-            Write(nullptr, 1);
-        }
-    }
-
-    void Write(const void* data, int n) {
-        ReportIf(pos + n > dimofi(buf));
-        if (pos + n > dimofi(buf)) {
-            return;
-        }
-        if (data) {
-            memcpy(buf + pos, data, (size_t)n);
-        }
-        pos += n;
-    }
-
-    void U16(int v) {
-        u16 v16 = (u16)v;
-        Write(&v16, 2);
-    }
-
-    void U32(u32 v) { Write(&v, 4); }
-
-    void Sz(const WCHAR* s) {
-        int n = s ? (int)wcslen(s) : 0;
-        Write(s, (n + 1) * 2);
-    }
-
-    void Item(u32 style, int x, int y, int cx, int cy, int id, int atom) {
-        Align();
-        U32(style | WS_CHILD | WS_VISIBLE);
-        U32(0);
-        U16(x);
-        U16(y);
-        U16(cx);
-        U16(cy);
-        U16(id);
-        U16(0xFFFF);
-        U16(atom);
-        U16(0); // the text is set in WM_INITDIALOG, as orig does
-        U16(0); // no creation data
-        nItems++;
-    }
-};
-
-static DLGTEMPLATE* BuildPrintAdvancedTemplate() {
-    PrintAdvancedTemplate t;
-    u32 style = DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | WS_POPUP | WS_CAPTION | WS_SYSMENU;
-    t.U32(style);
-    t.U32(IsUIRtl() ? (WS_EX_LAYOUTRTL | WS_EX_RTLREADING) : 0);
-    int cditPos = t.pos;
-    t.U16(0); // patched with nItems below
-    t.U16(0);
-    t.U16(0);
-    t.U16(292);
-    t.U16(194);
-    t.U16(0); // no menu
-    t.U16(0); // default dialog class
-    t.Sz(L"Advanced");
-    t.U16(8); // DS_SETFONT: point size and typeface
-    t.Sz(L"MS Shell Dlg");
-
-    u32 radio = BS_AUTORADIOBUTTON | WS_TABSTOP;
-    u32 check = BS_AUTOCHECKBOX | WS_TABSTOP;
-    t.Item(BS_GROUPBOX, 7, 7, 278, 52, IDC_SECTION_PRINT_RANGE, kAtomButton);
-    t.Item(radio | WS_GROUP, 14, 18, 264, 9, IDC_PRINT_RANGE_ALL, kAtomButton);
-    t.Item(radio, 14, 31, 264, 9, IDC_PRINT_RANGE_EVEN, kAtomButton);
-    t.Item(radio, 14, 44, 264, 9, IDC_PRINT_RANGE_ODD, kAtomButton);
-    t.Item(BS_GROUPBOX, 7, 62, 278, 65, IDC_SECTION_PRINT_SCALE, kAtomButton);
-    t.Item(radio | WS_GROUP, 14, 74, 264, 9, IDC_PRINT_SCALE_SHRINK, kAtomButton);
-    t.Item(radio, 14, 87, 264, 9, IDC_PRINT_SCALE_FIT, kAtomButton);
-    t.Item(radio, 14, 100, 264, 9, IDC_PRINT_SCALE_NONE, kAtomButton);
-    t.Item(radio, 14, 113, 264, 9, IDC_PRINT_SCALE_STRETCH, kAtomButton);
-    t.Item(check | WS_GROUP, 7, 133, 278, 10, IDC_PRINT_CENTER_HORIZONTALLY, kAtomButton);
-    t.Item(check, 7, 146, 278, 10, IDC_PRINT_PAPER_SOURCE_BY_SIZE, kAtomButton);
-    t.Item(check, 7, 159, 278, 10, IDC_PRINT_PER_PAGE_PAPER_SIZE, kAtomButton);
-    t.Item(SS_LEFT, 7, 175, 72, 9, IDC_PRINT_ROTATE_LABEL, kAtomStatic);
-    t.Item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 82, 173, 90, 60, IDC_PRINT_ROTATE, kAtomComboBox);
-
-    u16 cdit = (u16)t.nItems;
-    memcpy(t.buf + cditPos, &cdit, sizeof(cdit));
-    return (DLGTEMPLATE*)MemDup(nullptr, t.buf, (size_t)t.pos);
-}
 
 static INT_PTR CALLBACK Sheet_Print_Advanced_Proc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
     Print_Advanced_Data* data;
@@ -1563,6 +1471,7 @@ static INT_PTR CALLBACK Sheet_Print_Advanced_Proc(HWND hDlg, UINT msg, WPARAM wp
         case WM_INITDIALOG:
             data = (Print_Advanced_Data*)((PROPSHEETPAGE*)lp)->lParam;
             SetWindowLongPtr(hDlg, GWLP_USERDATA, (LONG_PTR)data);
+            PrintAdvancedInitDlg(hDlg);
             HwndSetDlgItemText(hDlg, IDC_SECTION_PRINT_RANGE, Tr("Print range"));
             HwndSetDlgItemText(hDlg, IDC_PRINT_RANGE_ALL, Tr("&All selected pages"));
             HwndSetDlgItemText(hDlg, IDC_PRINT_RANGE_EVEN, Tr("&Even pages only"));
@@ -1576,6 +1485,7 @@ static INT_PTR CALLBACK Sheet_Print_Advanced_Proc(HWND hDlg, UINT msg, WPARAM wp
             HwndSetDlgItemText(hDlg, IDC_PRINT_PAPER_SOURCE_BY_SIZE, Tr("Choose &paper source by document page size"));
             HwndSetDlgItemText(hDlg, IDC_PRINT_PER_PAGE_PAPER_SIZE,
                                Tr("Print each page at its &document page size (mixed sizes)"));
+            HwndSetDlgItemText(hDlg, IDC_PRINT_AUTO_ROTATE, Tr("Rotate &wide pages to fit the paper"));
             HwndSetDlgItemText(hDlg, IDC_PRINT_ROTATE_LABEL, Tr("&Rotate printout:"));
             {
                 HWND hwndCb = GetDlgItem(hDlg, IDC_PRINT_ROTATE);
@@ -1612,6 +1522,7 @@ static INT_PTR CALLBACK Sheet_Print_Advanced_Proc(HWND hDlg, UINT msg, WPARAM wp
             CheckDlgButton(hDlg, IDC_PRINT_PAPER_SOURCE_BY_SIZE,
                            data->paperSourceByPageSize ? BST_CHECKED : BST_UNCHECKED);
             CheckDlgButton(hDlg, IDC_PRINT_PER_PAGE_PAPER_SIZE, data->perPagePaperSize ? BST_CHECKED : BST_UNCHECKED);
+            CheckDlgButton(hDlg, IDC_PRINT_AUTO_ROTATE, data->autoRotate ? BST_CHECKED : BST_UNCHECKED);
 
             return FALSE;
             //] ACCESSKEY_GROUP Advanced Print Tab
@@ -1638,6 +1549,7 @@ static INT_PTR CALLBACK Sheet_Print_Advanced_Proc(HWND hDlg, UINT msg, WPARAM wp
                 data->centerHorizontally = IsDlgButtonChecked(hDlg, IDC_PRINT_CENTER_HORIZONTALLY) != 0;
                 data->paperSourceByPageSize = IsDlgButtonChecked(hDlg, IDC_PRINT_PAPER_SOURCE_BY_SIZE) != 0;
                 data->perPagePaperSize = IsDlgButtonChecked(hDlg, IDC_PRINT_PER_PAGE_PAPER_SIZE) != 0;
+                data->autoRotate = IsDlgButtonChecked(hDlg, IDC_PRINT_AUTO_ROTATE) != 0;
                 int rotIdx = (int)SendDlgItemMessage(hDlg, IDC_PRINT_ROTATE, CB_GETCURSEL, 0, 0);
                 data->extraRotation = rotIdx > 0 ? rotIdx * 90 : 0;
                 return TRUE;
@@ -1655,7 +1567,8 @@ static INT_PTR CALLBACK Sheet_Print_Advanced_Proc(HWND hDlg, UINT msg, WPARAM wp
                 case IDC_PRINT_SCALE_NONE:
                 case IDC_PRINT_CENTER_HORIZONTALLY:
                 case IDC_PRINT_PAPER_SOURCE_BY_SIZE:
-                case IDC_PRINT_PER_PAGE_PAPER_SIZE: {
+                case IDC_PRINT_PER_PAGE_PAPER_SIZE:
+                case IDC_PRINT_AUTO_ROTATE: {
                     HWND hApplyButton = GetDlgItem(GetParent(hDlg), ID_APPLY_NOW);
                     EnableWindow(hApplyButton, TRUE);
                 } break;
@@ -1669,21 +1582,20 @@ static INT_PTR CALLBACK Sheet_Print_Advanced_Proc(HWND hDlg, UINT msg, WPARAM wp
     return FALSE;
 }
 
-HPROPSHEETPAGE CreatePrintAdvancedPropSheet(Print_Advanced_Data* data, ScopedMem<DLGTEMPLATE>& dlgTemplate) {
+// the dialog template comes from the app (PrintAdvancedSetPage)
+static HPROPSHEETPAGE CreatePrintAdvancedPropSheet(Print_Advanced_Data* data) {
     PROPSHEETPAGE psp{};
 
-    dlgTemplate.Set(BuildPrintAdvancedTemplate());
     psp.dwSize = sizeof(PROPSHEETPAGE);
-    psp.dwFlags = PSP_USETITLE | PSP_PREMATURE | PSP_DLGINDIRECT;
-    psp.pResource = dlgTemplate.Get();
+    psp.dwFlags = PSP_USETITLE | PSP_PREMATURE;
     psp.pfnDlgProc = Sheet_Print_Advanced_Proc;
     psp.lParam = (LPARAM)data;
     auto s = Tr("Advanced");
     psp.pszTitle = CWStrTemp(s);
+    PrintAdvancedSetPage(&psp);
 
     return CreatePropertySheetPage(&psp);
 }
-#endif
 
 enum {
     MAXPAGERANGES = 10
@@ -1764,12 +1676,8 @@ static void PrintCurrentFileCont(MainWindow* win, bool waitForCompletion, bool s
     Vec<PRINTPAGERANGE> ranges;
     Vec<SelectionOnPage>* sel;
 
-    if (win->AsChm()) {
-        win->AsChm()->PrintCurrentPage(true);
-        return;
-    }
-    if (win->AsMarkdown()) {
-        win->AsMarkdown()->PrintCurrentPage(true);
+    if (win->AsBrowser()) {
+        win->AsBrowser()->PrintCurrentPage(true);
         return;
     }
     DisplayModel* dm = win->AsFixed();
@@ -1784,6 +1692,7 @@ static void PrintCurrentFileCont(MainWindow* win, bool waitForCompletion, bool s
         return;
     }
     int rotation;
+    WindowTab* tab = win->CurrentTab();
     // the print dialog needs the real total up front; no progress UI here
     EnsureFullLayout(dm);
     int nPages = dm->PageCount();
@@ -1832,12 +1741,8 @@ static void PrintCurrentFileCont(MainWindow* win, bool waitForCompletion, bool s
 
     Print_Advanced_Data advanced(PrintRangeAdv::All, defaultScaleAdv);
     advanced.dpiOverride = gSettings->printerDefaults.printDpi;
-#if defined(SUMATRA_NG)
-    ScopedMem<DLGTEMPLATE> dlgTemplate;
-    HPROPSHEETPAGE hPsp = CreatePrintAdvancedPropSheet(&advanced, dlgTemplate);
-#else
+    advanced.autoRotate = gSettings->printerDefaults.autoRotate;
     HPROPSHEETPAGE hPsp = CreatePrintAdvancedPropSheet(&advanced);
-#endif
     pdex.lphPropertyPages = &hPsp;
     pdex.nPropertyPages = 1;
 
@@ -1903,6 +1808,13 @@ static void PrintCurrentFileCont(MainWindow* win, bool waitForCompletion, bool s
     if (action != PD_RESULT_PRINT) {
         // it's cancel or apply so silently ignore as it's not an error
         logf("PrintCurrentFile: PrintDlgEx ended without print, action=%u\n", action);
+        goto Exit;
+    }
+
+    // the dialog's page ranges are for this tab's document; another file opened
+    // while it was up (e.g. from Outlook) becomes the current tab
+    if (win->CurrentTab() != tab) {
+        logf("PrintCurrentFile: tab changed during PrintDlgEx\n");
         goto Exit;
     }
 
@@ -2015,6 +1927,7 @@ static void PrintCurrentFileCont(MainWindow* win, bool waitForCompletion, bool s
 
     sel = printSelection ? win->CurrentTab()->selectionOnPage : nullptr;
     pd = new PrintData(pinnedEngine, printer, ranges, advanced, rotation, sel);
+    pd->mirror = dm->GetMirror();
     SafeEngineRelease(&pinnedEngine);
 
     if (pd->failedEngineClone) {
@@ -2467,6 +2380,7 @@ PrintResult PrintFile2(EngineBase* engine, Str printerName, bool displayErrors, 
     {
         Print_Advanced_Data advanced;
         advanced.dpiOverride = gSettings->printerDefaults.printDpi;
+        advanced.autoRotate = gSettings->printerDefaults.autoRotate;
         Vec<PRINTPAGERANGE> ranges;
 
         // apply print defaults from the PDF's /ViewerPreferences (issue #534),

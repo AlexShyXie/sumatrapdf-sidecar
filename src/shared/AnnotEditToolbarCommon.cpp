@@ -20,6 +20,7 @@
 #include "Translations.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Commands.h"
 #include "Toolbar.h"
@@ -357,11 +358,6 @@ static TempStr GetKnownColorNameTemp(PdfColor c) {
     return {};
 }
 
-// Clear non-owning Annotation* before the old engine is destroyed.
-void InvalidateEditAnnotationsOnEngineChange(WindowTab* tab) {
-    CloseAnnotationUiForTab(tab);
-}
-
 void NotifyAnnotationsChanged(WindowTab* tab) {
     if (tab && tab->win) {
         UpdateAnnotFilterToolbar(tab->win);
@@ -516,7 +512,8 @@ bool SameRectF(RectF a, RectF b) {
 }
 
 void OnAnnotsProgress(WindowTab* tab) {
-    if (!tab || !IsMainWindowValidAndNotClosing(tab->win)) {
+    // posted from the load thread: the tab may have closed since
+    if (!IsWindowTabValid(tab) || !IsMainWindowValidAndNotClosing(tab->win)) {
         return;
     }
     RefreshAnnotFilterAnnotations(tab->win);
@@ -596,6 +593,27 @@ static PdfColor ColorWithOpacity(PdfColor c, Annotation* annot, bool withOpacity
     u8 a;
     UnpackPdfColor(c, r, g, b, a);
     return MkPdfColor(r, g, b, (u8)Opacity(annot));
+}
+
+// the text a toolbar chip shows for item
+TempStr ChipLabelTemp(const AnnotEditItem& item) {
+    switch (item.kind) {
+        case AnnotEditKind::Opacity:
+            return fmt("%d%%", ((item.number * 100) + 127) / 255);
+        case AnnotEditKind::Border:
+        case AnnotEditKind::TextSize:
+            return fmt("%d", item.number);
+        case AnnotEditKind::Bold:
+            return str::DupTemp(StrL("B"));
+        case AnnotEditKind::Italic:
+            return str::DupTemp(StrL("I"));
+        case AnnotEditKind::Underline:
+            return str::DupTemp(StrL("U"));
+        case AnnotEditKind::Icon:
+            return str::DupTemp(item.iconName);
+        default:
+            return str::DupTemp(item.text);
+    }
 }
 
 void CollectItems(Annotation* annot, Vec<AnnotEditItem>& out) {
@@ -754,7 +772,7 @@ void ScheduleShowSelectedAnnotationView(WindowTab* tab) {
         return;
     }
     tab->pendingShowSelectedAnnotation = true;
-    uitask::Post(MkFunc0(ShowSelectedAnnotationView, tab), "ShowSelectedAnnot");
+    PostForTab(tab, ShowSelectedAnnotationView, "ShowSelectedAnnot");
 }
 
 static void AddAnnotPage(Vec<int>& pages, int pageNo, int pageCount) {
@@ -794,6 +812,24 @@ void CollectPriorityAnnotPages(WindowTab* tab, Annotation* extra, Vec<int>& page
     if (extra) {
         AddAnnotPage(pages, extra->pageNo, n);
     }
+}
+
+// Load the priority pages' annotations now, the rest in the background.
+void StartLoadingAnnotationsForUi(WindowTab* tab) {
+    DisplayModel* dm = tab ? tab->AsFixed() : nullptr;
+    if (!dm) {
+        return;
+    }
+    EngineBase* engine = dm->GetEngine();
+    if (!EngineSupportsAnnotations(engine)) {
+        return;
+    }
+    Vec<int> firstPages;
+    CollectPriorityAnnotPages(tab, tab->selectedAnnotation, firstPages);
+    for (int pageNo : firstPages) {
+        EngineMupdfLoadAnnotsForPage(engine, pageNo);
+    }
+    EngineMupdfStartLoadAllAnnotations(engine, firstPages, MkFunc0(OnAnnotsProgress, tab));
 }
 
 // how wide the stroke of an ink annotation is, from the Thickness slider of
@@ -862,6 +898,14 @@ void DeleteAnnotationAndUpdateUI(WindowTab* tab, Annotation* annot) {
     }
     Annotation* keepSelected = annot == tab->selectedAnnotation ? nullptr : tab->selectedAnnotation;
 
+    // deleting the annotation being moved or resized (Delete mid-drag) ends that
+    // gesture first; otherwise the drag goes on as a pan of the page
+    MainWindow* win = tab->win;
+    bool resizingIt = win && win->annotationBeingResized && annot == tab->selectedAnnotation;
+    if (win && (win->annotationBeingDragged == annot || resizingIt)) {
+        CancelDrag(win);
+    }
+
     DetachAnnotationFromUI(annot);
     DeleteAnnotation(annot);
     RefreshAnnotationLists(tab);
@@ -876,22 +920,13 @@ void DeleteAnnotationAndUpdateUI(WindowTab* tab, Annotation* annot) {
 // arrows in the annot list can keep moving the caret (issue #6009). Find
 // uses ScheduleRepaint, not MainWindowRerender, for the same reason.
 void ShowSelectedAnnotationView(WindowTab* tab) {
-    if (!tab) {
+    // the tab may have been closed (and freed) before this posted task ran
+    MainWindow* win = FindMainWindowByTab(tab);
+    if (!win) {
         return;
     }
     tab->pendingShowSelectedAnnotation = false;
-    if (!IsMainWindowValidAndNotClosing(tab->win)) {
-        return;
-    }
-    MainWindow* win = tab->win;
-    bool tabOpen = false;
-    for (WindowTab* t : win->Tabs()) {
-        if (t == tab) {
-            tabOpen = true;
-            break;
-        }
-    }
-    if (!tabOpen) {
+    if (!IsMainWindowValidAndNotClosing(win)) {
         return;
     }
     Annotation* annot = tab->selectedAnnotation;
@@ -1052,4 +1087,21 @@ void ChipColorPicked(AnnotEditToolbarBase* tb, Color col) {
             return;
     }
     AnnotChanged(tab);
+}
+
+void PostedStartContentsEdit(MainWindow* win) {
+    // the window may have been closed since this was posted
+    if (!IsMainWindowValidAndNotClosing(win)) {
+        return;
+    }
+    StartSelectedAnnotContentsEdit(win);
+}
+
+// How much committing a free text edit grows its box: only by what the new
+// text needs beyond both the box and what the old text needed. A box that fit
+// its text snugly, smaller than our padded estimate, keeps its size (#6551).
+Size FreeTextGrowth(Size box, Size fitOld, Size fitNew) {
+    int dx = fitNew.dx - std::max(box.dx, fitOld.dx);
+    int dy = fitNew.dy - std::max(box.dy, fitOld.dy);
+    return {std::max(dx, 0), std::max(dy, 0)};
 }

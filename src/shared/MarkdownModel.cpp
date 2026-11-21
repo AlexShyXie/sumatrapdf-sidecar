@@ -19,6 +19,7 @@
 #include "SumatraPDF.h"
 #include "EmbeddedResources.h"
 #include "MarkdownToc.h"
+#include "FileThumbnails.h"
 #include "PagePosition.h"
 #include "MarkdownModel.h"
 
@@ -95,6 +96,27 @@ static TempStr UrlFragmentTemp(Str url) {
     return url::DecodeTemp(Str(frag.s + 1, frag.len - 1));
 }
 
+// A decoded url path must stay inside the document's folder. WebView2 collapses
+// "../" in urls but not an encoded "%2e%2e%5c", which decodes to "..\".
+static bool IsRelPathInDir(Str rel) {
+    auto isSep = [](char c) { return c == '/' || c == '\\'; };
+    if (path::IsAbsolute(rel) || (len(rel) > 0 && isSep(rel.s[0]))) {
+        return false;
+    }
+    // reject any ".." segment: "a\..\..\b"
+    int segStart = 0;
+    for (int i = 0; i <= len(rel); i++) {
+        if (i < len(rel) && !isSep(rel.s[i])) {
+            continue;
+        }
+        if (str::Eq(Str(rel.s + segStart, i - segStart), StrL(".."))) {
+            return false;
+        }
+        segStart = i + 1;
+    }
+    return true;
+}
+
 static TempStr RelPathFromBaseTemp(Str filePath, Str baseDir) {
     TempStr normFile = path::NormalizeTemp(filePath);
     TempStr normBase = path::NormalizeTemp(baseDir);
@@ -102,10 +124,7 @@ static TempStr RelPathFromBaseTemp(Str filePath, Str baseDir) {
         return path::GetBaseNameTemp(filePath);
     }
     Str rel = normFile;
-    while (len(rel) > 0 && (rel.s[0] == '\\' || rel.s[0] == '/')) {
-        rel.s++;
-        rel.len--;
-    }
+    str::TrimAny(rel, "/\\");
     if (len(rel) == 0) {
         return path::GetBaseNameTemp(filePath);
     }
@@ -256,6 +275,9 @@ TempStr MarkdownModel::VirtualUrlToFileTemp(Str url) const {
     }
     // url path -> file path: decode first, a '/' or '\' can't be in a file name
     TempStr rel = str::ReplaceTemp(url::DecodeTemp(pathPart), StrL("/"), StrL(kPathSep));
+    if (!IsRelPathInDir(rel)) {
+        return {};
+    }
     if (isHtml) {
         // page urls keep their real name; images/links resolve against baseDir too
         return path::JoinTemp(baseDir, rel);
@@ -311,6 +333,9 @@ TempStr MarkdownModel::LinkedDocPathTemp(Str url) const {
         return {};
     }
     TempStr rel = str::ReplaceTemp(url::DecodeTemp(urlPath), StrL("/"), StrL(kPathSep));
+    if (!IsRelPathInDir(rel)) {
+        return {};
+    }
     return path::NormalizeTemp(path::JoinTemp(baseDir, rel));
 }
 
@@ -457,12 +482,37 @@ bool MarkdownModel::OnBeforeNavigate(Str url, bool newWindow) {
     return true;
 }
 
+// a capture outlives its model when the tab closes first, so it only keeps the path
+struct HtmlThumbnailCapture {
+    Str filePath;
+};
+
+static void HtmlThumbnailCaptured(HtmlThumbnailCapture* d, Str png) {
+    SetThumbnailFromImage(d->filePath, png);
+    str::Free(d->filePath);
+    delete d;
+}
+
+// the thumbnail is a picture of the loaded page, taken once, before the saved scroll position is restored
+void MarkdownModel::MaybeCaptureThumbnail(Str filePath) {
+    if (!isHtml || didCaptureThumbnail || !path::IsSame(filePath, pages[0])) {
+        return;
+    }
+    didCaptureThumbnail = true;
+    auto* d = new HtmlThumbnailCapture{str::Dup(filePath)};
+    if (!BrowserViewCapturePng(docView, MkFunc1(HtmlThumbnailCaptured, d))) {
+        str::Free(d->filePath);
+        delete d;
+    }
+}
+
 void MarkdownModel::OnDocumentComplete(Str url) {
     if (len(url) == 0) {
         return;
     }
     TempStr plainUrl = NormalizeMarkdownUrlTemp(url);
     TempStr filePath = VirtualUrlToFileTemp(plainUrl);
+    MaybeCaptureThumbnail(filePath);
     int pageNo = pages.Find(filePath) + 1;
     if (pageNo < 1) {
         pageNo = currentPageNo;
@@ -484,6 +534,33 @@ void MarkdownModel::OnDocumentComplete(Str url) {
     FinishDocumentLoad(pageNo);
 }
 
+static bool IsPageScriptUrl(Str url, Str name) {
+    return str::EqI(url, name) || (str::EndsWithI(url, name) && url.s[len(url) - len(name) - 1] == '/');
+}
+
+// scripts the page MarkdownToHtmlPage makes loads: pele for ```mermaid
+// fences, microlighter and code-run.js for code blocks
+static Str PageScriptData(Str url) {
+    Str embedded[] = {StrL("pele.min.js"), StrL("microlighter.min.js")};
+    for (Str name : embedded) {
+        if (!IsPageScriptUrl(url, name)) {
+            continue;
+        }
+        int n = 0;
+        u8* js = GetEmbeddedFileData(name, &n);
+        Str res = (js && n > 0) ? str::Dup(Str((const char*)js, n)) : Str{};
+        free(js);
+        return res;
+    }
+    if (IsPageScriptUrl(url, StrL("mermaid-run.js"))) {
+        return str::Dup(MermaidRunJs());
+    }
+    if (IsPageScriptUrl(url, StrL("code-run.js"))) {
+        return str::Dup(CodeRunJs());
+    }
+    return {};
+}
+
 Str MarkdownModel::GetDataForUrl(Str url) {
     ScopedMutex scope(&docAccess);
     TempStr plainUrl = NormalizeMarkdownUrlTemp(url);
@@ -492,16 +569,8 @@ Str MarkdownModel::GetDataForUrl(Str url) {
         return cached;
     }
 
-    Str data;
-    // mermaid runtime from IDR_EMBEDDED_PAK for ```mermaid fences (see MarkdownToHtmlPage)
-    if (str::EndsWithI(plainUrl, StrL("/mermaid.min.js")) || str::EqI(plainUrl, StrL("mermaid.min.js"))) {
-        int n = 0;
-        u8* js = GetEmbeddedFileData(StrL("mermaid.min.js"), &n);
-        if (js && n > 0) {
-            data = str::Dup(Str((const char*)js, n));
-        }
-        free(js);
-    } else {
+    Str data = PageScriptData(plainUrl);
+    if (len(data) == 0) {
         TempStr filePath = VirtualUrlToFileTemp(plainUrl);
         // in html mode every resource (the page, images, linked pages) is served raw;
         // in markdown mode .md/.markdown/.html are rendered to a styled page and other
@@ -614,7 +683,7 @@ static TocTree* BuildFullToc(Arena* arena, StrVec& pages, Str baseDir, bool isHt
         TempStr pageUrl = FileToVirtualUrlTemp(ft.filePath, baseDir, isHtml);
         AppendFileTocTraceItem(tocTrace, ft.filePath, pageUrl, pageNo);
 
-        for (MarkdownHeadingItem& hi : ft.headings) {
+        for (MarkdownHeadingItem& hi : *ft.headings) {
             TempStr destUrl = pageUrl;
             if (hi.anchor) {
                 destUrl = str::JoinTemp(pageUrl, fmt("#%s", hi.anchor));
@@ -630,11 +699,11 @@ static TocTree* BuildFullToc(Arena* arena, StrVec& pages, Str baseDir, bool isHt
 
     for (MarkdownFileToc& ft : fileTocs) {
         str::Free(ft.filePath);
-        for (MarkdownHeadingItem& hi : ft.headings) {
+        for (MarkdownHeadingItem& hi : *ft.headings) {
             str::Free(hi.title);
             str::Free(hi.anchor);
         }
-        VecReset(ft.headings);
+        delete ft.headings;
     }
 
     TocTree* res = BuildBrowserTocTree(arena, tocTrace);
@@ -696,8 +765,13 @@ bool MarkdownModel::Load(Str fileName) {
     str::ReplaceWithCopy(&baseDir, path::GetDirTemp(fileName));
     isHtml = IsHtmlFileType(GuessFileType(fileName, true));
 
+    // .md files in a folder are usually one set of docs, .html files usually aren't (#6448)
     StrVec mdFiles;
-    CollectMarkdownFiles(baseDir, fileName, isHtml, mdFiles);
+    if (isHtml) {
+        mdFiles.Append(fileName);
+    } else {
+        CollectMarkdownFiles(baseDir, fileName, false, mdFiles);
+    }
     if (len(mdFiles) == 0) {
         return false;
     }

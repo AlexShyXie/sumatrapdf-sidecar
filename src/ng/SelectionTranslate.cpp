@@ -35,6 +35,7 @@
 #include "DocController.h"
 #include "EngineBase.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "TextSelection.h"
 #include "Selection.h"
@@ -44,6 +45,7 @@
 #include "Theme.h"
 #include "gui/AppShell.h"
 #include "gui/DialogWidgets.h"
+#include "shared/PdfToolsCommon.h"
 #include "gui/PlatformFont.h"
 #include "gui/ToolWindow.h"
 #include "SelectionTranslate.h"
@@ -84,75 +86,26 @@ TempStr OsDefaultDestinationLanguageTemp() {
     return StrL("English");
 }
 
-static void LogTranslation(AIChatBackend backend, Str direction, Str text) {
-    logf("selection-translate %s %s: %s\n", BackendLogName(backend), direction, text);
+TempStr TranslateTempDirTemp() {
+    return GetTempDirPathTemp();
 }
 
-static bool RunTranslation(AIChatBackend backend, Str srcLang, Str dstLang, Str text, Str& msgOut) {
-    TempStr exePath = FindBackendExecutableTemp(backend);
-    if (len(exePath) == 0) {
-        msgOut = str::Dup(Tr("The selected AI CLI is not installed."));
-        return false;
-    }
-
-    TempStr prompt = BuildTranslationPromptTemp(srcLang, dstLang, text);
-    TempStr cwd = StripTrailingSlashTemp(GetTempDirPathTemp());
-    TempStr cmdLine;
-    if (backend == AIChatBackend::Grok) {
-        cmdLine = BuildGrokTranslateCmdLineTemp(exePath, prompt, cwd);
-    } else if (backend == AIChatBackend::Claude) {
-        cmdLine = BuildClaudeTranslateCmdLineTemp(exePath, prompt);
-    } else if (backend == AIChatBackend::Codex) {
-        cmdLine = BuildCodexTranslateCmdLineTemp(exePath, prompt, cwd);
-    } else if (backend == AIChatBackend::AntiGravity) {
-        cmdLine = BuildAntiGravityTranslateCmdLineTemp(exePath, prompt);
-    }
-
-    LogTranslation(backend, StrL(">>> backend"), BackendDisplayName(backend));
-    LogTranslation(backend, StrL(">>> srcLang"), srcLang);
-    LogTranslation(backend, StrL(">>> dstLang"), dstLang);
-    LogTranslation(backend, StrL(">>> prompt"), prompt);
-    LogTranslation(backend, StrL(">>> cmd"), cmdLine);
-
+TranslateRun RunTranslateCli(Str cmdLine, Str cwd, str::Builder& output) {
     AIChatProcessLaunchResult launch;
     if (!AIChatLaunchProcessWithStdoutPipe(cmdLine, cwd, &launch)) {
-        msgOut = str::Dup(Tr("Failed to launch the AI CLI."));
-        LogTranslation(backend, StrL("<<< error"), msgOut);
-        return false;
+        return TranslateRun::LaunchFailed;
     }
 
-    str::Builder output;
-    str::BuilderReserve(output, 4096);
     AIChatReadPipeToEnd(launch.hReadPipe, output);
     launch.hReadPipe = nullptr;
 
     if (!AIChatWaitForProcess(launch.hProcess, 5 * 60 * 1000)) {
         AIChatTerminateProcess(launch.hProcess);
         AIChatCloseProcess(&launch.hProcess, false);
-        msgOut = str::Dup(Tr("Translation timed out."));
-        LogTranslation(backend, StrL("<<< error"), msgOut);
-        return false;
+        return TranslateRun::TimedOut;
     }
     AIChatCloseProcess(&launch.hProcess, false);
-
-    LogTranslation(backend, StrL("<<< raw"), ToStr(output));
-
-    str::Builder translation;
-    str::BuilderReserve(translation, 1024);
-    ParseTranslationOutput(backend, ToStr(output), translation);
-    LogTranslation(backend, StrL("<<< parsed"), ToStr(translation));
-    if (len(translation) == 0) {
-        msgOut = str::Dup(Tr("Translation response did not contain text."));
-        LogTranslation(backend, StrL("<<< error"), msgOut);
-        return false;
-    }
-    if (TranslationLooksLikeError(ToStr(translation))) {
-        msgOut = translation.TakeStr();
-        LogTranslation(backend, StrL("<<< error"), msgOut);
-        return false;
-    }
-    msgOut = translation.TakeStr();
-    return true;
+    return TranslateRun::Done;
 }
 
 static bool TranslateDlgTestResult(bool ok, Str text);
@@ -497,32 +450,24 @@ void ShowSelectionTranslateDialog(WindowTab* tab, TranslateEngine engineIn) {
 
 // --- a window of its own (Windows) ------------------------------------------
 
-// orig's layout at 96 dpi: 12 around; the source edit (7 lines of the app
-// font: 113); "Translation:" 8 under it and the result edit 4 under that (6
-// lines: 98); the engine row, the language row and the button row, each 8
-// under the one before; 23 high combos, 25 high buttons
-constexpr float kTrPad = 12;
-constexpr float kTrGap = 8;
+// orig's layout: the source text, the translation once there is one, the
+// engine and languages, then the footer. The source edit is 7 lines (113),
+// the translation 6 (98)
 constexpr float kTrSrcDy = 113;
-constexpr float kTrLabelDy = 15;
-constexpr float kTrResultGap = 4;
 constexpr float kTrResultDy = 98;
+// the bare text fields have this much more above and below them
+constexpr float kTrTextPadDy = 4;
 constexpr float kTrComboDy = 23;
-constexpr float kTrBtnDy = 25;
-constexpr float kTrBtnPadDx = 12;
-// orig gives the default button 4 more on each side
-constexpr float kTrDefBtnPadDx = 15;
-constexpr float kTrBtnGap = 7;
-constexpr float kTrFontPx = 12;
 // a language combo's ideal width, and what the source edit adds to its text
 constexpr int kTrLangComboDx = 132;
 constexpr int kTrEditExtraDx = 10;
 constexpr int kTrEditIdealChars = 40;
 constexpr int kTrEditMaxChars = 120;
-// the result rows: label gap + label + edit gap + edit
-constexpr int kTrResultRowsDy = (int)(kTrGap + kTrLabelDy + kTrResultGap + kTrResultDy);
-constexpr int kTrBaseDy =
-    (int)(kTrPad + kTrSrcDy + kTrGap + kTrComboDy + kTrGap + kTrComboDy + kTrGap + kTrBtnDy + kTrPad);
+// the result rows: a hairline, the section's padding, the heading, the edit
+constexpr int kTrResultRowsDy = (int)(1 + 2 * kToolDlgFilesPadDy + kToolDlgRowDy + kTrResultDy);
+// the source's section, a hairline, the two rows of controls, the footer
+constexpr int kTrBaseDy = (int)(2 * (kToolDlgFilesPadDy + kTrTextPadDy) + kTrSrcDy + 1 + 2 * kToolDlgFilesPadDy +
+                                2 * kToolDlgRowDy + 2 * kToolDlgFootPadDy + kDlgBtnDy);
 
 static Str TranslateToolTitle() {
     return Tr("Translate");
@@ -549,10 +494,6 @@ static void TranslateToolShowResult() {
     }
 }
 
-static gp::El* TranslateToolLabel(gp::Ctx* cx, Str s, float font) {
-    return gp::TextEl(cx->a, GpuiDup(cx->a, s))->Font(font)->Fg(gp::ThemeNow(cx->app).foreground)->Shrink0();
-}
-
 static gp::El* TranslateToolBuild(MainWindow*, gp::Ctx* cx) {
     if (!gTranslate.visible || !gTranslate.tw) {
         return nullptr;
@@ -565,7 +506,6 @@ static gp::El* TranslateToolBuild(MainWindow*, gp::Ctx* cx) {
         gTranslate.toolWantsFocus = false;
         gp::InputFocus(gTranslate.editSrcText, cx->app, cx->win);
     }
-    float font = kTrFontPx * ToolWindowSetUiFontPx(cx, kTrFontPx);
     gp::WinSize ws = gp::WindowSize(cx->win);
     bool busy = gTranslate.translating;
 
@@ -574,73 +514,81 @@ static gp::El* TranslateToolBuild(MainWindow*, gp::Ctx* cx) {
     float srcDy = editsDy;
     float resultDy = 0;
     if (gTranslate.resultVisible) {
-        editsDy -= kTrGap + kTrLabelDy + kTrResultGap;
+        editsDy -= (float)kTrResultRowsDy - kTrResultDy;
         float extra = std::max(editsDy - kTrSrcDy - kTrResultDy, 0.f);
         srcDy = kTrSrcDy + extra / 2;
         resultDy = kTrResultDy + extra / 2;
     }
+    // a bare text field in the dialog's colors
+    auto textArea = [&](gp::Str id, gp::InputState* st, float dy, bool readonly) {
+        return gpc::Textarea::New(cx, id, st)
+            ->H(dy)
+            ->Disabled(busy && !readonly)
+            ->Readonly(readonly)
+            ->Appearance(false)
+            ->Bordered(false)
+            ->FocusRing(false)
+            ->IntoEl()
+            ->Font(kToolDlgTextFontPx);
+    };
 
-    gp::El* col = gp::Div(cx->a)->FlexCol()->W(gp::kFill)->Flex1()->MinH(0)->Pad(kTrPad);
-    col->Child(gpc::Textarea::New(cx, GStrL("translate-src"), gTranslate.editSrcText)
-                   ->H(srcDy)
-                   ->Disabled(busy)
-                   ->IntoEl()
-                   ->Shrink0());
+    gp::El* col =
+        gp::Div(cx->a)->FlexCol()->W(gp::kFill)->Flex1()->MinH(0)->Bg(ToGpui(ThemeWindowControlBackgroundColor()));
+    gp::El* src = DlgSection(cx)->PadY(kToolDlgFilesPadDy + kTrTextPadDy);
+    src->Child(textArea(GStrL("translate-src"), gTranslate.editSrcText, srcDy, false));
+    col->Child(src);
     if (gTranslate.resultVisible) {
         Str label = gTranslate.resultIsError ? Str(Tr("Error:")) : Str(Tr("Translation:"));
-        col->Child(gp::Div(cx->a)
-                       ->FlexRow()
-                       ->ItemsCenter()
-                       ->H(kTrGap + kTrLabelDy)
-                       ->PadT(kTrGap)
-                       ->Shrink0()
-                       ->Child(TranslateToolLabel(cx, label, font)));
-        col->Child(gp::Div(cx->a)
-                       ->PadT(kTrResultGap)
-                       ->Shrink0()
-                       ->Child(gpc::Textarea::New(cx, GStrL("translate-result"), gTranslate.editResult)
-                                   ->H(resultDy)
-                                   ->Readonly()
-                                   ->IntoEl()));
+        col->Child(DlgHairline(cx));
+        gp::El* result = DlgSection(cx);
+        result->Child(DlgSectionHeader(cx, label));
+        result->Child(textArea(GStrL("translate-result"), gTranslate.editResult, resultDy, true));
+        col->Child(result);
     }
+    col->Child(DlgHairline(cx));
 
-    auto row = [&](float dy) {
-        return gp::Div(cx->a)->FlexRow()->W(gp::kFill)->ItemsCenter()->H(kTrGap + dy)->PadT(kTrGap)->Shrink0();
-    };
-    gp::El* engineRow = row(kTrComboDy);
-    engineRow->Child(TranslateToolLabel(cx, Tr("Translate with"), font));
-    engineRow->Child(gp::Div(cx->a)->Flex1()->MinW(0)->PadL(4)->Child(
+    // the engine and the languages, the labels muted in one column
+    float labelDx = std::max(DlgFieldLabelDx(cx, Tr("Translate with")), DlgFieldLabelDx(cx, Tr("From:")));
+    gp::El* controls = DlgSection(cx);
+    gp::El* engineRow = DlgFieldRow(cx);
+    engineRow->Child(DlgFieldLabel(cx, Tr("Translate with"), labelDx));
+    engineRow->Child(gp::Div(cx->a)->Flex1()->MinW(0)->Child(
         gTranslate.ddEngine.Build(cx, StrL("translate-engine"), gp::kFill, busy)));
-    col->Child(engineRow);
-
-    gp::El* langRow = row(kTrComboDy);
-    langRow->Child(TranslateToolLabel(cx, Tr("From:"), font));
-    langRow->Child(gp::Div(cx->a)->Flex1()->MinW(0)->PadL(4)->Child(
-        gTranslate.ddSrcLang.BuildCombo(cx, StrL("translate-from"), gTranslate.editSrcLang, gp::kFill, busy)));
-    langRow->Child(gp::Div(cx->a)->PadL(4)->Shrink0()->Child(TranslateToolLabel(cx, Tr("To:"), font)));
-    langRow->Child(gp::Div(cx->a)->Flex1()->MinW(0)->Child(
-        gTranslate.ddDstLang.BuildCombo(cx, StrL("translate-to"), gTranslate.editDstLang, gp::kFill, busy)));
-    col->Child(langRow);
+    controls->Child(engineRow);
+    gp::El* langRow = DlgFieldRow(cx);
+    langRow->Child(DlgFieldLabel(cx, Tr("From:"), labelDx));
+    langRow->Child(gp::Div(cx->a)->Flex1()->MinW(0)->Child(gTranslate.ddSrcLang.BuildCombo(
+        cx, StrL("translate-from"), gTranslate.editSrcLang, gp::kFill, busy, kTrComboDy, kToolDlgTextFontPx)));
+    langRow->Child(DlgFieldLabel(cx, Tr("To:"), 0));
+    langRow->Child(gp::Div(cx->a)->Flex1()->MinW(0)->Child(gTranslate.ddDstLang.BuildCombo(
+        cx, StrL("translate-to"), gTranslate.editDstLang, gp::kFill, busy, kTrComboDy, kToolDlgTextFontPx)));
+    controls->Child(langRow);
+    col->Child(controls);
 
     TempStr srcLang = DlgSrcLangTemp();
     TempStr dstLang = DlgDstLangTemp();
     TempStr srcText = str::DupTemp(FromGpui(gp::InputValue(gTranslate.editSrcText)));
     bool enable = !busy && !str::IsEmptyOrWhiteSpace(srcText) && !LanguagesAreSameTemp(srcLang, dstLang);
     Str okText = busy ? Str(Tr("Translating...")) : Str(Tr("Translate"));
-
-    auto button = [&](gp::Str id, Str label, gp::Listener onClick, bool isDefault, bool disabled) {
-        gpc::Button* b = gpc::Button::New(cx, id)->Label(GpuiDup(cx->a, label))->Disabled(disabled)->OnClick(onClick);
-        if (isDefault) {
-            b->Primary();
-        }
-        return b->IntoEl()->H(kTrBtnDy)->PadX(isDefault ? kTrDefBtnPadDx : kTrBtnPadDx)->Shrink0();
-    };
-    gp::El* buttons = row(kTrBtnDy)->JustifyEnd()->Gap(kTrBtnGap);
-    buttons->Child(button(GStrL("translate-close"), Tr("Close"), gp::ListenTo(gTranslateView, &TranslateView::OnClose),
-                          false, false));
-    buttons->Child(button(GStrL("translate-go"), okText, gp::ListenTo(gTranslateView, &TranslateView::OnTranslate),
-                          true, !enable));
-    col->Child(buttons);
+    // the footer's Cancel stands for Close here
+    gp::El* row = gp::Div(cx->a)
+                      ->FlexRow()
+                      ->ItemsCenter()
+                      ->W(gp::kFill)
+                      ->Shrink0()
+                      ->PadX(kToolDlgPadDx)
+                      ->PadY(kToolDlgFootPadDy)
+                      ->Gap(kToolDlgGapDx);
+    row->Child(gp::Div(cx->a)->Flex1());
+    row->Child(gpc::Button::New(cx, GStrL("translate-close"))
+                   ->Label(ToGpui(Tr("Close")))
+                   ->Outline()
+                   ->WithSize(gp::UiSize::Small)
+                   ->OnClick(gp::ListenTo(gTranslateView, &TranslateView::OnClose))
+                   ->IntoEl());
+    row->Child(DlgFilledButton(cx, GStrL("translate-go"), okText,
+                               gp::ListenTo(gTranslateView, &TranslateView::OnTranslate), !enable));
+    col->Child(row);
     return col;
 }
 
@@ -699,7 +647,7 @@ static Size TranslateToolClientSize(MainWindow* win, Str selText) {
     int toDx = PlatformFontMeasureText(font, Tr("To:")).dx;
     int langRowDx = fromDx + toDx + MulDiv(2 * 4 + 2 * kTrLangComboDx, dpi, 96);
     int dx = std::max(editDx, langRowDx);
-    return Size(MulDiv(dx, 96, dpi) + 2 * (int)kTrPad, kTrBaseDy);
+    return Size(MulDiv(dx, 96, dpi) + 2 * (int)kToolDlgPadDx, kTrBaseDy);
 }
 
 static void TranslateOpenToolWindow(MainWindow* win, Str selText) {

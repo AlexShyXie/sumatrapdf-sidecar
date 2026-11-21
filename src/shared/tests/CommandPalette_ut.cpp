@@ -9,50 +9,33 @@
 // must be last due to assert() over-write
 #include "base/tests/UtAssert.h"
 
-// A pure model of the command palette's list + filtering, with no window
-// attached, so the filtering can be tested without a UI.
-struct CommandPaletteEntry {
-    int commandId = 0;
-};
-
-struct CommandPaletteModel {
-    StrVecWithData<CommandPaletteEntry> commands;
-    StrVecWithData<CommandPaletteEntry> filtered;
-    StrVec filterWords;
-
-    void SetCommands(const int* commandIds, int count);
-    void Filter(Str query);
-    int ItemCommandId(int index) const;
-};
-
-void CommandPaletteModel::SetCommands(const int* commandIds, int count) {
-    commands.Reset();
-    for (int i = 0; i < count; i++) {
-        int commandId = commandIds[i];
-        Str description = GetCommandDescription(commandId);
-        if (len(description) == 0) {
-            continue;
-        }
-        commands.Append(description, {commandId});
-    }
-    SortNoCase(&commands);
-    Filter({});
-}
-
-void CommandPaletteModel::Filter(Str query) {
-    filtered.Reset();
-    filterWords.Reset();
-    SplitFilterToWords(query, filterWords);
-    for (int i = 0; i < len(commands); i++) {
-        if (FilterMatches(commands[i], filterWords)) {
-            filtered.AppendFrom(&commands, i);
-        }
+static void PaletteSwitchLabel_UnitTests() {
+    struct {
+        const char* label;
+        const char* prefix;
+        const char* expected;
+    } cases[] = {
+        {"& Thumbnails", "&", "Thumbnails"},
+        {"& 缩略图", "&", "缩略图"},
+        {"缩略图", "&", "缩略图"},
+        {"&缩略图", "&", "缩略图"},
+        {"縮圖", "&", "縮圖"},
+        {"Vignettes (&)", "&", "Vignettes (&)"},
+        {"@ 标签页", "@", "标签页"},
+        {"= Settings", "=", "Settings"},
+        {"", "&", ""},
+        {"&", "&", ""},
+    };
+    for (auto& c : cases) {
+        utassert(str::Eq(PaletteSwitchLabel(Str(c.label), Str(c.prefix)), Str(c.expected)));
     }
 }
 
-int CommandPaletteModel::ItemCommandId(int index) const {
-    CommandPaletteEntry* entry = index >= 0 && index < len(filtered) ? filtered.AtData(index) : nullptr;
-    return entry ? entry->commandId : 0;
+// the command palette's filter over real command names: every word, any case
+static bool PaletteMatches(int cmdId, Str query) {
+    StrVec words;
+    SplitFilterToWords(query, words);
+    return FilterMatches(GetCommandDescription(cmdId), words);
 }
 
 // the prefixes docs/md/Command-Palette.md documents, and what they select
@@ -87,23 +70,13 @@ static void PalettePrefixes_UnitTests() {
 }
 
 void CommandPaletteModel_UnitTests() {
+    PaletteSwitchLabel_UnitTests();
     PalettePrefixes_UnitTests();
-    const int commands[] = {CmdOpenFile, CmdRotateLeft, CmdRotateRight, CmdZoomFitWidth};
-    CommandPaletteModel model;
-    model.SetCommands(commands, dimofi(commands));
-    utassert(len(model.filtered) == dimofi(commands));
-    utassert(model.ItemCommandId(0) == CmdOpenFile);
-
-    model.Filter(StrL("rotate right"));
-    utassert(len(model.filtered) == 1);
-    utassert(model.ItemCommandId(0) == CmdRotateRight);
-
-    model.Filter(StrL("FIT width"));
-    utassert(len(model.filtered) == 1);
-    utassert(model.ItemCommandId(0) == CmdZoomFitWidth);
-
-    model.Filter(StrL("missing"));
-    utassert(len(model.filtered) == 0);
+    utassert(PaletteMatches(CmdRotateRight, StrL("rotate right")));
+    utassert(!PaletteMatches(CmdRotateLeft, StrL("rotate right")));
+    utassert(PaletteMatches(CmdZoomFitWidth, StrL("FIT width")));
+    utassert(!PaletteMatches(CmdOpenFile, StrL("missing")));
+    utassert(PaletteMatches(CmdOpenFile, {}));
 
     // ignore diacritics
     StrVec words;

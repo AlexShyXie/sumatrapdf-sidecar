@@ -3,10 +3,12 @@
 
 void UpdateDeltaPerLine();
 
+// home page paints since start, read by -dbg-control WaitHomePainted
+extern int gHomePagePaintCount;
+
 LRESULT CALLBACK WndProcCanvas(HWND, UINT, WPARAM, LPARAM);
 LRESULT WndProcCanvasAbout(MainWindow*, HWND, UINT, WPARAM, LPARAM);
 bool IsDragDistance(int x1, int x2, int y1, int y2);
-void CancelDrag(MainWindow*);
 bool NudgeSelectedAnnotation(MainWindow*, WPARAM key);
 void FinishAnnotationNudge(MainWindow*);
 void StartAutoScrollAtCursor(MainWindow*);
@@ -17,7 +19,7 @@ void ToggleTransparencyGrid();
 bool ShowPageGrid();
 void TogglePageGrid();
 void SetShowPageGrid(bool);
-void RedrawPageGridWindows();
+void RedrawAllWindows();
 bool ShowFitContentArea();
 void ToggleShowFitContentArea();
 bool IsLaserPointerActive();

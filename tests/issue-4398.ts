@@ -65,7 +65,7 @@ export async function testit(): Promise<void> {
       if (!/show=1/.test(reset)) {
         throw new Error(`issue-4398: reset-grid turned off Show Grid: ${reset}`);
       }
-      if (!/width=72/.test(reset) || !/subdiv=4/.test(reset) || !/ox=0/.test(reset)) {
+      if (!/width=72/.test(reset) || !/subdiv=4/.test(reset) || !/ox=0/.test(reset) || !/slant=90/.test(reset)) {
         throw new Error(`issue-4398: reset-grid did not restore defaults: ${reset}`);
       }
     },
@@ -75,12 +75,9 @@ export async function testit(): Promise<void> {
 
 if (import.meta.main) {
   writeFileSync(PDF, makePageGridPdf());
-  const bugs = "C:\\Users\\kjk\\OneDrive\\!sumatra\\bugs\\bug-4398.pdf";
-  try {
-    writeFileSync(bugs, makePageGridPdf());
-    console.log(`wrote ${PDF} and ${bugs}`);
-  } catch {
-    console.log(`wrote ${PDF}`);
-  }
+  // a copy to open by hand, named like the files of the bug folder
+  const bugs = tmpPath("bug-4398.pdf");
+  writeFileSync(bugs, makePageGridPdf());
+  console.log(`wrote ${PDF} and ${bugs}`);
   await runStandalone(testit);
 }

@@ -59,6 +59,10 @@ static SeqStrings gPropNames =
     "sceneType\0"
     "imageFileSize\0"
     "imagePath\0"
+    "publisher\0"
+    "identifier\0"
+    "source\0"
+    "language\0"
     "\0";
 
 // @gen-start docprop-pdf-info
@@ -135,8 +139,4 @@ TempStr PropNameTemp(DocProp prop) {
         return {};
     }
     return SeqStrByIndex(gPropNames, idx);
-}
-
-DocProp PropFromName(Str name) {
-    return (DocProp)(SeqStrIndex(gPropNames, name) + 1);
 }

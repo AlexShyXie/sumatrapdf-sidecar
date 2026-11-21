@@ -5,17 +5,16 @@
 // Run: bun tests/issue-6269.ts [--no-build]
 
 import { dlopen, FFIType } from "bun:ffi";
+import type { ControlClient, LayoutRect } from "./control.ts";
 import { IS_WIN } from "./host.ts";
-import { runStandalone } from "./util.ts";
+import { runStandalone, USE_NG } from "./util.ts";
 import {
-  captureWindowPixels,
   clientToScreen,
   ensureModifierKeysUp,
   enumWindows,
   getClassName,
   getForegroundWindow,
   getWindowPid,
-  getWindowRect,
   isWindowVisible,
   MK_LBUTTON,
   packCoords,
@@ -86,47 +85,29 @@ function setClipboard(value: string): void {
   }
 }
 
-// colored "SumatraPDF" letters in the top band, away from the pale background
-function findLogo(canvas: number): { x: number; y: number } | null {
-  const pix = captureWindowPixels(canvas, "client");
-  if (!pix) {
-    return null;
-  }
-  let minX = pix.w;
-  let minY = pix.h;
-  let maxX = 0;
-  let maxY = 0;
-  let n = 0;
-  const yMax = Math.min(pix.h, 55);
-  for (let y = 0; y < yMax; y++) {
-    for (let x = 0; x < pix.w; x++) {
-      const i = (y * pix.w + x) * 4;
-      const b = pix.data[i]!;
-      const g = pix.data[i + 1]!;
-      const r = pix.data[i + 2]!;
-      const spread = Math.max(r, g, b) - Math.min(r, g, b);
-      if (spread < 40 || r + g + b > 680) {
-        continue;
-      }
-      n++;
-      if (x < minX) {
-        minX = x;
-      }
-      if (y < minY) {
-        minY = y;
-      }
-      if (x > maxX) {
-        maxX = x;
-      }
-      if (y > maxY) {
-        maxY = y;
-      }
+const kCanvasClass = "SUMATRA_PDF_CANVAS";
+const kAboutHoverClass = "SUMATRA_ABOUT_HOVER";
+const kHoverAttempts = 5;
+const kHoverAttemptMs = 2000;
+
+function centerOf(r: LayoutRect): { x: number; y: number } {
+  return { x: r.x + Math.floor(r.dx / 2), y: r.y + Math.floor(r.dy / 2) };
+}
+
+// Client rect of a named virtual control. The hover and the click still use the real cursor.
+async function waitNamed(client: ControlClient, className: string, name: string): Promise<LayoutRect> {
+  const deadline = Date.now() + 3000;
+  for (;;) {
+    const rows = await client.virtTree(className);
+    const hit = rows.find((r) => r.name === name && r.rect.dx > 0 && r.rect.dy > 0);
+    if (hit) {
+      return hit.rect;
     }
+    if (Date.now() > deadline) {
+      throw new Error(`issue-6269: no ${name} in ${className}`);
+    }
+    await sleep(40);
   }
-  if (n < 20) {
-    return null;
-  }
-  return { x: Math.round((minX + maxX) / 2), y: Math.round((minY + maxY) / 2) };
 }
 
 function findHover(pid: number): number {
@@ -148,18 +129,29 @@ function postMove(hwnd: number, x: number, y: number): void {
 }
 
 // one enter, then keep the real cursor on the title until the hover timer fires.
-// a move on every poll restarts that timer, so the popup never opens.
-async function showByHover(canvas: number, logo: { x: number; y: number }, pid: number): Promise<number> {
-  const screen = clientToScreen(canvas, logo.x, logo.y);
-  postMove(canvas, logo.x, logo.y);
-  const deadline = Date.now() + 2000;
-  while (Date.now() < deadline) {
-    setCursorPos(screen.x, screen.y);
-    const hover = findHover(pid);
-    if (hover) {
-      return hover;
+// a move on every poll restarts that timer, so the popup never opens. Only an
+// enter arms it, and the frame losing activation kills it: re-enter.
+async function showByHover(
+  client: ControlClient,
+  frame: number,
+  canvas: number,
+  pid: number,
+): Promise<{ hover: number; from: { x: number; y: number } }> {
+  for (let attempt = 0; attempt < kHoverAttempts; attempt++) {
+    forceForeground(frame);
+    const logo = centerOf(await waitNamed(client, kCanvasClass, "homeLogo"));
+    const screen = clientToScreen(canvas, logo.x, logo.y);
+    postMove(canvas, 0, 0);
+    postMove(canvas, logo.x, logo.y);
+    const deadline = Date.now() + kHoverAttemptMs;
+    while (Date.now() < deadline) {
+      setCursorPos(screen.x, screen.y);
+      const hover = findHover(pid);
+      if (hover) {
+        return { hover, from: screen };
+      }
+      await sleep(40);
     }
-    await sleep(40);
   }
   throw new Error("issue-6269: About popup did not appear on hover");
 }
@@ -192,10 +184,8 @@ async function walkTo(hover: number, from: { x: number; y: number }, to: { x: nu
 
 // mouse-down, a gap, then mouse-up. The popup used to close inside the down,
 // so the up never reached the button.
-async function clickCopy(hover: number, from: { x: number; y: number }): Promise<void> {
-  const rc = getWindowRect(hover);
-  const x = Math.round((rc.right - rc.left) / 2);
-  const y = rc.bottom - rc.top - 28;
+async function clickCopy(client: ControlClient, hover: number, from: { x: number; y: number }): Promise<void> {
+  const { x, y } = centerOf(await waitNamed(client, kAboutHoverClass, "aboutCopy"));
   await walkTo(hover, from, screenAt(hover, x, y));
   const lp = packCoords(x, y);
   sendMessage(hover, WM_LBUTTONDOWN, MK_LBUTTON, lp);
@@ -217,41 +207,28 @@ async function clickCopy(hover: number, from: { x: number; y: number }): Promise
 export async function testit(): Promise<void> {
   // ng draws About as a gpui hover card. There is no WS_EX_NOACTIVATE popup
   // whose SetFocus closes it on mouse-down.
-  if (!IS_WIN) {
+  if (!IS_WIN || USE_NG) {
     console.log("SKIP issue-6269: About hover is a Win32 no-activate popup");
     return;
   }
   setClipboard("issue-6269-sentinel");
-  const { proc, frame } = await launchControlled([]);
+  const { proc, client, frame } = await launchControlled([]);
   try {
     const canvas = findCanvas(frame);
-    let logo: { x: number; y: number } | null = null;
-    const logoDeadline = Date.now() + 3000;
-    while (Date.now() < logoDeadline && !logo) {
-      logo = findLogo(canvas);
-      if (!logo) {
-        await sleep(50);
-      }
-    }
-    if (!logo) {
-      throw new Error("issue-6269: could not find the SumatraPDF title on the home page");
-    }
-    const logoScreen = clientToScreen(canvas, logo.x, logo.y);
-
-    forceForeground(frame);
-    const hover = await showByHover(canvas, logo, proc.pid!);
-    await clickCopy(hover, logoScreen);
+    const { hover, from } = await showByHover(client, frame, canvas, proc.pid!);
+    await clickCopy(client, hover, from);
 
     // clicking the title puts the frame in front. Copy used to fail on every
     // later try, not only on the first hover.
     setClipboard("issue-6269-sentinel");
+    const logo = centerOf(await waitNamed(client, kCanvasClass, "homeLogo"));
     postMove(canvas, logo.x, logo.y);
     const lp = packCoords(logo.x, logo.y);
     sendMessage(canvas, WM_LBUTTONDOWN, MK_LBUTTON, lp);
     sendMessage(canvas, WM_LBUTTONUP, 0, lp);
     forceForeground(frame);
-    const again = isWindowVisible(hover) ? hover : await showByHover(canvas, logo, proc.pid!);
-    await clickCopy(again, logoScreen);
+    const again = isWindowVisible(hover) ? { hover, from } : await showByHover(client, frame, canvas, proc.pid!);
+    await clickCopy(client, again.hover, again.from);
   } finally {
     await ensureModifierKeysUp();
     await killAndWait(proc);

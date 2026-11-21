@@ -98,8 +98,12 @@ struct D2DTargetSlot {
 
 static D2DTargetSlot gD2DSlots[kD2DTargetPool];
 
+// Software, not hardware: a DC render target copies its whole surface through
+// GDI interop on every BeginDraw and EndDraw, which was 90% of a toolbar or
+// tab bar paint, and its D3D device cost the first paint ~100 ms of driver
+// loading. The software rasterizer draws the same pixels straight into the DC
 static D2D1_RENDER_TARGET_PROPERTIES D2DDcTargetProps() {
-    return D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+    return D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
                                         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.0f,
                                         96.0f, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT);
 }
@@ -638,18 +642,7 @@ void GfxDirect2D::FillEllipse(const Rect& r, Color col, u8 alpha) {
 }
 
 void GfxDirect2D::DrawLine(const Rect& r, Color col, int thickness) {
-    if (col == kColorUnset) {
-        col = textColor;
-    }
-    Rect r2 = r;
-    if (r2.dy == 0) {
-        r2.dy = thickness;
-    } else if (r2.dx == 0) {
-        r2.dx = thickness;
-    }
-    // a horizontal / vertical line is a thin rect: drawn as a fill it lands on
-    // whole pixels instead of being smeared over two rows
-    FillRect(r2, col);
+    GfxThinLine(this, r, col == kColorUnset ? textColor : col, thickness);
 }
 
 void GfxDirect2D::DrawLineAA(Point p1, Point p2, Color col, float thickness, u8 alpha) {

@@ -4,9 +4,16 @@
 struct MainWindow;
 struct WindowTab;
 struct VirtButton;
+struct VirtListBox;
+struct Edit;
+struct Gfx;
+struct Checkbox;
 struct PlatformFont;
+struct WindowBase;
+enum class VirtButtonStyle;
 
 void ShowAddFavoriteDialog(MainWindow* win, Str filePath, int pageNo, Str pageLabel, Str name);
+void ShowEditFavoritesDialog(MainWindow* win);
 void ShowAdvancedSettingsDialog(MainWindow* win);
 void ShowConfigureRestrictedUseDialog(MainWindow* win);
 void OpenSettingsFileInEditor();
@@ -51,6 +58,7 @@ void ShowEbookSettingsDialog(MainWindow* win);
 Str ShowGetPasswordDialog(HWND hwndParent, Str fileName, bool* rememberPassword, bool* showPassword);
 void ShowGoToPageDialog(MainWindow* win);
 void ShowInverseSearchDialog(MainWindow* win);
+void ShowSumatraPDFWebDialog(MainWindow* win);
 void ShowSettingsDialog(MainWindow* win);
 
 enum class PrintRangeAdv {
@@ -106,18 +114,31 @@ struct Print_Advanced_Data {
           extraRotation(extraRotation) {}
 };
 
-HPROPSHEETPAGE CreatePrintAdvancedPropSheet(Print_Advanced_Data* data);
 void ShowPDFScriptDialog(MainWindow* win);
+TempStr PDFScriptTestTemp(Str action, int idx, int* exitCodeOut);
 
 // the buttons of the redrawn dialogs: the one action filled with the text
 // color, Cancel outlined, the quiet ones plain words that fill on hover
-enum class DlgButtonStyle {
-    Filled,
-    Outline,
-    Ghost
-};
+using DlgButtonStyle = VirtButtonStyle;
 VirtButton* NewDlgButton(HWND hwndForDpi, Str text, PlatformFont* font, DlgButtonStyle style, bool isDefault);
 // a filled button goes pale while disabled
 void SetDlgButtonEnabled(VirtButton* b, DlgButtonStyle style, bool enabled);
 // the dialogs' UI font at `px`
 PlatformFont* DlgUiFont(int px);
+bool CreateToolDialog(WindowBase* w, HWND owner, Str title, PlatformFont* font, Color txt, Color bg);
+void SizeToLayout(WindowBase* w, ILayout* layout, int minDx, int minDy, HWND centerOn);
+VirtText* NewDlgLabel(Str s, PlatformFont* font, Color col, int dy, bool prefix = false);
+VirtText* NewDlgCaption(Str s, PlatformFont* font, Color col);
+ILayout* NewDlgUnderlined(ILayout* field);
+HBox* NewDlgRow();
+ILayout* NewDlgFooter(VirtButton* cancel, VirtButton* ok, VirtButton* extra = nullptr);
+VirtListBox* NewDlgList(int dpi, PlatformFont* font);
+void SetDlgListColors(VirtListBox* lb);
+ILayout* NewDlgListBox(VirtListBox* lb);
+void DrawDlgListItem(VirtListBox* lb, Gfx* gfx, Rect rc, bool selected, Str text, Str meta);
+Edit* NewDlgEdit(HWND parent, PlatformFont* font, Str text, int idealChars);
+Checkbox* NewDlgCheckbox(HWND parent, Str text, PlatformFont* font, bool checked);
+Checkbox* NewDlgRadio(HWND parent, Str text, PlatformFont* font, bool checked, bool groupStart);
+HBox* NewDlgFieldRow();
+ILayout* NewDlgSection(ILayout* content);
+void AlignDlgLabels(const Vec<VirtText*>& labels);

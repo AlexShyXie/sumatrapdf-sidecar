@@ -5,7 +5,6 @@
 #include "base/UITask.h"
 #include "base/SettingsUtil.h"
 #include "gui/UIModels.h"
-#define INCLUDE_SETTINGSSTRUCTS_METADATA
 #include "Settings.h"
 #include "AppSettings.h"
 #include "AppTools.h"
@@ -217,25 +216,15 @@ static Str StructCommentAtPath(const StructInfo* info, Str prefix, Str path) {
     return {};
 }
 
-// the index of the last '.' in a dotted path, -1 at the top level
-static int LastDotIdx(Str path) {
-    for (int i = len(path) - 1; i >= 0; i--) {
-        if (path.s[i] == '.') {
-            return i;
-        }
-    }
-    return -1;
-}
-
 // "FixedPageUI.TextColor" => "TextColor"
 Str SettingLeafName(Str path) {
-    int n = LastDotIdx(path) + 1;
+    int n = str::LastIndexOfChar(path, '.') + 1;
     return Str(path.s + n, len(path) - n);
 }
 
 // the section a dotted path is in, added to `sections` on first sight
 static int SectionIdxForPath(Vec<SettingSection*>& sections, Str path) {
-    int dot = LastDotIdx(path);
+    int dot = str::LastIndexOfChar(path, '.');
     if (dot < 0) {
         return -1;
     }

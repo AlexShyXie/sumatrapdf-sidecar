@@ -33,34 +33,8 @@ static Button* gButtonExit = nullptr;
 static Button* gButtonUninstaller = nullptr;
 static bool gWasSearchFilterInstalled = false;
 static bool gWasPreviewInstaller = false;
+static PreviewHandlers gOurPreviewHandlers;
 static Str gUninstallerLogPath;
-
-#if 0
-// The following list is used to verify that all the required files have been
-// installed (install flag set) and to know what files are to be removed at
-// uninstallation (all listed files that actually exist).
-// When a file is no longer shipped, just disable the install flag so that the
-// file is still correctly removed when SumatraPDF is eventually uninstalled.
-// clang-format off
-const char* gInstalledFiles[] = {
-    "libsumatrapdf.dll",
-    "PdfFilter.dll",
-    "PdfPreview.dll",
-    // those probably won't delete because in use
-    "SumatraPDF.exe",
-    "RA-MICRO PDF Viewer.exe",
-    // files no longer shipped, to be deleted
-    "libmupdf.dll", // renamed to libsumatrapdf.dll in 3.7
-    "DroidSansFallback.ttf",
-    "uninstall.exe",
-    "UnRar.dll",
-    "UnRar64.dll",
-    // other files we might generate
-    "sumatrapdfprefs.dat",
-    "SumatraPDF-settings.txt",
-};
-// clang-format on
-#endif
 
 static void UninstallerThread() {
     log(StrL("UninstallerThread started\n"));
@@ -115,6 +89,13 @@ static void OnButtonUninstall() {
 
     auto fn = MkFunc0Void(UninstallerThread);
     hThread = StartThread(fn, StrL("UninstallerThread"));
+    if (!hThread) {
+        // nothing was removed: say so and let the user retry
+        log(StrL("OnButtonUninstall: couldn't start the uninstaller thread\n"));
+        gButtonUninstaller->SetIsEnabled(true);
+        SetMsg(Tr("Uninstallation failed"), kColorMsgFailed);
+        HwndRepaintNow(gHwndFrame);
+    }
 }
 
 static void OnButtonExit() {
@@ -132,18 +113,6 @@ static void OnUninstallationFinished() {
     HwndRepaintNow(gHwndFrame);
 
     SafeCloseThreadHandle(&hThread);
-}
-
-static bool UninstallerOnWmCommand(WPARAM wp) {
-    switch (LOWORD(wp)) {
-        case IDCANCEL:
-            OnButtonExit();
-            break;
-
-        default:
-            return false;
-    }
-    return true;
 }
 
 constexpr const WCHAR* kInstallerWindowClassName = L"SUMATRA_PDF_INSTALLER_FRAME";
@@ -212,7 +181,7 @@ static LRESULT CALLBACK WndProcUninstallerFrame(HWND hwnd, UINT msg, WPARAM wp, 
             break;
 
         case WM_COMMAND: {
-            handled = UninstallerOnWmCommand(wp);
+            handled = InstallerWmCommand(wp, OnButtonExit);
             if (!handled) {
                 return DefWindowProc(hwnd, msg, wp, lp);
             }
@@ -343,6 +312,7 @@ int RunUninstaller() {
         log(StrL("Search filter is installed\n"));
     }
     gWasPreviewInstaller = IsPreviewInstalled();
+    gOurPreviewHandlers = GetOurPreviewHandlers();
     if (gWasPreviewInstaller) {
         log(StrL("Previewer is installed\n"));
     }
@@ -378,7 +348,7 @@ int RunUninstaller() {
         RegisterSearchFilter(gCli->allUsers, gCli->installDir);
     }
     if (gWasPreviewInstaller) {
-        RegisterPreviewer(gCli->allUsers, gCli->installDir);
+        RegisterPreviewer(gCli->allUsers, gCli->installDir, gOurPreviewHandlers);
     }
     InitSelfDelete();
     LaunchFileIfExists(uninstallerLogPath);

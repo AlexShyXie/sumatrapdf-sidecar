@@ -218,7 +218,7 @@ const CommandInfo gCommands[] = {
     {CmdPdfCompress, "CmdPdfCompress\0", StrL("Compress PDF...")},
     {CmdPdfDecompress, "CmdPdfDecompress\0", StrL("Decompress PDF...")},
     {CmdPdfDeletePages, "CmdPdfDeletePages\0", StrL("Delete Pages From PDF...")},
-    {CmdPdfExtractPages, "CmdPdfExtractPages\0", StrL("Extract Pages From PDF...")},
+    {CmdPdfExtractPages, "CmdPdfExtractPages\0", StrL("Extract Pages...")},
     {CmdPdfEncrypt, "CmdPdfEncrypt\0", StrL("Encrypt PDF...")},
     {CmdPdfDecrypt, "CmdPdfDecrypt\0", StrL("Decrypt PDF...")},
     {CmdPdfBake, "CmdPdfBake\0", StrL("Bake PDF File...")},
@@ -293,7 +293,7 @@ const CommandInfo gCommands[] = {
     {CmdInsertImage, "CmdInsertImage\0", StrL("Insert Image...")},
     {CmdToggleHighlightFormFields, "CmdToggleHighlightFormFields\0", StrL("Toggle Highlight Form Fields")},
     {CmdTogglePageBoxes, "CmdTogglePageBoxes\0", StrL("Toggle Page Boxes")},
-    {CmdConvertPdfToImages, "CmdConvertPdfToImages\0", StrL("Convert PDF to Images...")},
+    {CmdConvertPdfToImages, "CmdConvertPdfToImages\0", StrL("Convert to Images...")},
     {CmdToggleUniformPageWidth, "CmdToggleUniformPageWidth\0", StrL("Toggle Uniform Page Width")},
     {CmdToggleTransparencyGrid, "CmdToggleTransparencyGrid\0", StrL("Toggle Transparency Grid")},
     {CmdTogglePageGrid, "CmdTogglePageGrid\0", StrL("Toggle Page Grid")},
@@ -345,6 +345,66 @@ const CommandInfo gCommands[] = {
     {CmdQuickEditSettings, "CmdQuickEditSettings\0", StrL("Quick Edit Settings")},
     {CmdConfigureRestrictedUse, "CmdConfigureRestrictedUse\0", StrL("Configure Restricted Use...")},
     {CmdRunPDFScript, "CmdRunPDFScript\0", StrL("Run PDF Script...")},
+    {CmdToggleCaption, "CmdToggleCaption\0", StrL("Toggle Caption")},
+    {CmdAdjustBrightness, "CmdAdjustBrightness\0", StrL("Adjust Brightness...")},
+    {CmdAdjustContrast, "CmdAdjustContrast\0", StrL("Adjust Contrast...")},
+    {CmdToggleSidebarAutoHide, "CmdToggleSidebarAutoHide\0", StrL("Toggle Sidebar Auto-hide")},
+    {CmdDebugShowCrashMiniDumps, "CmdDebugShowCrashMiniDumps\0", StrL("Debug: Show Crash Minidumps")},
+    {CmdCopyTemporaryFileToNonTemporary, "CmdCopyTemporaryFileToNonTemporary\0", StrL("Copy Temporary File to Permanent Folder")},
+    {CmdConvertEpubToPdf, "CmdConvertEpubToPdf\0", StrL("Convert EPUB to PDF...")},
+    {CmdConvertCajToPDF, "CmdConvertCajToPDF\0", StrL("Convert CAJ to PDF...")},
+    {CmdFindHistory, "CmdFindHistory\0", StrL("Find History")},
+    {CmdSumatraPDFWeb, "CmdSumatraPDFWeb\0", StrL("SumatraPDF Web...")},
+    {CmdDebugSaveSettings, "CmdDebugSaveSettings\0", StrL("Debug: Save Settings")},
+    {CmdNewTab, "CmdNewTab\0", StrL("New Tab")},
+    {CmdShowSignatures, "CmdShowSignatures\0", StrL("Show Signatures")},
+    {CmdOpenFromURL, "CmdOpenFromURL\0", StrL("Open from URL...")},
+    {CmdGoToPrevChapter, "CmdGoToPrevChapter\0", StrL("Previous Chapter")},
+    {CmdGoToNextChapter, "CmdGoToNextChapter\0", StrL("Next Chapter")},
+    {CmdToggleLayers, "CmdToggleLayers\0", StrL("Toggle Layers")},
+    {CmdToggleFacingStepOne, "CmdToggleFacingStepOne\0", StrL("Toggle Facing: Step One Page")},
+    {CmdCountWords, "CmdCountWords\0", StrL("Count Words")},
+    {CmdMinimizeWindow, "CmdMinimizeWindow\0", StrL("Minimize Window")},
+    {CmdShowSelectedText, "CmdShowSelectedText\0", StrL("Show Selected Text")},
+    {CmdToggleMirror, "CmdToggleMirror\0", StrL("Mirror Pages")},
+    {CmdTrimPagesToSelection, "CmdTrimPagesToSelection\0", StrL("Trim Pages To Selection")},
+    {CmdShowWholePages, "CmdShowWholePages\0", StrL("Show Whole Pages")},
+    {CmdMeasure, "CmdMeasure\0", StrL("Measure")},
+    {CmdReplaceImage, "CmdReplaceImage\0", StrL("Replace Image...")},
+    {CmdEditImageExternally, "CmdEditImageExternally\0", StrL("Edit Image in Another App")},
+    {CmdToggleReadColumns, "CmdToggleReadColumns\0", StrL("Read Columns")},
+    {CmdToggleColumnsWholePage, "CmdToggleColumnsWholePage\0", StrL("Read Columns: Show Whole Page")},
+    {CmdDebugShowDownloadedFonts, "CmdDebugShowDownloadedFonts\0", StrL("Debug: Show Downloaded Fonts")},
+    {CmdTocExpandChapter, "CmdTocExpandChapter\0", StrL("Bookmarks: Expand Chapter")},
+    {CmdTocCollapseChapter, "CmdTocCollapseChapter\0", StrL("Bookmarks: Collapse Chapter")},
+    {CmdEditFavorites, "CmdEditFavorites\0", StrL("Edit Favorites...")},
+    {CmdCloseMissingTabs, "CmdCloseMissingTabs\0", StrL("Close Tabs of Missing Files")},
+    {CmdViewAsHex, "CmdViewAsHex\0", StrL("View As Hex")},
+    {CmdAIChatWithCustomAPI, "CmdAIChatWithCustomAPI\0", StrL("Custom AI chat...")},
+    {CmdSaveTrimmedPagesAs, "CmdSaveTrimmedPagesAs\0", StrL("Save Trimmed Pages As...")},
+    {CmdCaretUp, "CmdCaretUp\0", StrL("Move Caret Up")},
+    {CmdCaretDown, "CmdCaretDown\0", StrL("Move Caret Down")},
+    {CmdCaretLeft, "CmdCaretLeft\0", StrL("Move Caret Left")},
+    {CmdCaretRight, "CmdCaretRight\0", StrL("Move Caret Right")},
+    {CmdCaretWordLeft, "CmdCaretWordLeft\0", StrL("Move Caret One Word Left")},
+    {CmdCaretWordRight, "CmdCaretWordRight\0", StrL("Move Caret One Word Right")},
+    {CmdCaretLineStart, "CmdCaretLineStart\0", StrL("Move Caret To Line Start")},
+    {CmdCaretLineEnd, "CmdCaretLineEnd\0", StrL("Move Caret To Line End")},
+    {CmdCaretPageUp, "CmdCaretPageUp\0", StrL("Move Caret Page Up")},
+    {CmdCaretPageDown, "CmdCaretPageDown\0", StrL("Move Caret Page Down")},
+    {CmdCaretDocStart, "CmdCaretDocStart\0", StrL("Move Caret To Document Start")},
+    {CmdCaretDocEnd, "CmdCaretDocEnd\0", StrL("Move Caret To Document End")},
+    {CmdEditAnnotationText, "CmdEditAnnotationText\0", StrL("Edit Annotation Text")},
+    {CmdStripGroupNew, "CmdStripGroupNew\0", StrL("Add Tab to New Group")},
+    {CmdStripGroupAddTab, "CmdStripGroupAddTab\0", StrL("Add Tab to Group")},
+    {CmdStripGroupRemoveTab, "CmdStripGroupRemoveTab\0", StrL("Remove Tab from Group")},
+    {CmdStripGroupToggle, "CmdStripGroupToggle\0", StrL("Collapse / Expand Group")},
+    {CmdStripGroupRename, "CmdStripGroupRename\0", StrL("Rename Group...")},
+    {CmdStripGroupColor, "CmdStripGroupColor\0", StrL("Change Group Color")},
+    {CmdStripGroupUngroup, "CmdStripGroupUngroup\0", StrL("Ungroup Tabs")},
+    {CmdStripGroupClose, "CmdStripGroupClose\0", StrL("Close Group")},
+    {CmdToggleLineWeights, "CmdToggleLineWeights\0", StrL("Show Line Weights")},
+    {CmdToggleTextSelecting, "CmdToggleTextSelecting\0", StrL("Start / Stop Selecting Text")},
 };
 const int gCommandsCount = dimofi(gCommands);
 
@@ -392,7 +452,7 @@ static const ArgSpec argSpecs[] = {
     {CmdCreateAnnotText, kCmdArgFocusEdit, CommandArg::Type::Bool},
     {CmdCreateAnnotText, kCmdArgFocusList, CommandArg::Type::Bool},
 
-    // and  CmdScrollDown, CmdGoToNextPage, CmdGoToPrevPage
+    // and CmdScrollDown, CmdScrollLeft, CmdScrollRight, CmdGoToNextPage, CmdGoToPrevPage
     {CmdScrollUp, kCmdArgN, CommandArg::Type::Int}, // default
 
     {CmdSetTheme, kCmdArgTheme, CommandArg::Type::String}, // default
@@ -404,20 +464,71 @@ static const ArgSpec argSpecs[] = {
     {CmdSignDocument, kCmdArgCertify, CommandArg::Type::Bool},
 
     // toggle commands accept an optional bool to force a state (issue #5067),
-    // e.g. [CmdToggleFullscreen on] / [CmdToggleToolbar state=off]
-    {CmdToggleContinuousView, kCmdArgState, CommandArg::Type::Bool},   // default
-    {CmdToggleToolbar, kCmdArgState, CommandArg::Type::Bool},          // default
-    {CmdToggleMenuBar, kCmdArgState, CommandArg::Type::Bool},          // default
-    {CmdToggleFullscreen, kCmdArgState, CommandArg::Type::Bool},       // default
+    // e.g. [CmdToggleFullscreen on] / [CmdToggleToolbar state=off].
+    // From toggleCommands in cmd/gen-commands.ts
+    // clang-format off
+// @gen-start cmd-toggle-args
+    {CmdToggleContinuousView, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleMangaMode, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleBookmarks, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleTableOfContents, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleFullscreen, kCmdArgState, CommandArg::Type::Bool}, // default
     {CmdTogglePresentationMode, kCmdArgState, CommandArg::Type::Bool}, // default
-    {CmdToggleBookmarks, kCmdArgState, CommandArg::Type::Bool},        // default
-    {CmdToggleTableOfContents, kCmdArgState, CommandArg::Type::Bool},  // default
-#ifndef NO_THUMBNAIL_STATE_ARG
+    {CmdToggleToolbar, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleMenuBar, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdTogglePdfPreviewLogging, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleKeyboardHelp, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleLinks, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleShowAnnotations, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdTogglePageInfo, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleInverseSearch, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleWindowsPreviewer, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleWindowsSearchFilter, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleReadAloud, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleToolbarShowReadAloud, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleEngineeringDrawingEnhance, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdTogglePreservePdfImages, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleFavoritesSort, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleKeyboardLinkFollowing, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleImages, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleFilePicker, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleLaserPointer, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleHoverPreview, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleDisableLinks, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleHighlightFormFields, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdTogglePageBoxes, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleUniformPageWidth, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleTransparencyGrid, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdTogglePageGrid, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleEditPDF, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleTrimEmptyMargins, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleAutomaticallyScroll, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleReadingBar, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleReadingBarInvert, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleFreePan, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleGrayscale, kCmdArgState, CommandArg::Type::Bool}, // default
     {CmdToggleThumbnails, kCmdArgState, CommandArg::Type::Bool}, // default
-#endif
+    {CmdToggleAutoRotateWidePages, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleCaption, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleSidebarAutoHide, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleLayers, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleFacingStepOne, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleMirror, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleReadColumns, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleColumnsWholePage, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleLineWeights, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdToggleTextSelecting, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdFavoriteToggle, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdFindToggleMatchCase, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdFindToggleMatchWholeWord, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdInvertColors, kCmdArgState, CommandArg::Type::Bool}, // default
+    {CmdSelectTextViaKeyboard, kCmdArgState, CommandArg::Type::Bool}, // default
+// @gen-end cmd-toggle-args
+    // clang-format on
 
     // default string is the setting name, e.g. [CmdToggleBoolSetting Fullscreen.ShowMenubar]
     {CmdToggleBoolSetting, kCmdArgName, CommandArg::Type::String}, // default
+    {CmdToggleBoolSetting, kCmdArgState, CommandArg::Type::Bool},
 
     // extension including leading dot, e.g. [CmdFixDefaultApp .pdf]
     {CmdFixDefaultApp, kCmdArgExt, CommandArg::Type::String}, // default
@@ -428,6 +539,11 @@ static const ArgSpec argSpecs[] = {
     // a favorite in the Favorites menu, e.g. [CmdFavorite C:\dir\file.pdf page=3]
     {CmdFavorite, kCmdArgFilePath, CommandArg::Type::String}, // default
     {CmdFavorite, kCmdArgPage, CommandArg::Type::String},
+
+    // 1-based position of the group in the tab strip, e.g. [CmdStripGroupAddTab 2]
+    {CmdStripGroupAddTab, kCmdArgN, CommandArg::Type::Int}, // default
+    // without a color it moves to the next one, e.g. [CmdStripGroupColor #1a73e8]
+    {CmdStripGroupColor, kCmdArgColor, CommandArg::Type::Color}, // default
 
     {CmdNone, StrL(""), CommandArg::Type::None}, // sentinel
 };
@@ -473,6 +589,17 @@ Str GetCommandName(int commandId) {
 }
 
 Str GetCommandDescription(int commandId) {
+#if OS_WASM
+    // the folder is the stored documents (/uploads); same names as MenuDefs.cpp
+    switch (commandId) {
+        case CmdOpenNextFileInFolder:
+            return StrL("Open Next Document");
+        case CmdOpenPrevFileInFolder:
+            return StrL("Open Previous Document");
+        case CmdNavigateFilesInFolder:
+            return StrL("Browse Documents...");
+    }
+#endif
     int idx = FindCommandIndex(commandId);
     return idx < 0 ? Str{} : gCommands[idx].description;
 }
@@ -529,6 +656,35 @@ void FreeCommandArgs(CommandArg* first) {
 
 static int gNextCustomCommandId = (int)CmdFirstCustom;
 
+// WM_COMMAND treats ids from 0xF000 up as system commands (SC_*), and ids
+// travel as 16 bits (LOWORD(wp))
+constexpr int kCustomCommandIdLimit = 0xF000;
+
+static bool IsCustomCommandIdUsed(int id) {
+    for (auto* cmd = gFirstCustomCommand; cmd; cmd = cmd->next) {
+        if (cmd->id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Ids only grow (each settings reload and history entry takes new ones) so
+// live menus never see an id reused for another command. Once the range is
+// used up, take the lowest id no live command has.
+static int NewCustomCommandId() {
+    if (gNextCustomCommandId < kCustomCommandIdLimit) {
+        return gNextCustomCommandId++;
+    }
+    for (int id = (int)CmdFirstCustom; id < kCustomCommandIdLimit; id++) {
+        if (!IsCustomCommandIdUsed(id)) {
+            return id;
+        }
+    }
+    ReportIf(true);
+    return kCustomCommandIdLimit - 1;
+}
+
 CustomCommand* AllocCustomCommand(Str definition, Str name, Str key) {
     Str strings[] = {definition, name, key};
     auto* cmd = AllocCommandData<CustomCommand>(strings);
@@ -570,7 +726,7 @@ CustomCommand* CreateCustomCommand(Str definition, int origCmdId, CommandArg* ar
     // only when we have unique args we have to create a new command id
     int id = origCmdId;
     if (args != nullptr) {
-        id = gNextCustomCommandId++;
+        id = NewCustomCommandId();
     }
     NormalizeCommandNameAndKey(definition, &name, &key);
     auto* cmd = AllocCustomCommand(definition, name, key);
@@ -605,7 +761,7 @@ CustomCommand* CloneCustomCommand(CustomCommand* cmd, Str name, Str key) {
     auto* res = CreateCustomCommand(cmd->definition, cmd->origId, args, name, key);
     // Argumentless clones still need distinct toolbar IDs.
     if (!args) {
-        res->id = gNextCustomCommandId++;
+        res->id = NewCustomCommandId();
     }
     return res;
 }
@@ -617,6 +773,31 @@ CustomCommand* FindCustomCommand(int cmdId) {
         }
     }
     return nullptr;
+}
+
+// custom ids must stay below 0xF000 (system commands) once the range is used up
+bool Commands_UnitTestIdLimit() {
+    CustomCommand* savedFirst = gFirstCustomCommand;
+    int savedNext = gNextCustomCommandId;
+    gFirstCustomCommand = nullptr;
+    gNextCustomCommandId = kCustomCommandIdLimit - 2;
+
+    auto make = [] {
+        return CreateCustomCommand(StrL("CmdZoomCustom 50"), CmdZoomCustom, AllocCommandArg({}, StrL("50")), {}, {});
+    };
+    CustomCommand* a = make();
+    CustomCommand* b = make();
+    // range used up: the lowest free id is reused, never one at the limit
+    CustomCommand* c = make();
+    bool ok = a->id == kCustomCommandIdLimit - 2 && b->id == kCustomCommandIdLimit - 1;
+    ok = ok && c->id == (int)CmdFirstCustom;
+    CustomCommand* d = make();
+    ok = ok && d->id == (int)CmdFirstCustom + 1;
+
+    FreeCustomCommands();
+    gFirstCustomCommand = savedFirst;
+    gNextCustomCommandId = savedNext;
+    return ok;
 }
 
 void FreeCustomCommands() {
@@ -819,7 +1000,8 @@ CustomCommand* CreateCommandFromDefinition(Str definition) {
     int argCmdId = cmdId;
     if (cmdId >= CmdCreateAnnotFirst && cmdId <= CmdCreateAnnotLast) {
         argCmdId = CmdCreateAnnotText;
-    } else if (cmdId == CmdScrollUp || cmdId == CmdScrollDown || cmdId == CmdGoToNextPage || cmdId == CmdGoToPrevPage) {
+    } else if (cmdId == CmdScrollUp || cmdId == CmdScrollDown || cmdId == CmdScrollLeft || cmdId == CmdScrollRight ||
+               cmdId == CmdGoToNextPage || cmdId == CmdGoToPrevPage) {
         argCmdId = CmdScrollUp;
     }
 

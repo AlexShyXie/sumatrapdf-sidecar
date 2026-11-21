@@ -4,8 +4,7 @@
 
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { IS_MAC } from "./host.ts";
-import { cmdId, ROOT, runStandalone, tmpPath } from "./util.ts";
+import { cmdId, ROOT, runStandalone, tmpPath, USE_NG } from "./util.ts";
 import { launchControlled, killAndWait, sendCommandSync, waitForTitle } from "./win-automation.ts";
 import { captureWindowDCRegionPixels, sendCopyDataW, setProcessDpiAware, sleep } from "./winapi.ts";
 import type { LayoutInfo, LayoutItem } from "./control.ts";
@@ -142,7 +141,7 @@ export async function testit(): Promise<void> {
     ) {
       throw new Error(`layout-callback: initial HWND geometry is invalid:\n${normal.raw}`);
     }
-    if (IS_MAC) {
+    if (USE_NG) {
       console.log("SKIP layout-callback: ng has no Win32 ILayout tree");
     } else if (
       normal.nodes.length < 10 ||
@@ -178,17 +177,11 @@ export async function testit(): Promise<void> {
       throw new Error(`layout-callback: fullscreen canvas does not cover the frame:\n${fullscreen.raw}`);
     }
 
-    if (IS_MAC) {
-      console.log("SKIP layout-callback: no window DC to sample stale fullscreen pixels");
-    } else {
-      const immediatePixels = sampleFullscreenTop(frame);
-      const settledPixels = await sampleStableFullscreenTop(frame);
-      const stalePixels = countChangedPixels(immediatePixels, settledPixels);
-      if (stalePixels > 20) {
-        throw new Error(
-          `layout-callback: ${stalePixels} stale normal-window pixels remained after entering fullscreen`,
-        );
-      }
+    const immediatePixels = sampleFullscreenTop(frame);
+    const settledPixels = await sampleStableFullscreenTop(frame);
+    const stalePixels = countChangedPixels(immediatePixels, settledPixels);
+    if (stalePixels > 20) {
+      throw new Error(`layout-callback: ${stalePixels} stale normal-window pixels remained after entering fullscreen`);
     }
 
     sendCommandSync(frame, cmdId("CmdToggleFullscreen"));
@@ -247,11 +240,6 @@ export async function testit(): Promise<void> {
   } finally {
     client.close();
     await killAndWait(proc);
-  }
-
-  if (IS_MAC) {
-    console.log("SKIP layout-callback: WebView2 window-DC samples are Windows-only");
-    return;
   }
 
   const html = join(appdata, "webview-layout.html");

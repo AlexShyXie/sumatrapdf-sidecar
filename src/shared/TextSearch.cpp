@@ -63,8 +63,7 @@ void TextSearch::Clear() {
 }
 
 void TextSearch::Reset() {
-    pageText = {};
-    pageTextLen = 0;
+    SetPageText(0, {}, 0);
     TextSelection::Reset();
 }
 
@@ -205,7 +204,9 @@ void TextSearch::SetLastResult(TextSelection* sel) {
 
     findPage = std::max(startPage, endPage);
     findIndex = (findPage == endPage ? endGlyph : startGlyph);
-    pageText = engine->GetTextForPage(findPage, &pageTextLen);
+    int textLen = 0;
+    Str text = engine->GetTextForPage(findPage, &textLen);
+    SetPageText(findPage, text, textLen);
     forward = true;
 }
 
@@ -269,6 +270,58 @@ static bool StartsWithAtByte(Str text, int byteIdx, Str prefix) {
            memcmp(text.s + byteIdx, prefix.s, prefix.len) == 0;
 }
 
+void TextSearch::ResetByteIdx() const {
+    byteIdxCp = 0;
+    byteIdxByte = 0;
+}
+
+// pageText changes only here. The ByteIdxOf() cursor stays valid while the text
+// is for the same page: fetching a page again gives the same text.
+void TextSearch::SetPageText(int pageNo, Str text, int textLen) {
+    if (pageNo != pageTextPageNo) {
+        ResetByteIdx();
+    }
+    pageTextPageNo = pageNo;
+    pageText = text;
+    pageTextLen = textLen;
+}
+
+// pageNo's text for searching, through SetPageText(); false if canceled
+bool TextSearch::LoadPageText(int pageNo) {
+    bool abortSearch = false;
+    int textLen = 0;
+    Str text = GetSearchPageText(engine, pageNo, textLen, progressCb, abortSearch);
+    SetPageText(pageNo, text, textLen);
+    return !abortSearch;
+}
+
+// Byte offset of codepoint cp in pageText. Continues from the last lookup so a
+// forward search walks each page once instead of rescanning from its start.
+int TextSearch::ByteIdxOf(int cp) const {
+    if (cp < byteIdxCp) {
+        ResetByteIdx();
+    }
+    while (byteIdxCp < cp && byteIdxByte < pageText.len) {
+        Utf8CodepointNext(pageText, byteIdxByte);
+        byteIdxCp++;
+    }
+    return byteIdxByte;
+}
+
+// FoldCaseForSearch() of the codepoint at byteIdx; advances byteIdx.
+// ASCII skips UTF-8 decoding and folds to lower case, as FoldCaseForSearch() does.
+static int NextFolded(Str s, int& byteIdx) {
+    if (byteIdx >= s.len) {
+        return 0;
+    }
+    u8 b = (u8)s.s[byteIdx];
+    if (b >= 0x80) {
+        return FoldCaseForSearch(Utf8CodepointNext(s, byteIdx));
+    }
+    byteIdx++;
+    return ('A' <= b && b <= 'Z') ? b + ('a' - 'A') : b;
+}
+
 int TextSearch::FindAnchor() const {
     if (len(pageText) == 0 || len(anchor) == 0) {
         return -1;
@@ -282,8 +335,18 @@ int TextSearch::FindAnchor() const {
     int lastStart = matchCase ? end - anchorLen : end - 1;
     int result = -1;
     int start = forward ? findIndex : 0;
-    int byteIdx = Utf8CodepointToByteIndex(pageText, start);
+    int byteIdx = ByteIdxOf(start);
+    // Reject on the first folded codepoint before the full match. Not for
+    // s / ß: they match each other as "ss".
+    int firstByte = 0;
+    int first = NextFolded(anchor, firstByte);
+    bool prefilter = !matchCase && first != 's' && first != 0x00df;
     for (int i = start; i <= lastStart; i++) {
+        int nextByte = byteIdx;
+        if (prefilter && NextFolded(pageText, nextByte) != first) {
+            byteIdx = nextByte;
+            continue;
+        }
         bool matches = matchCase ? StartsWithAtByte(pageText, byteIdx, anchor)
                                  : MatchesFoldedAt(pageText, pageTextLen, i, byteIdx, anchor, anchorLen, end);
         if (matches) {
@@ -317,7 +380,7 @@ TextSearch::PageAndOffset TextSearch::MatchEnd(int startOff) const {
     int matchIdx = 0;
     int matchByteIdx = 0;
     int endIdx = startOff;
-    int endByteIdx = Utf8CodepointToByteIndex(currentPageText, endIdx);
+    int endByteIdx = ByteIdxOf(endIdx);
 
     if (matchWordStart && startOff > 0 && InsideWordAtByte(pageText, endByteIdx)) {
         return notFound;
@@ -466,7 +529,26 @@ void TextSearch::EnsureFullyLaidOut() {
     VecResize(pagesToSkip, nPages);
 }
 
+void TextSearch::StartSlice(int ms) {
+    sliceMs = ms;
+    sliceStart = GetTickCount64();
+}
+
+bool TextSearch::SliceUsedUp() const {
+    return sliceMs > 0 && GetTickCount64() - sliceStart >= (u64)sliceMs;
+}
+
+// continues a search that paused (see sliceMs) where it stopped
+Vec<TextSel>* TextSearch::Resume() {
+    ReportIf(!paused);
+    if (FindStartingAtPage(resumePage)) {
+        return &result;
+    }
+    return nullptr;
+}
+
 bool TextSearch::FindStartingAtPage(int pageNo) {
+    paused = false;
     if (len(findText) == 0) {
         return false;
     }
@@ -483,6 +565,11 @@ bool TextSearch::FindStartingAtPage(int pageNo) {
 
     int next = forward ? 1 : -1;
     while ((lo <= pageNo) && (pageNo <= hi) && !WasCanceled(progressCb)) {
+        if (SliceUsedUp()) {
+            paused = true;
+            resumePage = pageNo;
+            return false;
+        }
         UpdateProgress(progressCb, pageNo, nPages);
 
         if (!PageAllowed(pageNo) || pagesToSkip[pageNo - 1]) {
@@ -521,9 +608,7 @@ Vec<TextSel>* TextSearch::FindFirst(int page, Str text) {
 
 TextSearch::PageSearchResult TextSearch::SearchPage(int pageNo) {
     Reset();
-    bool abortSearch = false;
-    pageText = GetSearchPageText(engine, pageNo, pageTextLen, progressCb, abortSearch);
-    if (abortSearch) {
+    if (!LoadPageText(pageNo)) {
         return PageSearchResult::Canceled;
     }
     findIndex = pageTextLen;
@@ -540,8 +625,7 @@ TextSearch::PageSearchResult TextSearch::SearchPage(int pageNo) {
     if (forward) {
         if (findPage != r.page) {
             findPage = r.page;
-            pageText = GetSearchPageText(engine, findPage, pageTextLen, progressCb, abortSearch);
-            if (abortSearch) {
+            if (!LoadPageText(findPage)) {
                 return PageSearchResult::Canceled;
             }
         }
@@ -574,9 +658,7 @@ Vec<TextSel>* TextSearch::FindNext() {
         if (forward) {
             findPage = finalGlyph.page;
             findIndex = finalGlyph.offset;
-            bool abortSearch = false;
-            pageText = GetSearchPageText(engine, findPage, pageTextLen, progressCb, abortSearch);
-            if (abortSearch) {
+            if (!LoadPageText(findPage)) {
                 return nullptr;
             }
         }

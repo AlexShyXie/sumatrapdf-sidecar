@@ -18,13 +18,20 @@ import { IS_MAC, IS_WIN } from "./host.ts";
 import {
   macClientToScreen,
   macControlRequest,
+  macCaptureClientPixels,
+  macClipboardImageInfo,
   macDdeExecute,
   macFrameClientRect,
   macFrameVisible,
+  macPostKeyDown,
+  macPostKeyWithModifier,
   macSendMessage,
   macSendText,
+  macShowWindow,
   TestLayout,
+  type InputTarget,
 } from "./mac-control.ts";
+import { USE_NG } from "./util.ts";
 
 // Windows tests talk to user32. On macOS the same helpers either use
 // CoreGraphics or throw, so importing this file does not require the DLLs.
@@ -53,6 +60,10 @@ const user32 = loadDll("user32.dll", {
   GetWindow: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.u64 },
   PostMessageW: { args: [FFIType.ptr, FFIType.u32, FFIType.i64, FFIType.i64], returns: FFIType.bool },
   SendMessageW: { args: [FFIType.ptr, FFIType.u32, FFIType.i64, FFIType.i64], returns: FFIType.i64 },
+  SendMessageTimeoutW: {
+    args: [FFIType.ptr, FFIType.u32, FFIType.i64, FFIType.i64, FFIType.u32, FFIType.u32, FFIType.ptr],
+    returns: FFIType.i64,
+  },
   MoveWindow: {
     args: [FFIType.ptr, FFIType.i32, FFIType.i32, FFIType.i32, FFIType.i32, FFIType.bool],
     returns: FFIType.bool,
@@ -68,9 +79,14 @@ const user32 = loadDll("user32.dll", {
   InvalidateRect: { args: [FFIType.ptr, FFIType.ptr, FFIType.bool], returns: FFIType.bool },
   UpdateWindow: { args: [FFIType.ptr], returns: FFIType.bool },
   IsZoomed: { args: [FFIType.ptr], returns: FFIType.bool },
+  IsIconic: { args: [FFIType.ptr], returns: FFIType.bool },
+  AttachThreadInput: { args: [FFIType.u32, FFIType.u32, FFIType.bool], returns: FFIType.bool },
+  GetKeyboardState: { args: [FFIType.ptr], returns: FFIType.bool },
+  SetKeyboardState: { args: [FFIType.ptr], returns: FFIType.bool },
   GetClientRect: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.bool },
   GetScrollInfo: { args: [FFIType.ptr, FFIType.i32, FFIType.ptr], returns: FFIType.bool },
   SetCursorPos: { args: [FFIType.i32, FFIType.i32], returns: FFIType.bool },
+  MapVirtualKeyW: { args: [FFIType.u32, FFIType.u32], returns: FFIType.u32 },
   GetAsyncKeyState: { args: [FFIType.i32], returns: FFIType.i16 },
   keybd_event: { args: [FFIType.u8, FFIType.u8, FFIType.u32, FFIType.u64], returns: FFIType.void },
   ClientToScreen: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.bool },
@@ -88,6 +104,8 @@ const user32 = loadDll("user32.dll", {
   GetSystemMetrics: { args: [FFIType.i32], returns: FFIType.i32 },
   SystemParametersInfoW: { args: [FFIType.u32, FFIType.u32, FFIType.ptr, FFIType.u32], returns: FFIType.bool },
   SetProcessDpiAwarenessContext: { args: [FFIType.i64], returns: FFIType.bool },
+  InitializeTouchInjection: { args: [FFIType.u32, FFIType.u32], returns: FFIType.bool },
+  InjectTouchInput: { args: [FFIType.u32, FFIType.ptr], returns: FFIType.bool },
   GetCursorPos: { args: [FFIType.ptr], returns: FFIType.bool },
   GetGUIThreadInfo: { args: [FFIType.u32, FFIType.ptr], returns: FFIType.bool },
   GetCursorInfo: { args: [FFIType.ptr], returns: FFIType.bool },
@@ -115,6 +133,10 @@ const user32 = loadDll("user32.dll", {
   OpenClipboard: { args: [FFIType.ptr], returns: FFIType.bool },
   CloseClipboard: { args: [], returns: FFIType.bool },
   GetClipboardData: { args: [FFIType.u32], returns: FFIType.u64 },
+  EnumClipboardFormats: { args: [FFIType.u32], returns: FFIType.u32 },
+  EmptyClipboard: { args: [], returns: FFIType.bool },
+  GetClipboardSequenceNumber: { args: [], returns: FFIType.u32 },
+  SetClipboardData: { args: [FFIType.u32, FFIType.u64], returns: FFIType.u64 },
 });
 
 // GDI + GDI+ for capturing a window to a PNG (see captureWindowToPng). Capturing
@@ -191,6 +213,7 @@ const gdiplus = loadDll("gdiplus.dll", {
 });
 
 const kernel32 = loadDll("kernel32.dll", {
+  GetCurrentThreadId: { args: [], returns: FFIType.u32 },
   CreateProcessW: {
     args: [
       FFIType.ptr,
@@ -222,6 +245,8 @@ const kernel32 = loadDll("kernel32.dll", {
   GlobalLock: { args: [FFIType.u64], returns: FFIType.ptr },
   GlobalUnlock: { args: [FFIType.u64], returns: FFIType.bool },
   GlobalSize: { args: [FFIType.u64], returns: FFIType.u64 },
+  GlobalAlloc: { args: [FFIType.u32, FFIType.u64], returns: FFIType.u64 },
+  GlobalFree: { args: [FFIType.u64], returns: FFIType.u64 },
 });
 
 // Authenticode helpers (mirror src/base/Crypto.cpp GetExecutableSignerTemp / IsPEFileSigned).
@@ -309,6 +334,11 @@ export const WM_CONTEXTMENU = 0x007b;
 export const WM_KILLFOCUS = 0x0008;
 export const WM_COMMAND = 0x0111;
 export const WM_SYSCOMMAND = 0x0112;
+export const CB_SETCURSEL = 0x014e;
+export const CBN_SELCHANGE = 1;
+export const BM_SETCHECK = 0x00f1;
+export const BST_CHECKED = 1;
+export const ES_MULTILINE = 0x0004;
 export const SC_CLOSE = 0xf060;
 export const WM_COPYDATA = 0x004a;
 // virtual-key / mouse-button flags
@@ -347,6 +377,10 @@ export const PW_RENDERFULLCONTENT = 0x00000002;
 export const SRCCOPY = 0x00cc0020;
 export const COLORONCOLOR = 3; // StretchBlt mode: no smoothing
 // ShowWindow commands
+export const SW_SHOWMINNOACTIVE = 7;
+export const SW_MINIMIZE = 6;
+export const SW_SHOWMINIMIZED = 2;
+export const SW_SHOWNOACTIVATE = 4;
 export const SW_RESTORE = 9;
 export const SW_MAXIMIZE = 3;
 // GetSystemMetrics indices
@@ -586,22 +620,6 @@ export function enumChildWindows(parent: number, visit: (hwnd: number) => boolea
   }
 }
 
-// an owned top-level window (not a child) of a given class. 0 if none.
-export function findOwnedWindow(owner: number, className: string): number {
-  if (!owner) {
-    return 0;
-  }
-  let found = 0;
-  enumWindows((hwnd) => {
-    if (getWindowOwner(hwnd) === owner && getClassName(hwnd) === className) {
-      found = hwnd;
-      return false;
-    }
-    return true;
-  });
-  return found;
-}
-
 // find a top-level window of a given process and window class (0 if none)
 export function findTopWindow(pid: number, className: string): number {
   let found = 0;
@@ -692,7 +710,7 @@ export function getScrollInfo(
   hwnd: number,
   bar: number = SB_VERT,
 ): { min: number; max: number; page: number; pos: number; trackPos: number } {
-  if (IS_MAC) {
+  if (IS_MAC || USE_NG) {
     const text = String(macControlRequest(TestLayout, [])[1] ?? "");
     const key = bar === SB_HORZ ? "scrollH" : "scrollV";
     const m = new RegExp(`${key} pos=(-?\\d+) min=(-?\\d+) max=(-?\\d+) page=(-?\\d+)`).exec(text);
@@ -721,9 +739,102 @@ export function getScrollPos(hwnd: number, bar: number = SB_VERT): number {
   return getScrollInfo(hwnd, bar).pos;
 }
 
+const WM_RBUTTONDBLCLK = 0x0206;
+const WM_MBUTTONUP = 0x0208;
+const WM_MBUTTONDBLCLK = 0x0209;
+const WM_MOUSEWHEEL = 0x020a;
+const WM_MOUSEHWHEEL = 0x020e;
+const NG_INPUT_MSGS = new Set([
+  WM_MOUSEMOVE,
+  WM_LBUTTONDOWN,
+  WM_LBUTTONUP,
+  WM_LBUTTONDBLCLK,
+  WM_RBUTTONDOWN,
+  WM_RBUTTONUP,
+  WM_RBUTTONDBLCLK,
+  WM_MBUTTONDOWN,
+  WM_MBUTTONUP,
+  WM_MBUTTONDBLCLK,
+  WM_MOUSEWHEEL,
+  WM_MOUSEHWHEEL,
+  WM_KEYDOWN,
+  WM_KEYUP,
+  WM_CHAR,
+]);
+const NG_GPUI_CLASS = "GpuiSystemMonitor";
+
+function isNgGpuiWindow(hwnd: number): boolean {
+  return USE_NG && !IS_MAC && getClassName(hwnd) === NG_GPUI_CLASS;
+}
+
+// ng on Windows: a frame and a tool window are gpui windows, so mouse and key
+// input aimed at them goes through the control channel, as on macOS. Native
+// windows (message boxes, file dialogs) get the message.
+export function ngInputTarget(hwnd: number): InputTarget | undefined {
+  if (!isNgGpuiWindow(hwnd)) {
+    return undefined;
+  }
+  const target = hwnd;
+  const screenToClient = (x: number, y: number) => {
+    const o = clientToScreen(target, 0, 0);
+    return { x: x - o.x, y: y - o.y };
+  };
+  // a tool window is owned by its frame; the frame's document is not in it
+  if (!getWindowOwner(target)) {
+    return { hwnd: target, screenToClient };
+  }
+  const clientCenter = () => {
+    const rc = getClientRect(target);
+    return { x: Math.round((rc.left + rc.right) / 2), y: Math.round((rc.top + rc.bottom) / 2) };
+  };
+  return { hwnd: target, screenToClient, clientCenter };
+}
+
+const MAPVK_VK_TO_CHAR = 2;
+
+// the character TranslateMessage makes of an unshifted key, 0 for none
+function keyChar(vk: number): number {
+  const ch = user32.symbols.MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) & 0xffff;
+  // letters come back upper case
+  return ch >= 0x41 && ch <= 0x5a ? ch + 0x20 : ch;
+}
+
+function ngInput(
+  hwnd: number,
+  msg: number,
+  wParam: number | bigint,
+  lParam: number | bigint,
+  posted: boolean,
+): boolean {
+  if (!NG_INPUT_MSGS.has(msg)) {
+    return false;
+  }
+  const target = ngInputTarget(hwnd);
+  if (!target) {
+    return false;
+  }
+  const eaten = macSendMessage(msg, wParam, lParam, target);
+  // the message loop's TranslateMessage: a posted key types its character
+  // unless the key was handled
+  if (posted && msg === WM_KEYDOWN && eaten === 0n) {
+    const ch = keyChar(Number(BigInt(wParam) & 0xffffn));
+    if (ch) {
+      macSendMessage(WM_CHAR, ch, 0, target);
+    }
+  }
+  return true;
+}
+
 export function postMessage(hwnd: number, msg: number, wParam: number, lParam: number): boolean {
+  if (ngInput(hwnd, msg, wParam, lParam, true)) {
+    return true;
+  }
   if (IS_MAC) {
-    macSendMessage(msg, wParam, lParam);
+    if (msg === WM_KEYDOWN) {
+      macPostKeyDown(wParam, lParam);
+    } else {
+      macSendMessage(msg, wParam, lParam);
+    }
     return true;
   }
   return user32.symbols.PostMessageW(hwnd, msg, BigInt(wParam), BigInt(lParam));
@@ -743,7 +854,17 @@ export async function postChar(hwnd: number, ch: string): Promise<boolean> {
 // target window to finish handling the message before reading state. Returns the
 // LRESULT as a bigint -- TreeView messages return HTREEITEM pointers that can
 // exceed 2^53, so they must not be coerced to a JS number.
+const WM_NULL = 0x0000;
+
+// whether hwnd's thread answers a WM_NULL within timeoutMs: false while it's busy
+export function windowResponds(hwnd: number, timeoutMs: number): boolean {
+  return user32.symbols.SendMessageTimeoutW(hwnd, WM_NULL, 0n, 0n, 0, timeoutMs, null) !== 0n;
+}
+
 export function sendMessage(hwnd: number, msg: number, wParam: number | bigint, lParam: number | bigint): bigint {
+  if (ngInput(hwnd, msg, wParam, lParam, false)) {
+    return 0n;
+  }
   if (IS_MAC) {
     return macSendMessage(msg, wParam, lParam);
   }
@@ -892,6 +1013,13 @@ export function setWindowPos(
 
 export function showWindow(hwnd: number, cmd: number): boolean {
   if (IS_MAC) {
+    if (cmd === SW_SHOWMINNOACTIVE || cmd === SW_MINIMIZE || cmd === SW_SHOWMINIMIZED) {
+      macShowWindow(true);
+      return true;
+    }
+    if (isIconic(hwnd)) {
+      macShowWindow(false);
+    }
     if (cmd === SW_RESTORE && isZoomed(hwnd)) {
       return moveWindow(hwnd, 80, 80, 1200, 900);
     }
@@ -941,6 +1069,52 @@ export function isKeyDownAsync(vk: number): boolean {
 }
 
 const KEYEVENTF_KEYUP = 0x0002;
+
+// ControlCommand.TestUiState (control.ts imports this file)
+const TestUiState = 122;
+
+export function isIconic(hwnd: number): boolean {
+  if (IS_MAC) {
+    return / minimized=1/.test(String(macControlRequest(TestUiState, [])[1] ?? ""));
+  }
+  return user32.symbols.IsIconic(hwnd);
+}
+
+const kKeyDown = 0x80;
+
+// Posts WM_KEYDOWN vk to hwnd with Shift held, for a Shift shortcut. Injected
+// input is dropped here and a posted key carries no modifier, so share the app
+// thread's key state (AttachThreadInput) and mark Shift down in it: that is what
+// GetKeyState and TranslateAccelerator read. Call the returned function once the
+// app handled the key, to release Shift and detach.
+export function postKeyWithShift(hwnd: number, vk: number): () => void {
+  return postKeyWithModifier(hwnd, vk, VK_SHIFT);
+}
+
+// postKeyWithShift for any modifier (VK_CONTROL for a Ctrl shortcut)
+export function postKeyWithModifier(hwnd: number, vk: number, modVk: number): () => void {
+  if (IS_MAC) {
+    macPostKeyWithModifier(vk, modVk);
+    return () => {};
+  }
+  const appThread = user32.symbols.GetWindowThreadProcessId(hwnd, null);
+  const ourThread = kernel32.symbols.GetCurrentThreadId();
+  if (!user32.symbols.AttachThreadInput(ourThread, appThread, true)) {
+    throw new Error("postKeyWithModifier: AttachThreadInput failed");
+  }
+  const keys = new Uint8Array(256);
+  const setMod = (down: boolean) => {
+    user32.symbols.GetKeyboardState(ptr(keys));
+    keys[modVk] = down ? kKeyDown : 0;
+    user32.symbols.SetKeyboardState(ptr(keys));
+  };
+  setMod(true);
+  user32.symbols.PostMessageW(hwnd, WM_KEYDOWN, vk, 1);
+  return () => {
+    setMod(false);
+    user32.symbols.AttachThreadInput(ourThread, appThread, false);
+  };
+}
 
 // inject a key-up for vk, clearing a key the system thinks is still held
 export function injectKeyUp(vk: number): void {
@@ -1114,6 +1288,162 @@ function readClipboardText(): string | null {
     } finally {
       kernel32.symbols.GlobalUnlock(data);
     }
+  } finally {
+    user32.symbols.CloseClipboard();
+  }
+}
+
+export const CF_BITMAP = 2;
+export const CF_DIB = 8;
+export const CF_DIBV5 = 17;
+
+// The formats on the clipboard, in the order they were put there (synthesized
+// ones like CF_DIB from CF_BITMAP included). null when it can't be opened.
+export function getClipboardFormats(): number[] | null {
+  if (!user32.symbols.OpenClipboard(null)) {
+    return null;
+  }
+  try {
+    const out: number[] = [];
+    for (let f = user32.symbols.EnumClipboardFormats(0); f !== 0; f = user32.symbols.EnumClipboardFormats(f)) {
+      out.push(f);
+    }
+    return out;
+  } finally {
+    user32.symbols.CloseClipboard();
+  }
+}
+
+// What a pasting app gets for CF_DIB: the bitmap's size and how many of its
+// pixels are not black, read from the header and pixel bytes. null when there
+// is no CF_DIB (or the clipboard can't be opened).
+export function getClipboardDibInfo(): { width: number; height: number; bitCount: number; nonBlack: number } | null {
+  if (IS_MAC) {
+    return macClipboardImageInfo();
+  }
+  if (!user32.symbols.OpenClipboard(null)) {
+    return null;
+  }
+  try {
+    const h = user32.symbols.GetClipboardData(CF_DIB);
+    if (!h) {
+      return null;
+    }
+    const mem = kernel32.symbols.GlobalLock(h);
+    if (!mem) {
+      return null;
+    }
+    try {
+      const size = Number(kernel32.symbols.GlobalSize(h));
+      const buf = Buffer.from(toArrayBuffer(mem, 0, size));
+      const hdrSize = buf.readUInt32LE(0);
+      const width = buf.readInt32LE(4);
+      const height = Math.abs(buf.readInt32LE(8));
+      const bitCount = buf.readUInt16LE(14);
+      const compression = buf.readUInt32LE(16);
+      // BI_BITFIELDS puts three color masks after a BITMAPINFOHEADER
+      const bitsAt = hdrSize + (compression === 3 && hdrSize === 40 ? 12 : 0);
+      const bpp = bitCount / 8;
+      const stride = Math.ceil((width * bitCount) / 32) * 4;
+      let nonBlack = 0;
+      if (bpp >= 3) {
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const i = bitsAt + y * stride + x * bpp;
+            if (i + 2 < buf.length && (buf[i]! | buf[i + 1]! | buf[i + 2]!) !== 0) {
+              nonBlack++;
+            }
+          }
+        }
+      }
+      return { width, height, bitCount, nonBlack };
+    } finally {
+      kernel32.symbols.GlobalUnlock(h);
+    }
+  } finally {
+    user32.symbols.CloseClipboard();
+  }
+}
+
+// Puts `text` on the clipboard as CF_UNICODETEXT, verbatim (no line ending conversion).
+export function setClipboardText(text: string): boolean {
+  if (IS_MAC) {
+    return Bun.spawnSync(["pbcopy"], { stdin: Buffer.from(text, "utf8") }).exitCode === 0;
+  }
+  const CF_UNICODETEXT = 13;
+  const GMEM_MOVEABLE = 0x2;
+  if (!user32.symbols.OpenClipboard(null)) {
+    return false;
+  }
+  try {
+    user32.symbols.EmptyClipboard();
+    const src = wideZ(text);
+    const h = kernel32.symbols.GlobalAlloc(GMEM_MOVEABLE, src.byteLength);
+    if (!h) {
+      return false;
+    }
+    const mem = kernel32.symbols.GlobalLock(h);
+    if (!mem) {
+      kernel32.symbols.GlobalFree(h);
+      return false;
+    }
+    new Uint8Array(toArrayBuffer(mem, 0, src.byteLength)).set(new Uint8Array(src.buffer));
+    kernel32.symbols.GlobalUnlock(h);
+    if (!user32.symbols.SetClipboardData(CF_UNICODETEXT, h)) {
+      kernel32.symbols.GlobalFree(h);
+      return false;
+    }
+    return true;
+  } finally {
+    user32.symbols.CloseClipboard();
+  }
+}
+
+// Changes on every clipboard update; reading it doesn't open the clipboard.
+export function clipboardSeqNo(): number {
+  if (IS_MAC) {
+    // NSPasteboard's changeCount
+    const r = Bun.spawnSync(
+      ["osascript", "-l", "JavaScript", "-e", 'ObjC.import("AppKit"); $.NSPasteboard.generalPasteboard.changeCount'],
+      { stdout: "pipe", stderr: "ignore" },
+    );
+    return Number(r.stdout.toString().trim()) || 0;
+  }
+  return user32.symbols.GetClipboardSequenceNumber();
+}
+
+export function emptyClipboard(): boolean {
+  if (IS_MAC) {
+    const r = Bun.spawnSync(
+      ["osascript", "-l", "JavaScript", "-e", 'ObjC.import("AppKit"); $.NSPasteboard.generalPasteboard.clearContents'],
+      { stdout: "ignore", stderr: "ignore" },
+    );
+    return r.exitCode === 0;
+  }
+  if (!user32.symbols.OpenClipboard(null)) {
+    return false;
+  }
+  try {
+    return user32.symbols.EmptyClipboard();
+  } finally {
+    user32.symbols.CloseClipboard();
+  }
+}
+
+// Keeps the clipboard open for `ms`, as a clipboard listener (rdpclip,
+// clipboard history) does after a change.
+export async function holdClipboard(ms: number): Promise<boolean> {
+  // the macOS pasteboard has no open / close to hold
+  if (IS_MAC) {
+    await sleep(ms);
+    return true;
+  }
+  if (!user32.symbols.OpenClipboard(null)) {
+    return false;
+  }
+  try {
+    await sleep(ms);
+    return true;
   } finally {
     user32.symbols.CloseClipboard();
   }
@@ -1302,8 +1632,52 @@ export function setProcessDpiAware(): boolean {
   return user32.symbols.SetProcessDpiAwarenessContext(-4n as unknown as number);
 }
 
+// Touch injection: unlike SendInput mouse/keyboard, it reaches the app on this
+// machine. Coordinates are screen pixels (physical once setProcessDpiAware()).
+export const POINTER_FLAG_DOWN = 0x10000;
+export const POINTER_FLAG_UPDATE = 0x20000;
+export const POINTER_FLAG_UP = 0x40000;
+const POINTER_FLAG_INRANGE = 0x2;
+const POINTER_FLAG_INCONTACT = 0x4;
+const PT_TOUCH = 2;
+const TOUCH_FEEDBACK_NONE = 3;
+// sizeof(POINTER_TOUCH_INFO) on x64; ptPixelLocation is at 32
+const kPointerTouchInfoSize = 144;
+let touchInjectionReady = false;
+
+export function injectTouch(x: number, y: number, flag: number): boolean {
+  if (!IS_WIN) {
+    return false;
+  }
+  if (!touchInjectionReady) {
+    touchInjectionReady = user32.symbols.InitializeTouchInjection(1, TOUCH_FEEDBACK_NONE);
+  }
+  const buf = new Uint8Array(kPointerTouchInfoSize);
+  const v = new DataView(buf.buffer);
+  v.setUint32(0, PT_TOUCH, true);
+  const contact = flag === POINTER_FLAG_UP ? 0 : POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+  v.setUint32(12, flag | contact, true);
+  v.setInt32(32, x, true);
+  v.setInt32(36, y, true);
+  return user32.symbols.InjectTouchInput(1, ptr(buf));
+}
+
 // The real cursor position, in screen (physical, when this process is DPI
 // aware) coordinates.
+// Without an interactive desktop (a disconnected RDP session) SetCursorPos
+// fails or the cursor stays put, so a test that hovers by moving the real
+// cursor can't run. Moves it by a pixel and back to find out.
+export function canMoveCursor(): boolean {
+  const was = getCursorPos();
+  const probe = { x: was.x === 1 ? 2 : 1, y: was.y === 1 ? 2 : 1 };
+  if (!setCursorPos(probe.x, probe.y)) {
+    return false;
+  }
+  const now = getCursorPos();
+  setCursorPos(was.x, was.y);
+  return now.x === probe.x && now.y === probe.y;
+}
+
 export function getCursorPos(): { x: number; y: number } {
   if (IS_MAC) {
     return macCursor;
@@ -1372,6 +1746,59 @@ export function setTaskbarAutoHide(on: boolean): void {
 // was failing on these alone while the UI looked correct).
 export const CLR_INVALID = 0xffffffff;
 
+type WindowDC = ReturnType<typeof openWindowDCNow>;
+
+let gHeldDC: { hwnd: number; src: WindowDC } | null = null;
+
+// Runs fn with one DC of hwnd held: every read of hwnd inside it shares one
+// capture instead of a PrintWindow of an ng window per readWindowDCColumn call.
+export function withWindowDC<T>(hwnd: number, fn: () => T): T {
+  if (gHeldDC) {
+    return fn();
+  }
+  const src = openWindowDCNow(hwnd);
+  gHeldDC = { hwnd, src };
+  try {
+    return fn();
+  } finally {
+    gHeldDC = null;
+    src.close();
+  }
+}
+
+function openWindowDC(hwnd: number): WindowDC {
+  if (gHeldDC && gHeldDC.hwnd === hwnd) {
+    return { ...gHeldDC.src, close: () => {} };
+  }
+  return openWindowDCNow(hwnd);
+}
+
+// A DC with what a window shows. ng's gpui windows are flip swapchains without
+// a redirection bitmap, so their window DC is empty: PrintWindow them instead
+// (current when called from another process, unlike from inside the app).
+function openWindowDCNow(hwnd: number) {
+  if (!isNgGpuiWindow(hwnd)) {
+    const dc = user32.symbols.GetWindowDC(hwnd);
+    const r = getWindowRect(hwnd);
+    return { dc, w: r.right - r.left, h: r.bottom - r.top, close: () => user32.symbols.ReleaseDC(hwnd, dc) };
+  }
+  const r = getWindowRect(hwnd);
+  const w = r.right - r.left;
+  const h = r.bottom - r.top;
+  const screenDC = user32.symbols.GetWindowDC(0);
+  const dc = gdi32.symbols.CreateCompatibleDC(screenDC);
+  const bmp = gdi32.symbols.CreateCompatibleBitmap(screenDC, w, h);
+  user32.symbols.ReleaseDC(0, screenDC);
+  const oldObj = gdi32.symbols.SelectObject(dc, bmp);
+  user32.symbols.PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT);
+  const close = () => {
+    gdi32.symbols.SelectObject(dc, oldObj);
+    gdi32.symbols.DeleteObject(bmp);
+    gdi32.symbols.DeleteDC(dc);
+  };
+  return { dc, w, h, close };
+}
+
 // Read a vertical run of pixels straight out of a window's DC, as 0x00bbggrr
 // COLORREFs. Coordinates are window-relative, so 0,0 is the top-left of the
 // NON-client area -- which is what makes this usable for checking that native
@@ -1379,7 +1806,8 @@ export const CLR_INVALID = 0xffffffff;
 // Retries briefly on CLR_INVALID: concurrent DWM/paint can make GetPixel fail
 // for a frame without meaning the chrome is wrong.
 export function readWindowDCColumn(hwnd: number, x: number, y: number, count: number): number[] {
-  const dc = user32.symbols.GetWindowDC(hwnd);
+  const src = openWindowDC(hwnd);
+  const dc = src.dc;
   const out: number[] = [];
   for (let i = 0; i < count; i++) {
     let c = gdi32.symbols.GetPixel(dc, x, y + i) >>> 0;
@@ -1388,7 +1816,7 @@ export function readWindowDCColumn(hwnd: number, x: number, y: number, count: nu
     }
     out.push(c);
   }
-  user32.symbols.ReleaseDC(hwnd, dc);
+  src.close();
   return out;
 }
 
@@ -1397,7 +1825,8 @@ export function readWindowDCColumn(hwnd: number, x: number, y: number, count: nu
 // actually painted: scan the rows around the middle and count non-background
 // pixels.
 export function readWindowDCRow(hwnd: number, x: number, y: number, count: number): number[] {
-  const dc = user32.symbols.GetWindowDC(hwnd);
+  const src = openWindowDC(hwnd);
+  const dc = src.dc;
   const out: number[] = [];
   for (let i = 0; i < count; i++) {
     let c = gdi32.symbols.GetPixel(dc, x + i, y) >>> 0;
@@ -1406,7 +1835,7 @@ export function readWindowDCRow(hwnd: number, x: number, y: number, count: numbe
     }
     out.push(c);
   }
-  user32.symbols.ReleaseDC(hwnd, dc);
+  src.close();
   return out;
 }
 
@@ -1420,6 +1849,10 @@ export function captureWindowPixels(
   hwnd: number,
   area: "client" | "window" = "client",
 ): { w: number; h: number; data: Uint8Array } | null {
+  // the app draws the window into a PNG; there is no non-client area
+  if (IS_MAC) {
+    return macCaptureClientPixels();
+  }
   const rc = area === "client" ? getClientRect(hwnd) : getWindowRect(hwnd);
   const w = rc.right - rc.left;
   const h = rc.bottom - rc.top;
@@ -1473,7 +1906,30 @@ export function captureWindowDCRegionPixels(
   if (w <= 0 || h <= 0) {
     return null;
   }
-  const winDC = user32.symbols.GetWindowDC(hwnd);
+  // macOS: that region of the window's capture
+  if (IS_MAC) {
+    const cap = macCaptureClientPixels();
+    if (!cap) {
+      return null;
+    }
+    const out = new Uint8Array(w * h * 4);
+    for (let row = 0; row < h; row++) {
+      const sy = y + row;
+      if (sy < 0 || sy >= cap.h) {
+        continue;
+      }
+      for (let col = 0; col < w; col++) {
+        const sx = x + col;
+        if (sx < 0 || sx >= cap.w) {
+          continue;
+        }
+        out.set(cap.data.subarray((sy * cap.w + sx) * 4, (sy * cap.w + sx) * 4 + 4), (row * w + col) * 4);
+      }
+    }
+    return out;
+  }
+  const src = openWindowDC(hwnd);
+  const winDC = src.dc;
   const memDC = gdi32.symbols.CreateCompatibleDC(winDC);
   const bmi = new ArrayBuffer(40);
   const dv = new DataView(bmi);
@@ -1486,7 +1942,7 @@ export function captureWindowDCRegionPixels(
   const bmp = gdi32.symbols.CreateDIBSection(memDC, ptr(bmi), 0, ptr(bitsPtr), 0n, 0);
   if (!bmp || !bitsPtr[0]) {
     gdi32.symbols.DeleteDC(memDC);
-    user32.symbols.ReleaseDC(hwnd, winDC);
+    src.close();
     return null;
   }
   const oldObj = gdi32.symbols.SelectObject(memDC, bmp);
@@ -1497,7 +1953,7 @@ export function captureWindowDCRegionPixels(
   const data = copied ? new Uint8Array(toArrayBuffer(bits, 0, w * h * 4)).slice() : null;
   gdi32.symbols.DeleteObject(bmp);
   gdi32.symbols.DeleteDC(memDC);
-  user32.symbols.ReleaseDC(hwnd, winDC);
+  src.close();
   return data;
 }
 
@@ -1526,7 +1982,9 @@ export function tbGetButtonIndex(toolbar: number, cmdId: number): number {
 // set a window's text via WM_SETTEXT (works on edit controls cross-process,
 // unlike SendInput typing). Synchronous, so the wide buffer stays alive.
 export function sendText(hwnd: number, text: string): void {
-  if (IS_MAC) {
+  // ng's gpui windows take it through the control channel; native ones (file
+  // dialogs, message boxes) get the message
+  if (IS_MAC || ngInputTarget(hwnd)) {
     macSendText(text);
     return;
   }
@@ -1589,13 +2047,13 @@ export function captureWindowToPng(hwnd: number, outPath: string): boolean {
 // DWM this works for background windows too, but NOT for minimized ones.
 export function captureWindowDCToPng(hwnd: number, outPath: string): boolean {
   ensureGdiplus();
-  const r = getWindowRect(hwnd);
-  const w = r.right - r.left;
-  const h = r.bottom - r.top;
+  const src = openWindowDC(hwnd);
+  const { w, h } = src;
   if (w <= 0 || h <= 0) {
+    src.close();
     return false;
   }
-  const winDC = user32.symbols.GetWindowDC(hwnd);
+  const winDC = src.dc;
   const memDC = gdi32.symbols.CreateCompatibleDC(winDC);
   const bmp = gdi32.symbols.CreateCompatibleBitmap(winDC, w, h);
   const oldObj = gdi32.symbols.SelectObject(memDC, bmp);
@@ -1609,7 +2067,7 @@ export function captureWindowDCToPng(hwnd: number, outPath: string): boolean {
 
   gdi32.symbols.DeleteObject(bmp);
   gdi32.symbols.DeleteDC(memDC);
-  user32.symbols.ReleaseDC(hwnd, winDC);
+  src.close();
   return status === 0;
 }
 
@@ -1629,7 +2087,8 @@ export function captureWindowDCRegionToPng(
   if (w <= 0 || h <= 0) {
     return false;
   }
-  const winDC = user32.symbols.GetWindowDC(hwnd);
+  const src = openWindowDC(hwnd);
+  const winDC = src.dc;
   const memDC = gdi32.symbols.CreateCompatibleDC(winDC);
   const bmp = gdi32.symbols.CreateCompatibleBitmap(winDC, w * zoom, h * zoom);
   const oldObj = gdi32.symbols.SelectObject(memDC, bmp);
@@ -1644,7 +2103,7 @@ export function captureWindowDCRegionToPng(
 
   gdi32.symbols.DeleteObject(bmp);
   gdi32.symbols.DeleteDC(memDC);
-  user32.symbols.ReleaseDC(hwnd, winDC);
+  src.close();
   return status === 0;
 }
 

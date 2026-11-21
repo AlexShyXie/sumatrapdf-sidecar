@@ -176,6 +176,11 @@ void BrowserDocView::NavigationCompleted(void* ctx, Str url, bool success) {
     if (view->wv) {
         view->wv->Eval(Str(kReportScrollJs));
     }
+    view->docLoaded = true;
+    if (view->printPending) {
+        view->printPending = false;
+        view->PrintCurrentPage(true);
+    }
 }
 
 void BrowserDocView::HistoryChanged(void* ctx, bool canGoBack, bool canGoForward) {
@@ -512,6 +517,12 @@ void BrowserDocView::SetScrollPos(Point pos) {
 
 void BrowserDocView::PrintCurrentPage(bool showUI) {
     if (backend == Backend::WebView2 && wv) {
+        // WebView2 starts asynchronously; before the page is there, ShowPrintUI()
+        // fails and window.print() shows the browser preview (#6323)
+        if (!docLoaded) {
+            printPending = true;
+            return;
+        }
         if (!wv->ShowPrintUI()) {
             wv->Eval(StrL("window.print()"));
         }
@@ -622,6 +633,11 @@ void BrowserDocView::SelectAll() {
     }
 }
 
+// WebView2 only; see WebviewWnd::CapturePreviewPng
+bool BrowserDocView::CapturePng(const Func1<Str>& done) {
+    return backend == Backend::WebView2 && wv && wv->CapturePreviewPng(done);
+}
+
 void BrowserDocView::CopySelection() {
     if (backend == Backend::WebView2 && wv) {
         wv->Eval(StrL("document.execCommand('copy', false, null)"));
@@ -632,8 +648,48 @@ void BrowserDocView::CopySelection() {
     }
 }
 
+// script that scrolls the page like a browser does for a navigation key; empty
+// for other keys. Steps match Chromium's: 40px per arrow, 87.5% of the view
+// per page.
+static Str ScrollJsForKey(WPARAM key) {
+    switch (key) {
+        case VK_UP:
+            return StrL("window.scrollBy(0, -40)");
+        case VK_DOWN:
+            return StrL("window.scrollBy(0, 40)");
+        case VK_LEFT:
+            return StrL("window.scrollBy(-40, 0)");
+        case VK_RIGHT:
+            return StrL("window.scrollBy(40, 0)");
+        case VK_PRIOR:
+            return StrL("window.scrollBy(0, -window.innerHeight * 0.875)");
+        case VK_NEXT:
+            return StrL("window.scrollBy(0, window.innerHeight * 0.875)");
+        case VK_HOME:
+            return StrL("window.scrollTo(window.scrollX, 0)");
+        case VK_END:
+            return StrL("window.scrollTo(window.scrollX, document.documentElement.scrollHeight)");
+    }
+    return {};
+}
+
+// Scrolls and reports the new position at once: the 'scroll' event waits for a
+// rendering frame, which Chromium skips when the view is occluded or busy.
+void BrowserDocView::EvalScroll(Str js) {
+    wv->Eval(fmt("%s;%s", js, Str(kReportScrollJs)));
+}
+
 LRESULT BrowserDocView::SendMsg(UINT msg, WPARAM wp, LPARAM lp) {
     if (backend == Backend::WebView2 && wv && wv->hwnd) {
+        if (msg == WM_KEYDOWN) {
+            // Chromium ignores keys sent to the host hwnd too; they come from
+            // the focused frame, e.g. after a tab switch (#6419)
+            Str js = ScrollJsForKey(wp);
+            if (len(js) > 0) {
+                EvalScroll(js);
+                return 0;
+            }
+        }
         if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL) {
             // Chromium ignores WM_MOUSEWHEEL on the host hwnd. When the frame
             // (focused) or canvas parent gets the wheel, scroll via JS (#6142).
@@ -643,7 +699,7 @@ LRESULT BrowserDocView::SendMsg(UINT msg, WPARAM wp, LPARAM lp) {
             short delta = GET_WHEEL_DELTA_WPARAM(wp);
             bool horiz = (msg == WM_MOUSEHWHEEL) || (LOWORD(wp) & MK_SHIFT) || IsShiftPressed();
             int d = -(int)delta;
-            wv->Eval(horiz ? fmt("window.scrollBy(%d, 0)", d) : fmt("window.scrollBy(0, %d)", d));
+            EvalScroll(horiz ? fmt("window.scrollBy(%d, 0)", d) : fmt("window.scrollBy(0, %d)", d));
             return 0;
         }
         return SendMessageW(wv->hwnd, msg, wp, lp);
@@ -708,10 +764,6 @@ void BrowserViewSetVisible(BrowserView* bv, bool visible) {
     if (bv) {
         bv->view->SetVisible(visible);
     }
-}
-
-bool BrowserViewIsVisible(BrowserView* bv) {
-    return bv && bv->view->IsVisible();
 }
 
 void BrowserViewRefreshSurface(BrowserView* bv) {
@@ -784,6 +836,11 @@ void BrowserViewCopySelection(BrowserView* bv) {
     }
 }
 
+// async png of the visible page; false if not supported (done is then not called)
+bool BrowserViewCapturePng(BrowserView* bv, const Func1<Str>& done) {
+    return bv && bv->view->CapturePng(done);
+}
+
 void BrowserViewPrint(BrowserView* bv, bool showUI) {
     if (bv) {
         bv->view->PrintCurrentPage(showUI);
@@ -828,10 +885,11 @@ LRESULT BrowserViewPassUIMsg(BrowserView* bv, UINT msg, WPARAM wp, LPARAM lp) {
     return bv ? bv->view->SendMsg(msg, wp, lp) : 0;
 }
 
-gpui::El* BrowserViewBuild(BrowserView*, gpui::Ctx*) {
+gpui::El* BrowserViewBuild(BrowserView*, gpui::Ctx*, int) {
     return nullptr;
 }
 
 void BrowserViewCreatePending(MainWindow*, gpui::Ctx*) {}
 void BrowserViewSetOwnHost(BrowserView*) {}
 void BrowserViewCreatePendingIn(BrowserView*, gpui::Ctx*) {}
+void BrowserViewSetBackground(BrowserView*, Color) {}

@@ -104,11 +104,7 @@ bool IsDirectory(Str path) {
 // also remembered for ~4 minutes so later queries fail fast.
 // Non-Windows: no cache (same as an uncached attribute query).
 DWORD GetCachedAttributes(Str path) {
-    struct stat st;
-    if (!StatPath(path, st)) {
-        return (DWORD)-1; // INVALID_FILE_ATTRIBUTES
-    }
-    return (DWORD)st.st_mode;
+    return file::GetAttributes(path);
 }
 
 TempStr NormalizeTemp(Str path) {
@@ -211,6 +207,30 @@ TempStr StorageInfoTemp(Str path) {
 }
 
 bool IsEphemeralHostFile(Str /*path*/) {
+    return false;
+}
+
+// Is path inside a temporary folder ($TMPDIR, /tmp)? macOS gives /var/folders/...
+// for $TMPDIR, which is /private/var/folders/... once resolved (#6437)
+bool IsInTempDir(Str path) {
+    if (len(path) == 0) {
+        return false;
+    }
+    Str dirs[4] = {Str(getenv("TMPDIR")), StrL("/tmp/"), StrL("/private/tmp/"), {}};
+    if (len(dirs[0]) > 0) {
+        dirs[3] = str::JoinTemp(StrL("/private"), dirs[0]);
+    }
+    for (Str dir : dirs) {
+        if (len(dir) == 0) {
+            continue;
+        }
+        if (dir.s[len(dir) - 1] != '/') {
+            dir = str::JoinTemp(dir, StrL("/"));
+        }
+        if (len(path) > len(dir) && str::StartsWith(path, dir)) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -349,37 +369,8 @@ bool WriteAll(FileHandle h, Str data) {
     return true;
 }
 
-// Reads exactly size bytes at offset; a short read (e.g. hitting the end of
-// the file) is a failure. pread() doesn't move the file position, but the
-// Windows implementation does, so callers must not rely on either.
-bool ReadAt(FileHandle h, i64 offset, void* buf, int size) {
-    char* d = (char*)buf;
-    int left = size;
-    while (left > 0) {
-        ssize_t n = pread(h, d, (size_t)left, (off_t)offset);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-        if (n == 0) {
-            return false;
-        }
-        d += n;
-        offset += n;
-        left -= (int)n;
-    }
-    return true;
-}
-
 bool Flush(FileHandle h) {
     return fsync(h) == 0;
-}
-
-// Text of the error left behind by the last failed call, for error messages.
-TempStr LastErrorTemp() {
-    return str::DupTemp(Str(strerror(errno)));
 }
 
 bool Exists(Str path) {
@@ -524,14 +515,6 @@ bool Copy(Str dst, Str src, bool dontOverwrite, const CopyProgressCb& cbProgress
             cbProgress.Call(&progress);
         }
     }
-}
-
-FILETIME GetAccessTime(Str path) {
-    struct stat st;
-    if (!StatPath(path, st)) {
-        return {};
-    }
-    return FileTimeFromTimespec(StatAccessTime(st));
 }
 
 bool SetAccessTime(Str path, FILETIME accessTime) {
@@ -762,14 +745,47 @@ TempStr GetHomeDirTemp() {
     return str::DupTemp(Str(home));
 }
 
-TempStr ExpandEnvVarTemp(Str varName) {
-    const char* val = getenv(CStrTemp(varName));
-    if (!val) {
-        return {};
+// Linux: XDG_DOWNLOAD_DIR="$HOME/Downloads" in ~/.config/user-dirs.dirs
+static TempStr XdgDownloadDirTemp(Str home) {
+    const char* configHome = getenv("XDG_CONFIG_HOME");
+    TempStr config =
+        configHome && configHome[0] ? str::DupTemp(Str(configHome)) : path::JoinTemp(home, StrL(".config"));
+    Str data = file::ReadFile(path::JoinTemp(config, StrL("user-dirs.dirs")));
+    TempStr res;
+    StrVec lines;
+    Split(&lines, data, StrL("\n"));
+    for (int i = 0; i < len(lines); i++) {
+        Str line = lines[i];
+        Str prefix = StrL("XDG_DOWNLOAD_DIR=\"");
+        if (!str::StartsWith(line, prefix) || !str::EndsWith(line, StrL("\""))) {
+            continue;
+        }
+        Str val = Str(line.s + len(prefix), len(line) - len(prefix) - 1);
+        if (str::StartsWith(val, StrL("$HOME"))) {
+            val = str::JoinTemp(home, Str(val.s + 5, len(val) - 5));
+        }
+        res = str::DupTemp(val);
+        break;
     }
-    return str::DupTemp(Str(val));
+    str::Free(data);
+    return res;
 }
 
-TempStr ToAbsolutePathTemp(Str path) {
-    return path::NormalizeTemp(path);
+// the user's Downloads folder, where web browsers save files by default
+TempStr GetDownloadsDirTemp() {
+#if OS_WASM
+    return str::DupTemp(StrL("/uploads"));
+#else
+    TempStr home = GetHomeDirTemp();
+    if (len(home) == 0) {
+        return {};
+    }
+#if !OS_DARWIN
+    TempStr xdg = XdgDownloadDirTemp(home);
+    if (len(xdg) > 0) {
+        return xdg;
+    }
+#endif
+    return path::JoinTemp(home, StrL("Downloads"));
+#endif
 }

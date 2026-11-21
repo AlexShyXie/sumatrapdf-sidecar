@@ -12,6 +12,7 @@
 #include "EngineBase.h"
 #include "AppSettings.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "SumatraPDF.h"
 #include "Translations.h"
@@ -20,6 +21,7 @@
 #include "AIChatCommon.h"
 #include "AIChatPanel.h"
 #include "AIChatPanelCommon.h"
+#include "AIChatAPI.h"
 
 // path is host-relative, without a leading slash (e.g. "index.html")
 bool AIChatPathIs(Str path, Str name) {
@@ -29,21 +31,22 @@ bool AIChatPathIs(Str path, Str name) {
     return path.len > 0 && path.s[0] == '/' && str::EqI(Str(path.s + 1, path.len - 1), name);
 }
 
-// providerId is an AIChatBackend value (0=Claude, 1=Grok, 2=Codex, 3=AntiGravity)
+// providerId is an AIChatBackend value
 AIChatProvider* GetAIChatProvider(int providerId) {
-    if (providerId == 0) {
-        return GetClaudeCodeProvider();
+    switch ((AIChatBackend)providerId) {
+        case AIChatBackend::Claude:
+            return GetClaudeCodeProvider();
+        case AIChatBackend::Grok:
+            return GetGrokBuildProvider();
+        case AIChatBackend::Codex:
+            return GetCodexBuildProvider();
+        case AIChatBackend::AntiGravity:
+            return GetAntiGravityProvider();
+        case AIChatBackend::CustomAPI:
+            return GetCustomAIProvider();
+        default:
+            return nullptr;
     }
-    if (providerId == 1) {
-        return GetGrokBuildProvider();
-    }
-    if (providerId == 2) {
-        return GetCodexBuildProvider();
-    }
-    if (providerId == 3) {
-        return GetAntiGravityProvider();
-    }
-    return nullptr;
 }
 
 AIChatProvider* CurrentProvider(MainWindow* win) {
@@ -134,23 +137,22 @@ void SetAIChatWorking(MainWindow* win, bool /*working*/) {
     UpdateAIChatPanelForCurrentTab(win);
 }
 
-// the tab an update belongs to; prefer tabs with a running process
-WindowTab* FindAIChatUpdateTab(MainWindow* win, int pid, Str sessionId) {
-    for (WindowTab* t : win->Tabs()) {
-        AIChatTabState* st = GetTabState(t, pid);
-        if (!st || !st->process) {
-            continue;
-        }
-        if (sessionId && st->sessionId && str::Eq(st->sessionId, sessionId)) {
-            return t;
-        }
-        if (sessionId && str::Eq(sessionId, kAIChatPendingSessionId()) && len(st->sessionId) == 0) {
-            return t;
-        }
+// Each turn gets a unique id, so a turn's updates reach its tab only. Routing
+// by session id mixed up two new sessions (both "pending" until the provider
+// names them) and kept delivering a stopped turn's output.
+int AIChatNewTurnId() {
+    static int gLastTurnId = 0;
+    return ++gLastTurnId;
+}
+
+// the tab running turn turnId; null for a finished or stopped turn
+WindowTab* FindAIChatUpdateTab(MainWindow* win, int pid, int turnId) {
+    if (turnId == 0) {
+        return nullptr;
     }
     for (WindowTab* t : win->Tabs()) {
         AIChatTabState* st = GetTabState(t, pid);
-        if (st && st->sessionId && sessionId && str::Eq(st->sessionId, sessionId)) {
+        if (st && st->turnId == turnId) {
             return t;
         }
     }
@@ -233,6 +235,7 @@ void ShutdownAIChatForMainWindow(MainWindow* win) {
             continue;
         }
         for (AIChatTabState& chat : tab->aiChat) {
+            AIChatCancelAPI(&chat);
             AIChatCloseProcess(&chat.process, true);
         }
     }
@@ -266,9 +269,11 @@ void StopAIChat(MainWindow* win) {
     AIChatProvider* provider = CurrentProvider(win);
     WindowTab* tab = win->CurrentTab();
     AIChatTabState* st = GetTabState(tab, win->aiChatProvider);
-    if (provider && st && st->process) {
+    if (provider && st && (st->process || st->apiRequest)) {
         AIChatLog(provider->logger, StrL("stop"), st->sessionId ? st->sessionId : StrL("(no session)"));
+        AIChatCancelAPI(st);
         AIChatCloseProcess(&st->process, true);
+        st->turnId = 0;
         WebViewAddError(win, StrL("Stopped by user."));
         SetAIChatWorking(win, false);
     }
@@ -280,7 +285,8 @@ struct AIChatUpdateData {
     MainWindow* win = nullptr;
     int providerId = 0;
     Str text;
-    Str sessionId; // to identify which tab this belongs to
+    Str sessionId;
+    int turnId = 0; // to identify which tab this belongs to
     AIChatUpdateType updateType = AIChatUpdateType::Text;
 };
 
@@ -294,8 +300,17 @@ static void FreeAIChatUpdateData(AIChatUpdateData* data) {
 // WebView reflects the update; otherwise it's only logged / recorded
 static void ApplyAIChatUpdate(MainWindow* win, AIChatProvider* p, AIChatUpdateData* data, AIChatTabState* st,
                               bool isActiveTab) {
+    if (st && st->apiRequest && !isActiveTab) {
+        if (data->updateType == AIChatUpdateType::Text)
+            st->chatLog.Append(fmt("appendText('%s')\n", AIChatJsEscapeTemp(data->text)));
+        else if (data->updateType == AIChatUpdateType::Error)
+            st->chatLog.Append(fmt("addError('%s')\n", AIChatJsEscapeTemp(data->text)));
+        else if (data->updateType == AIChatUpdateType::Finished)
+            st->chatLog.Append(StrL("flushBlock()\n"));
+    }
     switch (data->updateType) {
         case AIChatUpdateType::Text:
+            if (st && st->apiRequest) st->apiReply.Append(data->text);
             if (data->text) {
                 AIChatLog(p->logger, StrL("<<< text"), data->text);
             }
@@ -312,6 +327,7 @@ static void ApplyAIChatUpdate(MainWindow* win, AIChatProvider* p, AIChatUpdateDa
             }
             break;
         case AIChatUpdateType::Error:
+            if (st && st->apiRequest) st->apiFailed = true;
             if (isActiveTab) {
                 WebViewAddError(win, data->text);
             } else if (data->text) {
@@ -332,7 +348,11 @@ static void ApplyAIChatUpdate(MainWindow* win, AIChatProvider* p, AIChatUpdateDa
             }
             break;
         case AIChatUpdateType::Finished:
+            AIChatFinishAPI(st);
             OnAIChatFinished(win, p, st, isActiveTab);
+            if (st) {
+                st->turnId = 0;
+            }
             break;
     }
 }
@@ -345,23 +365,23 @@ static void OnAIChatUpdate(AIChatUpdateData* data) {
         FreeAIChatUpdateData(data);
         return;
     }
-    WindowTab* tab = FindAIChatUpdateTab(win, pid, data->sessionId);
+    WindowTab* tab = FindAIChatUpdateTab(win, pid, data->turnId);
     bool isActiveTab = IsCurrentTab(win, tab) && win->aiChatProvider == pid;
     ApplyAIChatUpdate(win, p, data, GetTabState(tab, pid), isActiveTab);
     FreeAIChatUpdateData(data);
     AIChatUpdateApplied(win);
 }
 
-AIChatCaptureSink* gAIChatCapture = nullptr;
-
+// per stream, not global: a chat streaming on its reader thread while a
+// one-shot request parses must keep its own output
 void AIChatPostUpdate(AIChatStreamCtx* ctx, AIChatUpdateType type, Str text) {
-    if (gAIChatCapture) {
+    if (AIChatCaptureSink* capture = ctx->capture) {
         if (type == AIChatUpdateType::Text) {
-            gAIChatCapture->text.Append(text ? text : Str(""));
+            capture->text.Append(text ? text : Str(""));
         } else if (type == AIChatUpdateType::Error) {
-            gAIChatCapture->err.Append(text ? text : Str(""));
+            capture->err.Append(text ? text : Str(""));
         } else if (type == AIChatUpdateType::Finished) {
-            gAIChatCapture->finished = true;
+            capture->finished = true;
         }
         return;
     }
@@ -370,6 +390,7 @@ void AIChatPostUpdate(AIChatStreamCtx* ctx, AIChatUpdateType type, Str text) {
     data->win = ctx->win;
     data->providerId = ctx->providerId;
     data->sessionId = ctx->sessionId ? str::Dup(ctx->sessionId) : Str{};
+    data->turnId = ctx->turnId;
     data->text = text ? str::Dup(text) : Str{};
     data->updateType = type;
     uitask::Post(MkFunc0(OnAIChatUpdate, data), "AIChatUpdate");

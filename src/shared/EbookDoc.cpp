@@ -143,19 +143,12 @@ static TempStr DecodeTextToUtf8Temp(Str s, bool isXML = false) {
     if (str::TrimPrefix(s, StrL(kUtf8Bom))) {
         return str::DupTemp(s);
     }
+    // decoded from bytes, never in place: s may be archive-owned
     if (str::TrimPrefix(s, StrL(kUtf16Bom))) {
-        WStr ws = str::CastStrToWStr(s);
-        return ToUtf8Temp(ws);
+        return strconv::Utf16ToUtf8Temp(s, strconv::ByteOrder::LittleEndian);
     }
     if (str::TrimPrefix(s, StrL(kUtf16BeBom))) {
-        // convert from utf16 big endian to utf16
-        int n = str::CastStrToWStr(s).len;
-        for (int i = 0; i < n; i++) {
-            int idx = i * 2;
-            std::swap(s.s[idx], s.s[idx + 1]);
-        }
-        WStr ws = str::CastStrToWStr(s);
-        return ToUtf8Temp(ws);
+        return strconv::Utf16ToUtf8Temp(s, strconv::ByteOrder::BigEndian);
     }
     uint codePage = isXML ? GetCodepageFromPI(s) : CP_ACP;
     if (CP_ACP == codePage && IsValidUtf8(s)) {
@@ -344,6 +337,8 @@ bool EpubDoc::Load() {
     }
 
     Str content(contentFi->data, contentFi->fileSizeUncompressed);
+    // first value wins, so the sidecar overrides the package
+    EpubGetSidecarMetadata(fileName, props);
     ParseMetadata(content, props);
     GumboDoc contentDoc(content, GumboMode::XmlFragment);
     const GumboNode* node = GumboFindDescendantByTag(contentDoc.Document(), StrL("manifest"), HtmlNameMatch::Local);
@@ -353,7 +348,7 @@ bool EpubDoc::Load() {
 
     contentPath = Str(contentPath.s, str::LastIndexOfChar(contentPath, '/') + 1);
 
-    StrVec idList, pathList;
+    StrVec idList, pathList, navIds;
 
     const GumboVector* manifestChildren = GumboChildrenOf(node);
     for (unsigned int i = 0; manifestChildren && i < manifestChildren->length; i++) {
@@ -395,6 +390,9 @@ bool EpubDoc::Load() {
         if (path && htmlId) {
             idList.Append(htmlId);
             pathList.Append(path);
+            if (properties && str::Contains(properties, StrL("nav"))) {
+                navIds.Append(htmlId);
+            }
         }
     }
 
@@ -418,17 +416,38 @@ bool EpubDoc::Load() {
         isRtlDoc = readingDir.rtl;
     }
 
+    // page order: the linear spine items, then linear="no" ones (footnotes,
+    // endnotes) where links still reach them, then XHTML only the manifest
+    // names (an aside a link points at); the nav document is not a page (#5803)
+    StrVec spineIds, pageIds;
     const GumboVector* spineChildren = GumboChildrenOf(node);
-    for (unsigned int i = 0; spineChildren && i < spineChildren->length; i++) {
-        node = (const GumboNode*)spineChildren->data[i];
-        if (!GumboTagNameIs(node, StrL("itemref"), HtmlNameMatch::Local)) {
-            continue;
+    for (int pass = 0; pass < 2; pass++) {
+        for (unsigned int i = 0; spineChildren && i < spineChildren->length; i++) {
+            node = (const GumboNode*)spineChildren->data[i];
+            if (!GumboTagNameIs(node, StrL("itemref"), HtmlNameMatch::Local)) {
+                continue;
+            }
+            TempStr idref = GumboAttributeValueTemp(node, "idref");
+            if (len(idref) == 0) {
+                continue;
+            }
+            TempStr linear = GumboAttributeValueTemp(node, "linear");
+            bool isLinear = !str::Eq(linear, StrL("no"));
+            if (isLinear != (pass == 0)) {
+                continue;
+            }
+            spineIds.Append(idref);
+            pageIds.Append(idref);
         }
-        TempStr idref = GumboAttributeValueTemp(node, "idref");
-        if (len(idref) == 0) {
-            continue;
+    }
+    for (int i = 0; i < len(idList); i++) {
+        if (!spineIds.Contains(idList[i]) && !navIds.Contains(idList[i])) {
+            pageIds.Append(idList[i]);
         }
-        int idx = idList.Find(idref);
+    }
+
+    for (Str id : pageIds) {
+        int idx = idList.Find(id);
         if (idx < 0) {
             continue;
         }
@@ -463,6 +482,10 @@ static SeqStrNum epubPropsMap =
     "dcterms:modified\0" "\x0c"
     "dc:description\0" "\x08"
     "dc:rights\0" "\x06"
+    "dc:publisher\0" "\x6c"
+    "dc:identifier\0" "\x6e"
+    "dc:source\0" "\x70"
+    "dc:language\0" "\x72"
     "\0";
 // clang-format on
 // @gen-end docprop-epub
@@ -471,11 +494,37 @@ static bool IsTokPropName(HtmlToken* tok, Str name) {
     if (tok->NameIs(name)) {
         return true;
     }
+    // <description xmlns="http://purl.org/dc/elements/1.1/"> has no dc: prefix
+    Str dcPrefix = StrL("dc:");
+    if (str::StartsWith(name, dcPrefix) && tok->NameIs(Str(name.s + len(dcPrefix), len(name) - len(dcPrefix)))) {
+        return true;
+    }
     if (Tag_Meta != tok->tag) {
         return false;
     }
     AttrInfo attr = tok->GetAttrByName(StrL("property"));
     return attr && attr.ValIs(name);
+}
+
+// publishers store descriptions as escaped HTML: "<b>Bold</b><BR>Next &#8212; end"
+static TempStr HtmlDescriptionToTextTemp(Str html) {
+    GumboHtmlParser parser(html);
+    str::Builder text;
+    HtmlToken* tok;
+    while ((tok = parser.Next()) != nullptr) {
+        if (tok->IsText()) {
+            text.Append(ResolveHtmlEntitiesTemp(tok->s));
+            continue;
+        }
+        bool isBreak =
+            tok->NameIs(StrL("br")) || tok->NameIs(StrL("p")) || tok->NameIs(StrL("div")) || tok->NameIs(StrL("li"));
+        if (isBreak) {
+            text.AppendChar(' ');
+        }
+    }
+    TempStr res = str::DupTemp(ToStr(text));
+    res.len -= str::NormalizeWSInPlace(res);
+    return res;
 }
 
 static void ParseMetadata(Str content, Props& props) {
@@ -509,6 +558,9 @@ static void ParseMetadata(Str content, Props& props) {
             tok = pullParser.Next();
             if (tok && tok->IsText()) {
                 TempStr val = ResolveHtmlEntitiesTemp(tok->s);
+                if ((DocProp)propNo == DocProp::Subject) {
+                    val = HtmlDescriptionToTextTemp(val);
+                }
                 AddPropOwned(props, (DocProp)propNo, val);
             }
             break;
@@ -702,6 +754,32 @@ EpubReadingDirection EpubGetReadingDirection(Str path) {
     GumboDoc doc(Str(contentFi->data, contentFi->fileSizeUncompressed), GumboMode::XmlFragment);
     const GumboNode* spine = GumboFindDescendantByTag(doc.Document(), StrL("spine"), HtmlNameMatch::Local);
     return EpubSpineDirection(spine);
+}
+
+// Metadata from foo.opf next to foo.epub. Free with FreeProps.
+void EpubGetSidecarMetadata(Str epubPath, Props& props) {
+    if (len(epubPath) == 0) {
+        return;
+    }
+    TempStr opfPath = str::JoinTemp(path::GetPathNoExtTemp(epubPath), StrL(".opf"));
+    Str data = file::ReadFile(opfPath);
+    if (len(data) > 0) {
+        ParseMetadata(data, props);
+    }
+    str::Free(data);
+}
+
+// The package's metadata, without building a whole EpubDoc. Free with FreeProps.
+void EpubGetMetadata(Str path, Props& props) {
+    AutoDelete archive(OpenArchiveFromFile(path, false, gArchiveProgressCb));
+    if (!archive) {
+        return;
+    }
+    TempStr contentPath;
+    auto* contentFi = GetEpubPackage(archive, contentPath);
+    if (contentFi) {
+        ParseMetadata(Str(contentFi->data, contentFi->fileSizeUncompressed), props);
+    }
 }
 
 EpubDoc* EpubDoc::CreateFromFile(Str path) {
@@ -1061,7 +1139,7 @@ static Str HandleTealDocTag(str::Builder& builder, StrVec& tocEntries, Str text)
     if (len(text) < 9) {
     Fallback:
         builder.Append(StrL("&lt;"));
-        return text;
+        return Str(text.s + 1, len(text) - 1);
     }
     if (!str::StartsWithI(text, StrL("<BOOKMARK")) && !str::StartsWithI(text, StrL("<HEADER")) &&
         !str::StartsWithI(text, StrL("<HRULE")) && !str::StartsWithI(text, StrL("<LABEL")) &&
@@ -1364,6 +1442,96 @@ bool EbookDoc_UnitTestLoading() {
         }
     }
     return true;
+}
+
+// issue #5803: linear="no" spine items (notes) page after the linear ones,
+// then XHTML only the manifest names; a nav document is not a page.
+// Same EPUB as tests/issue-5803.ts.
+bool EbookDoc_UnitTestLinearNo() {
+    Str opf = StrL(
+        "<package version='3.0'><manifest>"
+        "<item id='c1' href='c1.xhtml' media-type='application/xhtml+xml'/>"
+        "<item id='notes' href='notes.xhtml' media-type='application/xhtml+xml'/>"
+        "<item id='c2' href='c2.xhtml' media-type='application/xhtml+xml'/>"
+        "<item id='extra' href='extra.xhtml' media-type='application/xhtml+xml'/>"
+        "<item id='nav' href='nav.xhtml' media-type='application/xhtml+xml' properties='nav'/>"
+        "</manifest><spine>"
+        "<itemref idref='c1'/><itemref idref='notes' linear='no'/><itemref idref='c2'/>"
+        "</spine></package>");
+    const Str pages[][2] = {
+        {StrL("c1"), StrL("CHAPTERONE")}, {StrL("notes"), StrL("NOTES")}, {StrL("c2"), StrL("CHAPTERTWO")},
+        {StrL("extra"), StrL("EXTRA")},   {StrL("nav"), StrL("NAVTOC")},
+    };
+
+    str::Builder zip;
+    ZipCreator creator(zip);
+    Str container = StrL("<container><rootfiles><rootfile full-path='OEBPS/content.opf'/></rootfiles></container>");
+    bool ok = creator.AddFileData(StrL("META-INF/container.xml"), container) &&
+              creator.AddFileData(StrL("OEBPS/content.opf"), opf);
+    for (const auto& p : pages) {
+        TempStr name = fmt("OEBPS/%s.xhtml", p[0]);
+        TempStr html = fmt("<html><body><h1>%s</h1></body></html>", p[1]);
+        ok = ok && creator.AddFileData(name, html);
+    }
+    if (!ok || !creator.Finish()) {
+        return false;
+    }
+    AutoDelete doc(EpubDoc::CreateFromData(ToStr(zip)));
+    if (!doc) {
+        return false;
+    }
+
+    Str html = ToStr(doc->htmlData);
+    if (str::Contains(html, StrL("NAVTOC"))) {
+        return false;
+    }
+    int last = -1;
+    for (Str title : {StrL("CHAPTERONE"), StrL("CHAPTERTWO"), StrL("NOTES"), StrL("EXTRA")}) {
+        int at = str::IndexOf(html, title);
+        if (at <= last) {
+            return false;
+        }
+        last = at;
+    }
+    return true;
+}
+
+// Decoding UTF-16BE must not byte-swap the archive's cached data: a page
+// listed twice in the spine is decoded twice from the same buffer.
+bool EbookDoc_UnitTestUtf16BeTwice() {
+    Str opf = StrL(
+        "<package version='3.0'><manifest>"
+        "<item id='c1' href='c1.xhtml' media-type='application/xhtml+xml'/>"
+        "</manifest><spine><itemref idref='c1'/><itemref idref='c1'/></spine></package>");
+    Str htmlUtf8 = StrL("<html><body><h1>BEPAGE</h1></body></html>");
+    str::Builder html;
+    html.Append(StrL("\xFE\xFF"));
+    for (int i = 0; i < len(htmlUtf8); i++) {
+        html.AppendChar(0);
+        html.AppendChar(htmlUtf8.s[i]);
+    }
+
+    str::Builder zip;
+    ZipCreator creator(zip);
+    Str container = StrL("<container><rootfiles><rootfile full-path='OEBPS/content.opf'/></rootfiles></container>");
+    bool ok = creator.AddFileData(StrL("META-INF/container.xml"), container) &&
+              creator.AddFileData(StrL("OEBPS/content.opf"), opf) &&
+              creator.AddFileData(StrL("OEBPS/c1.xhtml"), ToStr(html));
+    if (!ok || !creator.Finish()) {
+        return false;
+    }
+    AutoDelete doc(EpubDoc::CreateFromData(ToStr(zip)));
+    if (!doc) {
+        return false;
+    }
+
+    Str s = ToStr(doc->htmlData);
+    int first = str::IndexOf(s, StrL("BEPAGE"));
+    if (first < 0) {
+        return false;
+    }
+    Str rest = Str(s.s + first + 1, len(s) - first - 1);
+    return str::IndexOf(rest, StrL("BEPAGE")) >= 0;
 }
 
 // issue #5846: consecutive ../../ must fully resolve

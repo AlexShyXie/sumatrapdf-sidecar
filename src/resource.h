@@ -24,12 +24,13 @@
 #define IDC_PRINT_ROTATE_LABEL 1068
 #define IDC_PRINT_ROTATE 1069
 #define IDC_SECTION_PRINT_COMPATIBILITY 1070
+#define IDC_PRINT_AUTO_ROTATE 1071
 #define IDB_RELOADING_CUE 2010
 
 #define IDC_STATIC (-1)
 
 // LzSA archive with everything embedded in the exe: translations.txt,
-// marked.min.js, mermaid.min.js, fonts\* (mupdf's built-in fonts), in-app
+// markdown-it.min.js, pele.min.js, fonts\* (mupdf's built-in fonts), in-app
 // manual and (non-static builds only)
 // the installer payload: libsumatrapdf.dll, PdfFilter.dll, PdfPreview.dll,
 // sumatrapdf-tool.exe. Packed by cmd/pack-embedded-prebuild.cmd.

@@ -27,6 +27,7 @@
 #include "MainWindow.h"
 #include "DisplayModel.h"
 #include "Favorites.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Commands.h"
 #include "Translations.h"
@@ -240,7 +241,7 @@ void ExpandTocToCurrentPage(MainWindow* win) {
     }
     // make sure the bookmarks (table of contents) sidebar is visible
     if (!win->uiState.tocVisible) {
-        SetSidebarVisibility(win, true, gSettings->showFavorites);
+        SetTocVisibility(win, true);
     }
     TocTree* tm = CurrentTocTree(win);
     if (!win->tocLoaded || !win->uiState.tocVisible || !tm) {
@@ -372,6 +373,25 @@ void TocCollapseSameLevel(MainWindow* win, TocItem* ti) {
     AppShellInvalidate(win);
 }
 
+// Expand `ti` and everything under it, leaving other chapters alone.
+void TocExpandChapter(MainWindow* win, TocItem* ti) {
+    if (!ti) {
+        return;
+    }
+    SetExpanded(ti, true);
+    ExpandAllRec(ti->child, true);
+    AppShellInvalidate(win);
+}
+
+void TocCollapseChapter(MainWindow* win, TocItem* ti) {
+    if (!ti) {
+        return;
+    }
+    SetExpanded(ti, false);
+    ExpandAllRec(ti->child, false);
+    AppShellInvalidate(win);
+}
+
 // --- context menu -----------------------------------------------------------
 
 // ng: orig builds an HMENU and tracks it; the pane builds a gpui PopupMenu from
@@ -384,6 +404,10 @@ MenuModel* BuildTocContextMenu(MainWindow* win, TocItem* dti) {
         pageNo = PageDestGetPageNo(dest);
     }
     MenuModel* popup = BuildMenuFromDef(menuDefContextToc, nullptr);
+    if (!dti || !dti->child) {
+        MenuRemove(popup, CmdTocExpandChapter);
+        MenuRemove(popup, CmdTocCollapseChapter);
+    }
 
     Kind destKind = dest ? dest->GetKind() : nullptr;
     if (destKind == kindDestinationLaunchEmbedded) {
@@ -509,6 +533,12 @@ void TocContextMenuCommand(MainWindow* win, TocItem* dti, int cmd) {
         case CmdTocCollapseSameLevel:
             TocCollapseSameLevel(win, dti);
             break;
+        case CmdTocExpandChapter:
+            TocExpandChapter(win, dti);
+            break;
+        case CmdTocCollapseChapter:
+            TocCollapseChapter(win, dti);
+            break;
         case CmdExpandToCurrentPage:
             ExpandTocToCurrentPage(win);
             break;
@@ -525,12 +555,10 @@ void TocContextMenuCommand(MainWindow* win, TocItem* dti, int cmd) {
             OpenEmbeddedFile(win->CurrentTab(), dest);
             break;
         case CmdSaveAttachment:
-            // hack: the attachment number is saved in pageNo, see
-            // PdfLoadAttachments and DestFromAttachment
-            SaveAttachment(win->CurrentTab(), dest->GetName(), pageNo);
+            SaveAttachment(win->CurrentTab(), dest->GetName(), ((PageDestination*)dest)->attachmentNo);
             break;
         case CmdOpenAttachment:
-            OpenAttachment(win->CurrentTab(), dest->GetName(), pageNo);
+            OpenAttachment(win->CurrentTab(), dest->GetName(), ((PageDestination*)dest)->attachmentNo);
             break;
         default:
             break;

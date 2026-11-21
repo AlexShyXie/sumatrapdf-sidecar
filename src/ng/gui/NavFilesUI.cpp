@@ -33,12 +33,14 @@
 #include "Theme.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Tabs.h"
 #include "SvgIcons.h"
 #include "TipMarkup.h"
 #include "FilterHighlightDraw.h"
 #include "AIChatPanel.h"
+#include "base/DirScan.h"
 #include "NavFilesInFolder.h"
 #include "gui/AppShell.h"
 #include "SumatraDialogs.h"
@@ -46,6 +48,7 @@
 #include "gui/ToolWindow.h"
 #include "gui/NavFilesUI.h"
 #include "AppHelpersCommon.h"
+#include "NavFilesInFolderCommon.h"
 
 #include "SumatraLog.h"
 
@@ -56,8 +59,6 @@ enum NavBtn {
     NavBtnHome,
     NavBtnCount
 };
-
-constexpr int kNavHistoryMax = 100;
 
 // Clear: show ".." alone until the listing arrives (new folder).
 // Keep: leave the current listing on screen while it is re-read (F5,
@@ -171,10 +172,6 @@ static ToolWindow* gNavTw = nullptr;
 // next file it is asked to open has nowhere to go and closes it. Set while
 // the window it was opened from is gone (it is drawn for another one then)
 static bool gNavOwnerGone = false;
-// dirs visited ("" for home), kept for the whole session so a re-opened
-// window can still go Back to where the previous one was
-static StrVec gNavHistory;
-static int gNavHistIdx = -1;
 
 // ng: the picker outlives a file being opened, so the window it sits in can be
 // gone by the time a scan or a save prompt comes back
@@ -302,10 +299,6 @@ void CloseNavFilesInFolder() {
     if (IsMainWindowValidAndNotClosing(win)) {
         AppShellFocusFrame(win);
     }
-}
-
-bool IsNavFilesInFolderVisible() {
-    return gNav.visible;
 }
 
 // ng: orig's picker is a window of its own and outlives the main one; so does
@@ -634,19 +627,9 @@ static void SetDir(Str dir, Str selectPath, int selectIdx = -1, NavListReset res
     NavInvalidate();
 }
 
-// show dir and record it in the session history, dropping the forward entries
+// show dir and record it in the session history
 static void Navigate(Str dir, Str selectPath = {}) {
-    bool same = gNavHistIdx >= 0 && str::EqI(gNavHistory[gNavHistIdx], dir);
-    if (!same) {
-        while (len(gNavHistory) > gNavHistIdx + 1) {
-            gNavHistory.RemoveAt(len(gNavHistory) - 1);
-        }
-        if (len(gNavHistory) >= kNavHistoryMax) {
-            gNavHistory.RemoveAt(0);
-        }
-        gNavHistory.Append(dir);
-        gNavHistIdx = len(gNavHistory) - 1;
-    }
+    NavHistoryPush(dir);
     SetDir(dir, selectPath);
 }
 
@@ -657,7 +640,7 @@ static void RefreshList() {
     TempStr sel = SelectedPathTemp();
     int selIdx = -1;
     // listing still in flight: keep the file we meant to select
-    if (len(sel) == 0 && len(gNav.pendingSelectPath) > 0) {
+    if (len(sel) == 0 && gNav.scanInFlight && len(gNav.pendingSelectPath) > 0) {
         sel = str::DupTemp(gNav.pendingSelectPath);
     } else if (len(sel) == 0 && gNav.scanInFlight) {
         selIdx = gNav.pendingSelectIdx;
@@ -667,10 +650,9 @@ static void RefreshList() {
 }
 
 static void GoHome() {
-    if (IsHome()) {
-        return;
+    if (!IsHome()) {
+        Navigate(Str{});
     }
-    Navigate(Str{});
 }
 
 // from a root directory (C:\) Up goes to the home view
@@ -1177,7 +1159,7 @@ void NavFilesView::OnClose(NavFilesView*, gp::Ctx* cx, const gp::ClickEvent*) {
 // what the panel may take without leaving the canvas less than kMinDocCanvasDx
 static int NavMaxDx(MainWindow* win) {
     int sidebarDx = 0;
-    if (win->uiState.tocVisible || win->uiState.favVisible) {
+    if ((win->uiState.tocVisible || win->uiState.favVisible) && !AppShellSidebarFloats(win)) {
         sidebarDx = win->sidebarDx + kSplitterDx;
     }
     int avail = win->frameRc.dx - sidebarDx - AIChatPanelDx(win) - kMinDocCanvasDx - kSplitterDx;
@@ -1746,6 +1728,21 @@ TempStr NavFilesInFolderStateTemp(Str action, int idx, int* exitCodeOut) {
             *exitCodeOut = 0;
         }
         return fmt("OK %d %d %d %d", (int)r.x, (int)r.y, (int)r.w, (int)r.h);
+    } else if (str::Eq(action, StrL("list-screen-rect"))) {
+        // where a test must touch to pan the list (screen pixels)
+        if (exitCodeOut) {
+            *exitCodeOut = 0;
+        }
+        gp::Bounds r = gNav.listBounds;
+#if OS_WIN
+        HWND hwnd = gNavTw ? ToolWindowHwnd(gNavTw) : AppShellNativeHwnd(gNav.win);
+        float scale = (float)DpiGetForHwnd(hwnd) / 96.f;
+        POINT pt{(int)(r.x * scale), (int)(r.y * scale)};
+        ClientToScreen(hwnd, &pt);
+        return fmt("OK %d %d %d %d", (int)pt.x, (int)pt.y, (int)(r.w * scale), (int)(r.h * scale));
+#else
+        return fmt("OK %d %d %d %d", (int)r.x, (int)r.y, (int)r.w, (int)r.h);
+#endif
     } else if (str::Eq(action, StrL("edit-path")) || str::TrimPrefix(action, StrL("path-"))) {
         // path editing: edit-path, path-text:<text>, path-commit, path-cancel,
         // path-state (report only)
@@ -1805,7 +1802,7 @@ TempStr NavFilesInFolderStateTemp(Str action, int idx, int* exitCodeOut) {
     int filterFocused = IsNavInputFocused(gNav.filterEdit);
     return fmt(
         "OK scan=%d sel=%d items=%d back=%d fwd=%d dir=\"%s\" name=\"%s\" keyboard=%d dx=%d filter=\"%s\" "
-        "filterFocused=%d",
+        "filterFocused=%d scrollY=%d",
         (int)gNav.scanInFlight, sel, len(gNav.entries), canBack, canFwd, gNav.currDir, name, (int)gNav.hasKeyboard,
-        NavFilesPanelDx(gNav.win), filter, filterFocused);
+        NavFilesPanelDx(gNav.win), filter, filterFocused, (int)gNav.scrollY);
 }

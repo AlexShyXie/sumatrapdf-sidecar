@@ -41,70 +41,6 @@
 
 constexpr int kFindWinMinEditDx = 48;
 
-namespace {
-
-// exact-width box: the child is constrained to `dx`
-struct FindFixedDx : ILayout {
-    ILayout* child = nullptr;
-    int dx = 0;
-
-    FindFixedDx(ILayout* c, int dxIn);
-    ~FindFixedDx() override;
-
-    Size Layout(Constraints bc) override;
-    int MinIntrinsicHeight(int width) override;
-    int MinIntrinsicWidth(int height) override;
-    void SetBounds(Rect) override;
-    int LayoutChildCount() override;
-    ILayout* LayoutChildAt(int) override;
-};
-
-FindFixedDx::FindFixedDx(ILayout* c, int dxIn) {
-    child = c;
-    dx = dxIn;
-}
-
-FindFixedDx::~FindFixedDx() {
-    delete child;
-}
-
-int FindFixedDx::LayoutChildCount() {
-    return child ? 1 : 0;
-}
-
-ILayout* FindFixedDx::LayoutChildAt(int) {
-    return child;
-}
-
-int FindFixedDx::MinIntrinsicWidth(int) {
-    return dx;
-}
-
-int FindFixedDx::MinIntrinsicHeight(int width) {
-    return child ? child->MinIntrinsicHeight(width) : 0;
-}
-
-Size FindFixedDx::Layout(const Constraints bc) {
-    int w = MinIntrinsicWidth(0);
-    if (bc.min.dx > w) {
-        w = bc.min.dx;
-    }
-    if (bc.HasBoundedWidth() && bc.max.dx < w) {
-        w = bc.max.dx;
-    }
-    Size s = child ? child->Layout(bc.TightenWidth(w)) : Size{};
-    return {w, s.dy};
-}
-
-void FindFixedDx::SetBounds(Rect r) {
-    lastBounds = r;
-    if (child) {
-        child->SetBounds(r);
-    }
-}
-
-} // namespace
-
 struct FindWindowWnd;
 
 struct DeferredGoToFindMatchData {
@@ -133,8 +69,8 @@ struct FindWindowWnd : WindowBase {
     // the status text, the buttons and the results list are virtual controls;
     // the search fields are HWND children. Owned by `layout` once built
     VirtText* status = nullptr;
-    FindFixedDx* statusBox = nullptr;
-    FindFixedDx* pagesBox = nullptr;
+    MinDxBox* statusBox = nullptr;
+    MinDxBox* pagesBox = nullptr;
     HBox* toolsLayout = nullptr;
     Wrap* headerLayout = nullptr;
     Spacer* pagesLabelGap = nullptr;
@@ -182,8 +118,6 @@ struct FindWindowWnd : WindowBase {
     void SaveSelectedMatch();
     bool MoveResultSelection(WPARAM vkey);
     void FindNextOrPrev(bool forward);
-    int CurrentMatchIndex();         // list index of the document's current match, or -1
-    int FirstMatchFromCurrentPage(); // list index of the first match at/after the current page
 
     void OnSize(WindowBase::SizeEvent* ev);
     void OnDpiChanged(WindowBase::DpiChangedEvent* ev);
@@ -195,7 +129,8 @@ struct FindWindowWnd : WindowBase {
 
 static void DeferredGoToFindMatch(DeferredGoToFindMatchData* d) {
     AutoDelete del(d);
-    if (!IsMainWindowValidAndNotClosing(d->win) || !d->findWindow) {
+    // the find window can be closed or replaced while the window lives on
+    if (!IsMainWindowValidAndNotClosing(d->win) || !d->findWindow || d->findWindow != d->win->findWindow) {
         return;
     }
     if (d->epoch != d->findWindow->pendingNavEpoch) {
@@ -205,7 +140,7 @@ static void DeferredGoToFindMatch(DeferredGoToFindMatchData* d) {
 }
 
 // append a command's keyboard shortcut to its tooltip, e.g. "Find Next (F3)"
-static TempStr AppendCmdAccel(Str base, int cmd) {
+TempStr AppendCmdAccel(Str base, int cmd) {
     TempStr accel = AppendAccelKeyToMenuStringTemp({}, cmd);
     if (len(accel) == 0) {
         return base;
@@ -235,14 +170,21 @@ FindWindowWnd::~FindWindowWnd() {
 
 // the pixmaps belong to the icon cache, which re-renders them for the current
 // theme and size
+// the window's buttons, in order; btns[], the icons and these must line up
+constexpr int kFindWinBtnCmds[] = {CmdFindPrev, CmdFindNext, CmdFindToggleMatchCase, CmdFindToggleMatchWholeWord,
+                                   kFindWinPinCmdId};
+constexpr int kFindWinBtnCount = dimof(kFindWinBtnCmds);
+static_assert(dimof(FindWindowWnd::btns) == kFindWinBtnCount);
+
 void FindWindowWnd::UpdateButtonIcons(int dpi) {
-    static const char* icons[5] = {gIconChevronUp, gIconChevronDown, gIconMatchCase, gIconMatchWholeWord,
-                                   gIconArrowsDiagonalMinimize};
+    static const char* icons[] = {gIconChevronUp, gIconChevronDown, gIconMatchCase, gIconMatchWholeWord,
+                                  gIconArrowsDiagonalMinimize};
     if (dpi <= 0) {
         dpi = GetDpi();
     }
     int isz = RoundUp(DpiScaleByDpi(dpi, 16), 4);
-    for (int i = 0; i < 5; i++) {
+    static_assert(dimof(icons) == kFindWinBtnCount);
+    for (int i = 0; i < kFindWinBtnCount; i++) {
         if (btns[i]) {
             btns[i]->pixmap = GetCachedPixmapForSvg(Str(icons[i]), isz, isz);
         }
@@ -258,10 +200,9 @@ static void FindWindowButtonClicked(FindWindowWnd* w, VirtMouseEvent* ev) {
 }
 
 void FindWindowWnd::CreateButtons() {
-    static const int cmds[5] = {CmdFindPrev, CmdFindNext, CmdFindToggleMatchCase, CmdFindToggleMatchWholeWord,
-                                kFindWinPinCmdId};
+    const int* cmds = kFindWinBtnCmds;
     int pad = DpiScale(4);
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < kFindWinBtnCount; i++) {
         auto* b = new VirtIconButton();
         b->id = cmds[i];
         b->padding = Insets{pad, pad, pad, pad};
@@ -395,7 +336,7 @@ void FindWindowWnd::BuildLayout() {
     toolsLayout = tools;
     tools->alignCross = CrossAxisAlign::CrossCenter;
     tools->gap = status->font->averageCharWidth;
-    statusBox = new FindFixedDx(status, FindStatusDx(status->font, 0, false));
+    statusBox = new MinDxBox(status, FindStatusDx(status->font, 0, false));
     tools->AddChild(statusBox);
     for (VirtIconButton* b : btns) {
         tools->AddChild(b);
@@ -414,7 +355,7 @@ void FindWindowWnd::BuildLayout() {
     pagesRow->AddChild(pagesLabel);
     pagesLabelGap = new Spacer(gap, 0);
     pagesRow->AddChild(pagesLabelGap);
-    pagesBox = new FindFixedDx(editPages, pagesDx);
+    pagesBox = new MinDxBox(editPages, pagesDx);
     pagesRow->AddChild(pagesBox);
 
     auto* vbox = new VBox();
@@ -526,7 +467,7 @@ void FindWindowWnd::RefreshResults(bool allowNavigation) {
         savedSelGlyph = -1;
     }
     if (sel < 0) {
-        sel = CurrentMatchIndex();
+        sel = FindCurrentMatchIndex(win);
     }
     if (sel >= 0) {
         // the document already sits on a match (find-as-you-type found it): just
@@ -537,7 +478,7 @@ void FindWindowWnd::RefreshResults(bool allowNavigation) {
         // so the document isn't on a match. Drive selection + navigation off the
         // full count instead: go to the first match at/after the current page,
         // like find-as-you-type would have.
-        sel = FirstMatchFromCurrentPage();
+        sel = FindFirstMatchFromPage(win);
         results->SetCurrentSelection(sel);
         // streamed partial updates must not navigate: OnResultSelected joins
         // the in-flight count worker (GoToFindMatch), which would cancel the
@@ -584,7 +525,8 @@ void FindWindowWnd::DrawResultItem(VirtListBox::DrawItemEvent* ev) {
     // stays stable while the window is resized; long snippets ellipsize into it
     // instead of fighting a per-row measured width (#5692 / #5796).
     const FindMatch& fm = win->findMatches[ev->itemIndex];
-    TempStr pageStr = fmt("%s", win->ctrl->GetPageLabeTemp(fm.startPage));
+    // ctrl is null between closing a document and loading the next one in the tab
+    TempStr pageStr = win->ctrl ? fmt("%s", win->ctrl->GetPageLabeTemp(fm.startPage)) : TempStr{};
     int pageGap = DpiScale(10);
     int pageColDx = DpiScale(40);
     Size pageSize = gfx->MeasureText(pageStr, lb->font);
@@ -657,49 +599,6 @@ void FindWindowWnd::SaveSelectedMatch() {
     savedSelGlyph = fm.startGlyph;
 }
 
-// list index of the match the document is currently on (so the selection can
-// track the current match), or -1 if it isn't in the list
-int FindWindowWnd::CurrentMatchIndex() {
-    if (win->ctrl && win->ctrl->CanFindInPage()) {
-        // tracked by the browser (chm / markdown) webview find (see
-        // SearchAndDDE.cpp BrowserFind*)
-        return win->browserFindCurrent;
-    }
-    DisplayModel* dm = win->AsFixed();
-    if (!dm || !dm->textSearch || dm->textSearch->result.len == 0) {
-        return -1;
-    }
-    return FindMatchIndex(win, dm->textSearch->startPage, dm->textSearch->startGlyph);
-}
-
-// first match at/after the current page, wrapping to the start of the document
-// if there is none: the match with the smallest forward page distance from the
-// current page (the list itself is in document order)
-int FindWindowWnd::FirstMatchFromCurrentPage() {
-    int n = len(win->findMatches);
-    if (n == 0) {
-        return -1;
-    }
-    int curPage = win->ctrl ? win->ctrl->CurrentPageNo() : 1;
-    int nPages = win->ctrl ? win->ctrl->PageCount() : 1;
-    int best = 0;
-    int bestDist = INT_MAX;
-    for (int i = 0; i < n; i++) {
-        int dist = win->findMatches[i].startPage - curPage;
-        if (dist < 0) {
-            dist += nPages;
-        }
-        if (dist < bestDist) {
-            bestDist = dist;
-            best = i;
-            if (dist == 0) {
-                break; // first match on the current page
-            }
-        }
-    }
-    return best;
-}
-
 // move the results-list selection (keyboard arrows or the Next/Prev buttons)
 // while focus stays in the search edit, navigating to the newly selected match.
 // Returns false (not handled) when there are no results, so the caller can fall
@@ -715,7 +614,7 @@ bool FindWindowWnd::MoveResultSelection(WPARAM vkey) {
     constexpr int kPage = 10;
     int cur = results->GetCurrentSelection();
     if (cur < 0) {
-        cur = CurrentMatchIndex(); // start from where the document already is
+        cur = FindCurrentMatchIndex(win); // start from where the document already is
     }
     int idx;
     switch (vkey) {
@@ -811,26 +710,11 @@ void FindWindowWnd::UpdateTheme() {
 }
 
 void FindWindowWnd::OnTextChanged() {
-    if (suppressTextChanged) {
-        return;
-    }
-    OnFindBarTextChanged(win);
+    FindTextChanged(win, suppressTextChanged);
 }
 
-// picking an entry out of the open history list is a search request; walking
-// the list with the arrow keys only fills the box, and waits for Enter
 void FindWindowWnd::OnHistoryCommitted() {
-    if (suppressTextChanged || !edit) {
-        return;
-    }
-    int idx = CbGetCurrentSelection(edit);
-    if (idx < 0 || idx >= len(edit->items)) {
-        return;
-    }
-    // Take the term from the list item, not the edit: a combo box has not
-    // necessarily copied the picked item into its edit yet when it says the
-    // list closed.
-    StartPickedFindTerm(win, edit->items[idx]);
+    FindHistoryCommitted(win, edit, suppressTextChanged);
 }
 
 void FindWindowWnd::OnSize(WindowBase::SizeEvent* ev) {
@@ -855,17 +739,7 @@ void FindWindowWnd::OnSize(WindowBase::SizeEvent* ev) {
 void FindWindowWnd::OnDpiChanged(WindowBase::DpiChangedEvent* ev) {
     // Don't apply the suggested rect until Create() finished: it would pin the
     // still-hidden popup to the primary monitor (#5998).
-    if (!layout) {
-        ev->didHandle = true;
-        return;
-    }
-    RECT* r = ev->suggested;
-    if (r) {
-        SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-    UpdateDpi((int)ev->dpiX);
-    ev->didHandle = true;
+    HandleDpiChanged(this, ev);
 }
 
 void FindWindowWnd::OnGetMinMaxInfo(WindowBase::GetMinMaxInfoEvent* ev) {
@@ -1035,6 +909,13 @@ static void PositionFindWindow(FindWindowWnd* w) {
 }
 
 void ShowFindWindow(MainWindow* win) {
+    // hiding the bar aborts a running search or count (e.g. -search); restart below
+    bool wasFinding = win->findThread != nullptr;
+    bool wasCounting = win->findCountThread != nullptr;
+    // one find UI at a time: SearchUIFloating can change while the bar is up
+    if (IsFindBarVisible(win)) {
+        HideFindBar(win);
+    }
     // Capture before we re-point findEdit at this window's (possibly empty) edit.
     // CLI -search writes the term into the hidden compact bar; without this the
     // floating window opens with a blank box and empty result rows (#6055).
@@ -1068,6 +949,12 @@ void ShowFindWindow(MainWindow* win) {
     // populate the results list: show what's cached, and (re)run the search for
     // the current term so snippets get built now that the window is visible
     w->RefreshResults();
+    if (wasFinding && !win->findThread && len(term) > 0) {
+        FindTextOnThread(win, TextSearch::Direction::Forward, term, true, true);
+    }
+    if (wasCounting && !win->findCountThread) {
+        EnsureFindSnippets(win);
+    }
     // a CLI/DDE search still running fills the list itself: FindEndTask ->
     // UpdateMatchCount requests snippets now that the window is visible
     if (CbGetTextLen(win->findEdit) == 0 || win->findThread) {
@@ -1128,6 +1015,8 @@ void FindWindowSetStatus(MainWindow* win, Str s, int totalHits) {
 // idx into FindWindowWnd::btns
 constexpr int kBtnMatchCase = 2;
 constexpr int kBtnMatchWholeWord = 3;
+static_assert(kFindWinBtnCmds[kBtnMatchCase] == CmdFindToggleMatchCase);
+static_assert(kFindWinBtnCmds[kBtnMatchWholeWord] == CmdFindToggleMatchWholeWord);
 
 static void FindWindowSetBtnChecked(MainWindow* win, int idx, bool checked) {
     if (!win->findWindow) {
@@ -1302,8 +1191,9 @@ TempStr FindWindowContentsResultTemp(int* exitCodeOut) {
     ShowFindWindow(win);
 
     TempStr term = win->findEdit ? win->findEdit->GetTextTemp() : TempStr{};
+    // a [Search] or -search fills the box only once its search got going
     if (len(term) == 0) {
-        return fail(StrL("ERROR empty-term"));
+        return fail(StrL("NOTREADY empty-term"));
     }
     if (win->findThread || win->findCountThread || !win->findCountValid || !win->findCountHasSnippets) {
         return fail(StrL("NOTREADY snippets"));

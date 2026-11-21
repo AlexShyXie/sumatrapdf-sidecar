@@ -17,6 +17,7 @@
 #include "DisplayModel.h"
 #include "Theme.h"
 #include "FindBar.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "MainWindow.h"
 #include "SumatraPDF.h"
@@ -66,12 +67,13 @@ void StopMiddleClickScroll(MainWindow* win) {
 // ng: orig arms / kills a 10 ms WM_TIMER; the shell ticks unconditionally, so
 // "armed" is just the per-tab state the tick reads. What is left of the two is
 // resetting the time base and the sub-pixel accumulator.
-void ArmReadingTimer(MainWindow*, WindowTab* tab) {
+void ArmReadingTimer(MainWindow* win, WindowTab* tab) {
     if (!tab) {
         return;
     }
     tab->autoScroll.lastQpc = 0;
     tab->autoScroll.accum = 0;
+    AppShellRequestFastTick(win);
 }
 
 void KillReadingTimer(MainWindow*) {}
@@ -134,7 +136,7 @@ void ReadingAutoScrollView::OnSpeed(ReadingAutoScrollView* self, gp::Ctx* cx, co
     }
     int idx = limitValue((int)(bar->speedSlider.value.End() + 0.5f), 0, SpeedCount() - 1);
     bar->sliderIdx = idx;
-    SetSpeed(kSpeeds[idx]);
+    SetSpeed(SessionTab(win), kSpeeds[idx]);
     gp::Notify(cx);
 }
 
@@ -165,14 +167,7 @@ void ReadingAutoScrollView::OnSpeedMove(ReadingAutoScrollView* self, gp::Ctx* cx
 }
 
 void ReadingAutoScrollView::OnSpeedHover(ReadingAutoScrollView* self, gp::Ctx* cx, const gp::HoverEvent* ev) {
-    if (ev->hovered) {
-        return;
-    }
-    if (BarWindowOf(self->win, cx)) {
-        HoverTooltipHideIn(self->win->gpuiWin);
-        return;
-    }
-    HoverTooltipHide(cx);
+    HoverTooltipHideBar(self->win->gpuiWin, ev->hovered, BarWindowOf(self->win, cx) != nullptr, cx);
 }
 
 ReadingAutoScrollBar* BarEnsure(MainWindow* win) {
@@ -181,8 +176,8 @@ ReadingAutoScrollBar* BarEnsure(MainWindow* win) {
     }
     if (!win->readingAutoScrollBar) {
         auto* bar = new ReadingAutoScrollBar();
-        bar->speedSlider =
-            gp::SliderStateNew(0, (float)(SpeedCount() - 1), gp::SliderSingle((float)ClosestSpeedIdx(CurrentSpeed())));
+        bar->speedSlider = gp::SliderStateNew(0, (float)(SpeedCount() - 1),
+                                              gp::SliderSingle((float)ClosestSpeedIdx(CurrentSpeed(SessionTab(win)))));
         win->readingAutoScrollBar = bar;
     }
     return win->readingAutoScrollBar;
@@ -309,14 +304,14 @@ static gp::El* BarRowBuild(MainWindow* win, gp::Ctx* cx, bool ownWindow) {
     // a speed set from a key / command has to reach the slider, but not while
     // the user is dragging it (orig's VirtSlider::IsAdjusting)
     if (!bar->speedSlider.dragging) {
-        int idx = ClosestSpeedIdx(CurrentSpeed());
+        int idx = ClosestSpeedIdx(CurrentSpeed(SessionTab(win)));
         if (idx != bar->sliderIdx) {
             bar->sliderIdx = idx;
             gp::SliderSetValue(&bar->speedSlider, gp::SliderSingle((float)idx));
         }
     }
 
-    bool paused = tab->autoScroll.paused || tab->autoScroll.atEnd;
+    bool paused = tab->autoScroll.IsStopped();
     float margin = (float)DpiScale(kBarMargin);
     float gap = (float)DpiScale(kBtnGap);
     const gp::Theme& th = gp::ThemeNow(cx->app);
@@ -389,9 +384,9 @@ TempStr ReadingAutoScrollBarStateTemp(int* exitCodeOut) {
     hwnd = (int)(uintptr_t)MainWindowHwnd(win);
 #endif
     out.Append(fmt("OK visible=1 paused=%d atEnd=%d dir=%d speed=%d scrollY=%d page=%d pages=%d hwnd=%d\n",
-                   (int)tab->autoScroll.paused, (int)tab->autoScroll.atEnd, tab->autoScroll.dir,
-                   (int)(CurrentSpeed() + 0.5f), scrollY, page, pages, hwnd));
-    out.Append(fmt("speedIdx=%d speedCount=%d label=%s\n", ClosestSpeedIdx(CurrentSpeed()), SpeedCount(),
+                   (int)tab->autoScroll.IsStopped(), (int)(tab->autoScroll.stop == AutoScrollStop::AtEnd),
+                   tab->autoScroll.dir, (int)(CurrentSpeed(tab) + 0.5f), scrollY, page, pages, hwnd));
+    out.Append(fmt("speedIdx=%d speedCount=%d label=%s\n", ClosestSpeedIdx(CurrentSpeed(tab)), SpeedCount(),
                    SpeedLabelTemp(tab)));
     out.Append(fmt("status=%s\n", StatusTextTemp(tab)));
     return finish(0);

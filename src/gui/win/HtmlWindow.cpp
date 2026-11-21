@@ -274,12 +274,7 @@ class HW_IInternetProtocolInfo : public IInternetProtocolInfo {
 };
 
 ULONG STDMETHODCALLTYPE HW_IInternetProtocolInfo::Release() {
-    LONG res = InterlockedDecrement(&refCount);
-    ReportIf(res < 0);
-    if (0 == res) {
-        delete this;
-    }
-    return res;
+    return ComRelease(&refCount, [this] { delete this; });
 }
 
 STDMETHODIMP HW_IInternetProtocolInfo::QueryInterface(REFIID riid, void** ppv) {
@@ -323,12 +318,7 @@ class HW_IInternetProtocol : public IInternetProtocol {
 };
 
 ULONG STDMETHODCALLTYPE HW_IInternetProtocol::Release() {
-    LONG res = InterlockedDecrement(&refCount);
-    ReportIf(res < 0);
-    if (0 == res) {
-        delete this;
-    }
-    return res;
+    return ComRelease(&refCount, [this] { delete this; });
 }
 
 STDMETHODIMP HW_IInternetProtocol::QueryInterface(REFIID riid, void** ppv) {
@@ -487,12 +477,7 @@ class HW_IInternetProtocolFactory : public IClassFactory {
 };
 
 STDMETHODIMP_(ULONG) HW_IInternetProtocolFactory::Release() {
-    LONG res = InterlockedDecrement(&refCount);
-    ReportIf(res < 0);
-    if (0 == res) {
-        delete this;
-    }
-    return res;
+    return ComRelease(&refCount, [this] { delete this; });
 }
 
 STDMETHODIMP HW_IInternetProtocolFactory::QueryInterface(REFIID riid, void** ppv) {
@@ -1148,12 +1133,7 @@ ULONG STDMETHODCALLTYPE HtmlMoniker::AddRef() {
 }
 
 ULONG STDMETHODCALLTYPE HtmlMoniker::Release() {
-    LONG res = InterlockedDecrement(&refCount);
-    ReportIf(res < 0);
-    if (0 == res) {
-        delete this;
-    }
-    return res;
+    return ComRelease(&refCount, [this] { delete this; });
 }
 
 // The window that renders the page and processes its input. It sits under
@@ -1314,10 +1294,6 @@ bool HtmlWindow::CreateBrowser() {
         if (FAILED(hr)) {
             return false;
         }
-#if 0 // is this necessary?
-        hr = oleObject->DoVerb(OLEIVERB_SHOW, 0, fs->oleClientSite, 0,
-                hwnd, &rc);
-#endif
     }
 
     if (!setClientSiteFirst) {
@@ -1959,12 +1935,7 @@ STDMETHODIMP FrameSite::QueryInterface(REFIID riid, void** ppv) {
 }
 
 ULONG STDMETHODCALLTYPE FrameSite::Release() {
-    LONG res = InterlockedDecrement(&refCount);
-    ReportIf(res < 0);
-    if (0 == res) {
-        delete this;
-    }
-    return res;
+    return ComRelease(&refCount, [this] { delete this; });
 }
 
 // IDispatch
@@ -2029,16 +2000,6 @@ HRESULT HW_DWebBrowserEvents2::Invoke(DISPID dispIdMember, __unused REFIID riid,
             *pDispParams->rgvarg[0].pboolVal = shouldCancel ? VARIANT_TRUE : VARIANT_FALSE;
             break;
         }
-
-#if 0
-        case DISPID_PROGRESSCHANGE:
-        {
-            long current = pDispParams->rgvarg[1].lVal;
-            long maximum = pDispParams->rgvarg[0].lVal;
-            fs->htmlWindow->OnProgressURL(current, maximum);
-            break;
-        }
-#endif
 
         case DISPID_DOCUMENTCOMPLETE: {
             // TODO: there are complexities related to multi-frame documents. This
@@ -2172,16 +2133,6 @@ HRESULT HW_IOleInPlaceSiteWindowless::GetDC(__unused LPCRECT pRect, __unused DWO
         return E_INVALIDARG;
     }
 
-#if 0
-    if (grfFlags & OLEDC_NODRAW)
-    {
-        *phDC = mfs->hDCBuffer;
-        return S_OK;
-    }
-
-    if (fs->hDCBuffer != nullptr)
-        return E_UNEXPECTED;
-#endif
     return E_NOTIMPL;
 }
 

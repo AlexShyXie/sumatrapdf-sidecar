@@ -13,6 +13,7 @@
 #include "EngineBase.h"
 #include "DisplayModel.h"
 #include "Theme.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "MainWindow.h"
 #include "SumatraPDF.h"
@@ -28,17 +29,6 @@ static Vec<OverlayScrollbar*> gAllScrollbars;
 // ng: the bar that has the mouse (orig's SetCapture) for a thumb drag or an
 // auto-repeat
 static OverlayScrollbar* gCapture = nullptr;
-
-// ng: win32's MulDiv (a * b / c, rounded) for a positive c; the other
-// platforms have none
-static int MulDivI(int a, int b, int c) {
-    if (c <= 0) {
-        return -1;
-    }
-    i64 n = (i64)a * (i64)b;
-    n = n >= 0 ? n + (c / 2) : n - (c / 2);
-    return (int)(n / c);
-}
 
 static bool IsLive(OverlayScrollbar* sb) {
     if (!sb) {
@@ -69,38 +59,6 @@ Rect ClientRect(OverlayScrollbar* sb) {
     return Rect(0, 0, sb->clientDx, sb->clientDy);
 }
 
-static int ThumbLen(OverlayScrollbar* sb, int trackLen) {
-    int range = sb->nMax - sb->nMin + 1;
-    int thumbLen = MulDivI(trackLen, sb->nPage, std::max(range, 1));
-    return std::max(thumbLen, DpiScale(kMinThumbSize));
-}
-
-// Calculate thumb rect within the track
-static Rect GetThumbRect(OverlayScrollbar* sb) {
-    Rect track = GetTrackRect(sb);
-    int range = sb->nMax - sb->nMin + 1;
-    if (range <= 0 || sb->nPage >= range) {
-        return track;
-    }
-
-    int trackLen = IsVert(sb) ? track.dy : track.dx;
-    int thumbLen = ThumbLen(sb, trackLen);
-
-    int scrollableTrack = trackLen - thumbLen;
-    int scrollableRange = range - sb->nPage;
-    int pos = sb->isDragging ? sb->nTrackPos : sb->nPos;
-    int thumbOffset = 0;
-    if (scrollableRange > 0) {
-        thumbOffset = MulDivI(pos - sb->nMin, scrollableTrack, scrollableRange);
-    }
-    thumbOffset = limitValue(thumbOffset, 0, std::max(0, scrollableTrack));
-
-    if (IsVert(sb)) {
-        return {track.x, track.y + thumbOffset, track.dx, thumbLen};
-    }
-    return {track.x + thumbOffset, track.y, thumbLen, track.dy};
-}
-
 static void SendScrollMsg(OverlayScrollbar* sb, ScrollMsg msg) {
     if (sb->onScroll) {
         sb->onScroll(sb->win, sb, msg);
@@ -122,7 +80,10 @@ void SetState(OverlayScrollbar* sb, State newState) {
     if (!IsVisible(sb)) {
         sb->mouseOverThumb = false;
     }
-    sb->hideLeftMs = (newState == State::SmartThin) ? sb->showAfterScrollMs : 0;
+    sb->autoHide.Cancel();
+    if (newState == State::SmartThin) {
+        sb->autoHide.Arm(sb->showAfterScrollMs);
+    }
     PaintScrollbar(sb);
 }
 
@@ -142,7 +103,7 @@ void RestartSmartThinAutoHide(OverlayScrollbar* sb) {
     if (sb->state != State::SmartThin) {
         return;
     }
-    sb->hideLeftMs = sb->showAfterScrollMs;
+    sb->autoHide.Arm(sb->showAfterScrollMs);
 }
 
 OverlayScrollbar* OverlayScrollbarCreate(MainWindow* win, OverlayScrollbar::Type type, OverlayScrollbar::Mode mode,
@@ -159,7 +120,9 @@ OverlayScrollbar* OverlayScrollbarCreate(MainWindow* win, OverlayScrollbar::Type
         sb->thickWidth = sysWidth;
     }
     sb->state = IsAlwaysThickMode(sb) ? State::AlwaysThick : State::SmartThin;
-    sb->hideLeftMs = (sb->state == State::SmartThin) ? sb->showAfterScrollMs : 0;
+    if (sb->state == State::SmartThin) {
+        sb->autoHide.Arm(sb->showAfterScrollMs);
+    }
     VecAppend(gAllScrollbars, sb);
     return sb;
 }
@@ -214,7 +177,7 @@ void OverlayScrollbarOnMouse(OverlayScrollbar* sb, bool overOwner, bool overScro
         }
         // Reset the auto-hide timer since mouse is moving
         if (sb->state == State::SmartThin) {
-            sb->hideLeftMs = sb->hideAfterMouseStopMs;
+            sb->autoHide.Arm(sb->hideAfterMouseStopMs);
         }
         return;
     }
@@ -244,13 +207,13 @@ static int RepeatDelayMs(bool initial) {
 static void StartRepeat(OverlayScrollbar* sb, ScrollMsg code) {
     sb->repeatScrollCode = code;
     sb->repeatIsInitial = true;
-    sb->repeatLeftMs = RepeatDelayMs(true);
+    sb->repeat.Arm(RepeatDelayMs(true));
     gCapture = sb;
 }
 
 static void StopRepeat(OverlayScrollbar* sb) {
     sb->repeatScrollCode = ScrollMsg::None;
-    sb->repeatLeftMs = 0;
+    sb->repeat.Cancel();
 }
 
 // ng: a window's own scrollbar stops paging once the thumb is under the
@@ -280,30 +243,21 @@ bool OverlayScrollbarTick(OverlayScrollbar* sb, int elapsedMs, bool ownerActive)
     }
     State was = sb->state;
     // orig's kTimerRepeatScroll
-    if (sb->repeatScrollCode != ScrollMsg::None) {
-        sb->repeatLeftMs -= elapsedMs;
-        if (sb->repeatLeftMs <= 0) {
-            if (!ThumbReachedClick(sb)) {
-                SendScrollMsg(sb, sb->repeatScrollCode);
-            }
-            // switch from initial delay to repeat rate
-            sb->repeatIsInitial = false;
-            sb->repeatLeftMs = RepeatDelayMs(false);
+    if (sb->repeatScrollCode != ScrollMsg::None && sb->repeat.Tick(elapsedMs)) {
+        if (!ThumbReachedClick(sb)) {
+            SendScrollMsg(sb, sb->repeatScrollCode);
         }
+        // switch from initial delay to repeat rate
+        sb->repeatIsInitial = false;
+        sb->repeat.Arm(RepeatDelayMs(false));
     }
     // orig's poll: only scrollbars whose owner is in the active window show
     if (!ownerActive && IsActive(sb) && IsVisible(sb) && !sb->isDragging) {
         HideScrollbarWindow(sb);
     }
     // orig's kTimerAutoHide
-    if (sb->hideLeftMs > 0) {
-        sb->hideLeftMs -= elapsedMs;
-        if (sb->hideLeftMs <= 0) {
-            sb->hideLeftMs = 0;
-            if (!sb->isDragging) {
-                HideScrollbarWindow(sb);
-            }
-        }
+    if (sb->autoHide.Tick(elapsedMs) && !sb->isDragging) {
+        HideScrollbarWindow(sb);
     }
     return was != sb->state;
 }
@@ -396,24 +350,6 @@ static void OnPaintScrollbar(gp::PaintCtx* ctx, gp::El* e, void* user) {
 }
 
 // --- mouse (orig's WndProcOverlayScrollbar) ----------------------------------
-
-// the position that puts the thumb's center at `clickPos` (client coords)
-static int PosForThumbCenteredAt(OverlayScrollbar* sb, int clickPos) {
-    Rect track = GetTrackRect(sb);
-    int range = sb->nMax - sb->nMin + 1;
-    int trackLen = IsVert(sb) ? track.dy : track.dx;
-    int thumbLen = ThumbLen(sb, trackLen);
-    int scrollableTrack = trackLen - thumbLen;
-    int scrollableRange = range - sb->nPage;
-    int clickInTrack = clickPos - (IsVert(sb) ? track.y : track.x);
-    int thumbOffset = clickInTrack - (thumbLen / 2);
-    thumbOffset = limitValue(thumbOffset, 0, std::max(0, scrollableTrack));
-    int newPos = sb->nMin;
-    if (scrollableTrack > 0 && scrollableRange > 0) {
-        newPos = sb->nMin + MulDivI(thumbOffset, scrollableRange, scrollableTrack);
-    }
-    return newPos;
-}
 
 static void OnLeftButtonDown(OverlayScrollbar* sb, int mx, int my, bool isShift) {
     Point pt(mx, my);
@@ -515,8 +451,6 @@ struct ScrollbarView {
     static void OnMove(ScrollbarView*, gp::Ctx* cx, const gp::MouseMoveEvent* ev, int64_t arg);
     static void OnHover(ScrollbarView*, gp::Ctx* cx, const gp::HoverEvent* ev, int64_t arg);
     static void OnMenu(ScrollbarView*, gp::Ctx* cx, const gp::ClickEvent* ev, int64_t arg);
-    static void OnWinMove(ScrollbarView*, gp::Ctx* cx, const gp::MouseMoveEvent* ev);
-    static void OnWinUp(ScrollbarView*, gp::Ctx* cx, const gp::MouseUpEvent* ev);
     static void OnWinExit(ScrollbarView*, gp::Ctx* cx, const gp::MouseExitEvent* ev);
 };
 
@@ -647,14 +581,6 @@ void OverlayScrollbarOnWindowUp(gp::Window* gw, gp::MouseButton button) {
     OnLeftButtonUp(sb);
 }
 
-void ScrollbarView::OnWinMove(ScrollbarView*, gp::Ctx* cx, const gp::MouseMoveEvent* ev) {
-    OverlayScrollbarOnWindowMove(cx->win, ev->x, ev->y);
-}
-
-void ScrollbarView::OnWinUp(ScrollbarView*, gp::Ctx* cx, const gp::MouseUpEvent* ev) {
-    OverlayScrollbarOnWindowUp(cx->win, ev->button);
-}
-
 // ng: a gpui menu item's action is dispatched from the focused element, which
 // the bar is no ancestor of, so the items call back directly
 void ScrollbarView::OnMenu(ScrollbarView*, gp::Ctx*, const gp::ClickEvent*, int64_t arg) {
@@ -745,9 +671,8 @@ static OverlayScrollbar::Mode ModeFromPrefs() {
         case kScrollbarOverlay:
             return OverlayScrollbar::Mode::Thick;
         case kScrollbarSmart:
-            return OverlayScrollbar::Mode::Smart;
         default:
-            return OverlayScrollbar::Mode::Windows;
+            return OverlayScrollbar::Mode::Smart;
     }
 }
 

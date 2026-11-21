@@ -7,20 +7,14 @@ import { ControlClient, ControlCommand } from "./control.ts";
 import { cmdId, pollUntil, runStandalone, tmpPath, SLOW_BUILD_FACTOR, USE_NG, makeBlankPdf } from "./util.ts";
 import {
   clientToScreen,
-  getClassName,
   getClientRect,
-  getFocusedHwnd,
-  getRootWindow,
   MK_LBUTTON,
   packCoords,
   postMessage,
   sendMessage,
-  sendText,
   setCursorPos,
   sleep,
-  VK_DOWN,
   VK_ESCAPE,
-  VK_RETURN,
   WM_COMMAND,
   WM_KEYDOWN,
   WM_LBUTTONDOWN,
@@ -36,8 +30,8 @@ import {
   pressEscape,
   sendCommand,
   sendCommandSync,
-  ngKey,
-  ngType,
+  paletteRun,
+  ngInput,
 } from "./win-automation.ts";
 
 type Point = { x: number; y: number };
@@ -115,115 +109,8 @@ function toolbarButtonRect(dump: string): { x: number; y: number; dx: number; dy
   return { x, y, dx: +m[3]! - x, dy: +m[4]! - y };
 }
 
-// ng's palette is a gpui field, not an Edit. Type through the control pipe.
-async function executeFromCommandPaletteNg(client: ControlClient, frame: number): Promise<void> {
-  sendCommand(frame, cmdId("CmdCommandPalette"));
-  const openDeadline = Date.now() + 8_000;
-  let raw = "";
-  for (;;) {
-    const res = await client.request(ControlCommand.TestCommandPalette, []);
-    raw = String(res[1] ?? "");
-    if (res[0] === 0 && raw.startsWith("OK") && raw.includes("editFocus=1")) {
-      break;
-    }
-    if (Date.now() > openDeadline) {
-      throw new Error(`ink-annotation-placement: command palette did not open\n${raw}`);
-    }
-    await sleep(50);
-  }
-
-  const query = ">Create Ink Annotation";
-  await ngType(client, query);
-  const filterDeadline = Date.now() + 3_000;
-  let itemCount = 0;
-  for (;;) {
-    const res = await client.request(ControlCommand.TestCommandPalette, []);
-    raw = String(res[1] ?? "");
-    const m = /items=(\d+) querySel=-?\d+,-?\d+ queryLen=(\d+) cmd=(-?\d+)/.exec(raw);
-    if (res[0] === 0 && m && +m[2]! === query.length) {
-      itemCount = +m[1]!;
-      break;
-    }
-    if (Date.now() > filterDeadline) {
-      throw new Error(`ink-annotation-placement: palette query did not settle\n${raw}`);
-    }
-    await sleep(40);
-  }
-
-  for (let i = 0; i < itemCount; i++) {
-    const res = await client.request(ControlCommand.TestCommandPalette, []);
-    raw = String(res[1] ?? "");
-    const m = /cmd=(-?\d+)/.exec(raw);
-    if (res[0] === 0 && m && +m[1]! === cmdId("CmdCreateAnnotInk")) {
-      await ngKey(client, VK_RETURN);
-      return;
-    }
-    await ngKey(client, VK_DOWN);
-  }
-  throw new Error("ink-annotation-placement: Ink command was not in the filtered palette");
-}
-
-async function executeFromCommandPalette(client: ControlClient, frame: number): Promise<void> {
-  if (USE_NG) {
-    await executeFromCommandPaletteNg(client, frame);
-    return;
-  }
-  sendCommand(frame, cmdId("CmdCommandPalette"));
-  const openDeadline = Date.now() + 8_000;
-  let palette = 0;
-  let edit = 0;
-  while (Date.now() < openDeadline) {
-    edit = getFocusedHwnd(frame);
-    if (edit && getClassName(edit) === "Edit") {
-      palette = getRootWindow(edit);
-      if (palette && palette !== frame) {
-        break;
-      }
-    }
-    await sleep(50);
-  }
-  if (!palette || !edit) {
-    throw new Error("ink-annotation-placement: command palette did not open");
-  }
-
-  const query = ">Create Ink Annotation";
-  sendText(edit, query);
-  const filterDeadline = Date.now() + 3_000;
-  let itemCount = 0;
-  for (;;) {
-    const res = await client.request(ControlCommand.TestCommandPalette, []);
-    const raw = String(res[1] ?? "");
-    const m = /items=(\d+) querySel=-?\d+,-?\d+ queryLen=(\d+) cmd=(-?\d+)/.exec(raw);
-    if (res[0] === 0 && m && +m[2]! === query.length) {
-      itemCount = +m[1]!;
-      break;
-    }
-    if (Date.now() > filterDeadline) {
-      throw new Error(`ink-annotation-placement: palette query did not settle\n${raw}`);
-    }
-    await sleep(40);
-  }
-
-  for (let i = 0; i < itemCount; i++) {
-    const res = await client.request(ControlCommand.TestCommandPalette, []);
-    const raw = String(res[1] ?? "");
-    const m = /cmd=(-?\d+)/.exec(raw);
-    if (res[0] === 0 && m && +m[1]! === cmdId("CmdCreateAnnotInk")) {
-      postMessage(edit, WM_KEYDOWN, VK_RETURN, 0);
-      return;
-    }
-    postMessage(edit, WM_KEYDOWN, VK_DOWN, 0);
-    await sleep(80);
-  }
-  throw new Error("ink-annotation-placement: Ink command was not in the filtered palette");
-}
-
-async function ngMouse(client: ControlClient, kind: string, point: Point, button: number): Promise<void> {
-  const res = await client.request(ControlCommand.TestInput, [kind, point.x, point.y, button, 0]);
-  const raw = String(res[1] ?? "");
-  if (res[0] !== 0 || !raw.startsWith("OK")) {
-    throw new Error(`ink-annotation-placement: ${kind} failed: ${raw}`);
-  }
+function ngMouse(client: ControlClient, kind: string, point: Point, button: number): Promise<void> {
+  return ngInput(client, [kind, point.x, point.y, button, 0]);
 }
 
 async function moveMouse(client: ControlClient, canvas: number, point: Point): Promise<void> {
@@ -236,6 +123,17 @@ async function moveMouse(client: ControlClient, canvas: number, point: Point): P
   const screen = clientToScreen(canvas, point.x, point.y);
   setCursorPos(screen.x, screen.y);
   sendMessage(canvas, WM_MOUSEMOVE, 0, packCoords(point.x, point.y));
+}
+
+// Toolbar and notification cursor queries can overwrite the canvas cursor.
+async function waitForCursor(client: ControlClient, canvas: number, point: Point): Promise<PlacementState | null> {
+  const deadline = Date.now() + 2_000 * SLOW_BUILD_FACTOR;
+  for (;;) {
+    await moveMouse(client, canvas, point);
+    const state = await placementState(client);
+    if (state?.cursor || Date.now() > deadline) return state;
+    await sleep(40);
+  }
 }
 
 async function drawStroke(client: ControlClient, canvas: number, points: Point[]): Promise<void> {
@@ -331,8 +229,7 @@ export async function testit(): Promise<void> {
 
     await clickInkToolbar();
     let state = await waitForPlacement(client, true, "toolbar");
-    await moveMouse(client, canvas, center);
-    state = await placementState(client);
+    state = await waitForCursor(client, canvas, center);
     if (
       !state ||
       !state.notification ||
@@ -359,10 +256,9 @@ export async function testit(): Promise<void> {
       throw new Error(`ink-annotation-placement: outside first click did not cancel cleanly\n${state.raw}`);
     }
 
-    await executeFromCommandPalette(client, frame);
+    await paletteRun(client, frame, ">Create Ink Annotation", "CmdCreateAnnotInk");
     state = await waitForPlacement(client, true, "palette");
-    await moveMouse(client, canvas, center);
-    state = await placementState(client);
+    state = await waitForCursor(client, canvas, center);
     if (!state || !state.notification || !state.cursor || state.annotations !== 0) {
       throw new Error(`ink-annotation-placement: palette did not start placement mode\n${state?.raw ?? "NOTREADY"}`);
     }

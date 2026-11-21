@@ -4,6 +4,7 @@
 // --- shared by CanvasCommon.cpp, orig's Canvas.cpp and ng's gui/DocCanvas.cpp ---
 
 extern bool gLaserPointer;
+extern bool gDisableInteractiveInverseSearch;
 bool IsPointInSelection(MainWindow* win, Point pt);
 int ScrollLineAmount(int configuredAmount);
 bool IsLineEndpointHandle(ResizeHandle handle);
@@ -18,3 +19,20 @@ extern bool gShowFitContentArea;
 Color ColorForPdfPageBox(PdfPageBoxKind kind);
 Point PdfPageBoxLabelPos(const Rect& r, PdfPageBoxKind kind);
 bool IsFullPageImage(DisplayModel* dm, IPageElement* el, int pageNo);
+int WheelPageTurnDir(MainWindow* win, int delta, int turnDelta);
+
+template <typename T>
+void MakeFullScrollbar(T& si) {
+    si.nPos = 0;
+    si.nMin = 0;
+    si.nMax = 99;
+    si.nPage = 100;
+}
+
+// the canvas window's mouse capture, timers and coordinates; implemented by each app
+void CanvasSetCapture(MainWindow* win, bool capture);
+void CanvasStartTimer(MainWindow* win, int id, int ms);
+void CanvasKillTimer(MainWindow* win, int id);
+void CanvasTrackMouseLeave(MainWindow* win);
+void CanvasRelayoutAutoScroll(MainWindow* win);
+bool CanvasClientToScreen(MainWindow* win, Rect r, Rect& out);

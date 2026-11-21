@@ -26,12 +26,31 @@ Compiler and sanitizer variants add suffixes, such as `dbg-clang` and
 base unit tests. `-run` launches SumatraPDF as a normal session, so it
 saves and restores settings. Pass `-- -for-testing` for a throwaway run.
 
+## Measuring
+
+`CmdMeasure` (View menu) opens the Measure window with orig's tools, rows and
+strings: Length, Rectangular area, Radius, Guide line and Calibrate, snapping to
+the page's vector lines, Clear, Reset scale and a calibration saved per file.
+The model, label text and expression evaluator are shared with orig
+(`src/shared/MeasurementToolbarCommon.cpp`); `src/ng/MeasurementToolbar.cpp`
+is the GPUI window and the canvas drawing. `TestMeasurement` drives it as in
+orig. Differences: on macOS `Cmd + click` deletes a measurement (Command
+stands in for Ctrl on the canvas); the window can be dragged wider; a length's
+label sits just above its line, since GPUI's line box is taller than orig's.
+Wasm has no tool windows, so the command is hidden there.
+
 ## PDF scripts
 
 `CmdRunPDFScript` uses a GPUI dialog and runs the same MuPDF JavaScript
 engine as `SumatraPDF run` in a child process. Arguments, bundled examples
 and output capture match the original. WebAssembly has no child processes,
 so the command is unavailable there.
+
+## Caption overlay
+
+On Windows, `CmdToggleCaption` (`Shift + F8`) hides the caption and reveals
+it over the document while the pointer is near the top edge. Other platforms
+keep their native caption: GPUI's client caption currently supports Windows.
 
 ## Keyboard shortcuts
 

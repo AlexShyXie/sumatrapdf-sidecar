@@ -7,10 +7,13 @@ struct InputState;
 } // namespace gpui
 
 struct WindowTab;
+struct TabGroup;
+struct StripGroup;
 struct DocController;
 struct DocControllerCallback;
 struct ChmModel;
 struct MarkdownModel;
+struct BrowserDocController;
 struct DisplayModel;
 struct MenuModel;
 struct NotificationWnd;
@@ -30,6 +33,12 @@ struct DocCanvasUI;
 struct HomePageUI;
 struct WatchedFile;
 enum class SidebarContent;
+// orig's sidebarTop / sidebarMiddle / sidebarBottom panels
+enum class SidebarSlot {
+    Top,
+    Middle,
+    Bottom,
+};
 
 // one match of the current find, in (page, glyph) coordinates
 struct FindMatch {
@@ -40,11 +49,14 @@ struct FindMatch {
     Str snippet; // UTF-8, owned (freed when findMatches is rebuilt)
 };
 
-enum PresentationMode {
-    PM_DISABLED = 0,
-    PM_ENABLED,
-    PM_BLACK_SCREEN,
-    PM_WHITE_SCREEN
+// One mode at a time: fullscreen and presentation used to be two fields, so
+// both could be set. The PresentationBlack / White modes hide the page.
+enum class WindowMode {
+    Normal,
+    FullScreen,
+    Presentation,
+    PresentationBlack,
+    PresentationWhite,
 };
 
 // Current action being performed with a mouse
@@ -98,10 +110,10 @@ struct Annotation;
 struct AnnotEditToolbar;
 struct AnnotFilterToolbar;
 struct AnnotTextPopup;
+struct MeasurementToolbar;
 
-// ng: orig's cursors that are bitmaps, which gpui's CursorKind cannot name.
-// Windows only: the canvas asks gpui for a stand-in kind and the frame's
-// subclass sets the real cursor (gui/NativeCursors_win.cpp).
+// ng: orig's cursors that are bitmaps, which gpui's CursorKind cannot name;
+// the canvas shows them as gpui cursor images (gui/NativeCursors.cpp).
 enum class NativeCursor {
     None,
     // the hand of a drag-pan (orig's gCursorDrag)
@@ -192,6 +204,7 @@ struct MainWindow {
     DisplayModel* AsFixed() const;
     ChmModel* AsChm() const;
     MarkdownModel* AsMarkdown() const;
+    BrowserDocController* AsBrowser() const;
 
     // owned by CurrentTab()
     DocController* ctrl = nullptr;
@@ -218,6 +231,8 @@ struct MainWindow {
     // keeps the sequence of tab selection, for restoring the previous tab
     // when the current one is closed (points into tabs)
     Vec<WindowTab*>* tabSelectionHistory = nullptr;
+    // groups of tabs in the tab strip (owned), in strip order
+    Vec<StripGroup*> stripGroups;
     // ng: the gpui side of the tab strip (hover, drag, context menu); orig
     // keeps the same state in its TabsCtrl
     TabsUI* tabsUI = nullptr;
@@ -240,6 +255,9 @@ struct MainWindow {
     // orig's tabsInTitlebar: the tab strip and the caption buttons are drawn
     // in a caption of the port's own (Windows; set when UseTabs is on)
     bool tabsInTitlebar = false;
+    bool captionOverlayShown = false;
+    // last minimized state seen by the frame tick (orig gets it from WM_SIZE)
+    bool wasMinimized = false;
     // the width the tab strip has in that caption; 0 = the frame's
     int tabsAvailDx = 0;
     // size of the whole window and whether it is maximized, as the shell saw
@@ -271,6 +289,8 @@ struct MainWindow {
     bool dragRightClick = false;
     Point dragStart;
     Point dragPrevPos;
+    // presentation just started: the next mouse move hides the cursor at once
+    bool hideCursorOnNextMove = false;
     // middle-button auto-scroll: pixels per 20 ms, with the sub-pixel leftover
     float xScrollSpeed = 0;
     float yScrollSpeed = 0;
@@ -283,6 +303,9 @@ struct MainWindow {
     int scrollTargetY = 0;
     double scrollAnimY = 0;
     bool scrollAnimActive = false;
+    // the document and DisplayModel::viewChanges scrollTargetY was computed for
+    DisplayModel* scrollAnimDm = nullptr;
+    int scrollAnimViewChanges = 0;
     // a page was still rendering on the last paint, so paint again soon
     bool repaintPending = false;
 
@@ -303,21 +326,22 @@ struct MainWindow {
     mutable bool readAloudScrollFromCode = false;
     ReadAloudPlaybackBar* readAloudPlaybackBar = nullptr;
     // ng: orig's kReadAloudHighlightTimerID, counted down by the shell's tick
-    bool readAloudTimerOn = false;
-    int readAloudTimerLeftMs = 0;
+    Countdown readAloudTimer;
 
     // --- links and selection (step 8a) --------------------------------------
 
     // the link the last left button press landed on; the click follows it if
     // the release lands on it too
     IPageElement* linkOnLastButtonDown = nullptr;
+    int linkOnLastButtonDownGen = 0; // engine's elementsGeneration when it was taken
     // a press on already selected text: the drag-out gesture orig starts here
     // is not ported (no OLE drag and drop in gpui), but the click still clears
     bool textDragPending = false;
     // true when mouse down on image, waiting for drag (Windows: OLE drag-out)
     bool imageDragPending = false;
     IPageElement* imageDragElement = nullptr;
-    int imageDragPageNo = -1; // page of imageDragElement for screen-rect / hotspot
+    int imageDragElementGen = 0; // engine's elementsGeneration when it was taken
+    int imageDragPageNo = -1;    // page of imageDragElement for screen-rect / hotspot
     // the rubber band while a selection is being made, in canvas coordinates
     Rect selectionRect;
     // size of a rectangular selection in the document's units
@@ -359,16 +383,19 @@ struct MainWindow {
     gpui::InputState* findPagesEdit = nullptr;
 
     ThreadHandle printThread = nullptr;
-    bool printCanceled = false;
+    // set on the UI thread, read by the print thread
+    AtomicBool printCanceled = 0;
 
     ThreadHandle findThread = nullptr;
-    bool findCancelled = false;
+    // set on the UI thread, read by the find thread
+    AtomicBool findCancelled = 0;
     bool findMatchCase = false;
     bool findMatchWholeWord = false;
     // find-as-you-type is debounced: orig arms a WM_TIMER on hwndFrame, here
-    // the shell's tick counts this down and fires the deferred search
+    // the shell's tick counts this down and fires the deferred search.
+    // findDebouncePending mirrors findDebounce.IsArmed(): shared code reads it
     bool findDebouncePending = false;
-    int findDebounceLeftMs = 0;
+    Countdown findDebounce;
     // the current find session already recorded its starting view
     bool searchStartMarked = false;
 
@@ -390,6 +417,9 @@ struct MainWindow {
     bool findCountPendingMatchCase = false;
     bool findCountPendingMatchWholeWord = false;
     // also used by PaintAllFindMatches to highlight every find hit
+    // CmdFindHistory: the search field's list opens when it's next drawn, it
+    // may not exist yet
+    bool findHistoryWantOpen = false;
     Vec<FindMatch> findMatches;
     bool findCountHasSnippets = false;
 
@@ -406,7 +436,7 @@ struct MainWindow {
     bool textSelectModeActive = false;
     bool textSelectModeVisual = false;
     bool textSelectCaretVisible = true; // toggled by the blink timer
-    int textSelectBlinkLeftMs = 0;
+    Countdown textSelectBlink;
     int textSelectPage = 0; // caret position, 0 if not set yet
     int textSelectGlyph = 0;
     int textSelectAnchorPage = 0; // where the selection started
@@ -417,10 +447,14 @@ struct MainWindow {
     // what the sidebar shows; orig keeps the same three flags in win->uiState
     struct {
         bool tocVisible = false;
+        // orig's sidebarMiddleVisible: only with the other two
+        bool middleVisible = false;
         bool favVisible = false;
         bool aiChatVisible = false;
     } uiState;
     SidebarContent sidebarBottomContent;
+    // the content neither the top nor the bottom panel shows
+    SidebarContent sidebarMiddleContent;
     // --- AI chat panel (step 14d) --------------------------------------------
     // provider (AIChatBackend value) the panel content is configured for;
     // -1 = none
@@ -429,6 +463,11 @@ struct MainWindow {
     int aiChatDx = 0;
     // width of the sidebar in dips; orig's win->sidebarDx
     int sidebarDx = 0;
+    // SidebarAutoHide: the floating sidebar is shown (by the mouse or the
+    // keyboard) and whether the mouse is over it
+    bool sidebarOverlayShown = false;
+    bool sidebarOverlayByMouse = false;
+    bool sidebarOverlayHovered = false;
     // frame pixels SidebarWindowSize = grow added for the sidebar (0: none)
     int sidebarGrewFrameDx = 0;
     // Windows: the frame's last non-maximized rectangle in screen pixels, for
@@ -464,13 +503,15 @@ struct MainWindow {
     // the property row under the selected annotation, and the annotation list
     AnnotEditToolbar* annotEditToolbar = nullptr;
     AnnotFilterToolbar* annotFilterToolbar = nullptr;
+    // the Measure window (CmdMeasure); null while it is closed
+    MeasurementToolbar* measurementToolbar = nullptr;
     // where the annotation list window was last (screen pixels), and whether
     // the user put it there; not saved to the settings file, as in orig
     Rect annotListFloatPos;
     bool annotListFloatPosUserSet = false;
     // read-only card with a clicked annotation's whole text
     AnnotTextPopup* annotTextPopup = nullptr;
-    // what the canvas' cursor is when canvasCursor is the stand-in kind
+    // the canvas' cursor image; canvasCursor is the kind shown without one
     NativeCursor nativeCursor = NativeCursor::None;
     // Edit PDF: the card with the properties of the annotation under the cursor
     AnnotationHoverOverlay* annotationHoverOverlay = nullptr;
@@ -501,9 +542,9 @@ struct MainWindow {
     // where arrow keys moved an annotation; re-rendered once the keys pause
     WindowTab* annotationNudgeTab = nullptr;
     int annotationNudgePageNo = 0;
-    int annotationNudgeLeftMs = 0;
+    Countdown annotationNudge;
     // page bitmap follows a rectangle resize once the pointer pauses
-    int annotationResizeRerenderLeftMs = 0;
+    Countdown annotationResizeRerender;
     // a press that only deselected an annotation; the click must do nothing
     bool pressOnlyDeselected = false;
     // an engine edit operation is open: everything until it closes is one
@@ -519,17 +560,18 @@ struct MainWindow {
     bool contextMenuPtValid = false;
 
     bool showSelection = false;
-    bool isFullScreen = false;
     // -quicklook: a chrome-less always-on-top preview window (Explorer Space)
     bool isQuickLook = false;
-    PresentationMode presentation = PM_DISABLED;
+    WindowMode windowMode = WindowMode::Normal;
     int windowStateBeforePresentation = 0;
     // ng: orig arms kHideCursorTimerID on the canvas; the shell's tick counts
-    // this down instead. -1 is "no timer armed"
-    int presCursorHideLeftMs = -1;
+    // this down instead
+    Countdown presCursorHide;
     // set at the beginning of CloseWindow() to prevent processing commands
     // while closing
     bool isBeingClosed = false;
+    // the AutoSync tab group that follows this window's tabs; not owned
+    TabGroup* syncedTabGroup = nullptr;
     bool isClosePending = false;
 
     /* when doing a forward search, the result location is highlighted with
@@ -541,8 +583,18 @@ struct MainWindow {
         int page = 0;
         int hideStep = 0; // value used to gradually hide the markers
         // ng: orig arms kHideFwdSearchMarkTimerID; the tick counts this down
-        int hideLeftMs = -1;
+        Countdown hide;
     } fwdSearchMark;
+
+    // ring blinked around the match Find Next/Prev landed on (FlashFindMatch)
+    struct {
+        bool show = false; // ring visible in the current blink step
+        Vec<Rect> rects;   // match in user coordinates
+        int page = 0;
+        int step = 0;
+        // ng: orig arms kFindFlashTimerID; the tick counts this down
+        Countdown next;
+    } findFlash;
 
     StressTest* stressTest = nullptr;
 
@@ -552,12 +604,17 @@ struct MainWindow {
     void Focus() const;
     void ToggleZoom() const;
     bool InPresentation() const;
-    void ChangePresentationMode(PresentationMode mode);
+    bool IsFullScreen() const { return windowMode == WindowMode::FullScreen; }
+    bool IsFullScreenOrPresentation() const { return windowMode != WindowMode::Normal; }
+    // presentation with the page hidden behind a black / white screen
+    bool InBlankPresentation() const {
+        return windowMode == WindowMode::PresentationBlack || windowMode == WindowMode::PresentationWhite;
+    }
+    void ChangePresentationMode(WindowMode mode);
 };
 
 bool HasOpenedDocuments(MainWindow*);
 MainWindow* FindMainWindowByTab(WindowTab*);
-MainWindow* FindMainWindowByGpuiWindow(gpui::Window*);
 #if OS_WIN
 HWND MainWindowHwnd(MainWindow*);
 MainWindow* FindMainWindowByHwnd(HWND);
@@ -567,6 +624,8 @@ bool IsMainWindowValid(MainWindow*);
 bool IsMainWindowValidAndNotClosing(MainWindow*);
 bool IsCurrentTab(MainWindow* win, WindowTab* tab);
 bool IsWindowTabValid(WindowTab*);
+void PostForWindow(MainWindow*, void (*fn)(MainWindow*), Kind kind);
+void PostForTab(WindowTab*, void (*fn)(WindowTab*), Kind kind);
 extern Vec<MainWindow*> gWindows;
 void CleanRemoteDestNameInPlace(Str& destName);
 void ScheduleRepaint(MainWindow*, int delay);

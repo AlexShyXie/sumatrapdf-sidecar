@@ -219,7 +219,7 @@ const commandsRaw = [
     "CmdPdfCompress", "Compress PDF...",
     "CmdPdfDecompress", "Decompress PDF...",
     "CmdPdfDeletePages", "Delete Pages From PDF...",
-    "CmdPdfExtractPages", "Extract Pages From PDF...",
+    "CmdPdfExtractPages", "Extract Pages...",
     "CmdPdfEncrypt", "Encrypt PDF...",
     "CmdPdfDecrypt", "Decrypt PDF...",
     "CmdPdfBake", "Bake PDF File...",
@@ -294,7 +294,7 @@ const commandsRaw = [
     "CmdInsertImage", "Insert Image...",
     "CmdToggleHighlightFormFields", "Toggle Highlight Form Fields",
     "CmdTogglePageBoxes", "Toggle Page Boxes",
-    "CmdConvertPdfToImages", "Convert PDF to Images...",
+    "CmdConvertPdfToImages", "Convert to Images...",
     "CmdToggleUniformPageWidth", "Toggle Uniform Page Width",
     "CmdToggleTransparencyGrid", "Toggle Transparency Grid",
     "CmdTogglePageGrid", "Toggle Page Grid",
@@ -346,6 +346,66 @@ const commandsRaw = [
     "CmdQuickEditSettings", "Quick Edit Settings",
     "CmdConfigureRestrictedUse", "Configure Restricted Use...",
     "CmdRunPDFScript", "Run PDF Script...",
+    "CmdToggleCaption", "Toggle Caption",
+    "CmdAdjustBrightness", "Adjust Brightness...",
+    "CmdAdjustContrast", "Adjust Contrast...",
+    "CmdToggleSidebarAutoHide", "Toggle Sidebar Auto-hide",
+    "CmdDebugShowCrashMiniDumps", "Debug: Show Crash Minidumps",
+    "CmdCopyTemporaryFileToNonTemporary", "Copy Temporary File to Permanent Folder",
+    "CmdConvertEpubToPdf", "Convert EPUB to PDF...",
+    "CmdConvertCajToPDF", "Convert CAJ to PDF...",
+    "CmdFindHistory", "Find History",
+    "CmdSumatraPDFWeb", "SumatraPDF Web...",
+    "CmdDebugSaveSettings", "Debug: Save Settings",
+    "CmdNewTab", "New Tab",
+    "CmdShowSignatures", "Show Signatures",
+    "CmdOpenFromURL", "Open from URL...",
+    "CmdGoToPrevChapter", "Previous Chapter",
+    "CmdGoToNextChapter", "Next Chapter",
+    "CmdToggleLayers", "Toggle Layers",
+    "CmdToggleFacingStepOne", "Toggle Facing: Step One Page",
+    "CmdCountWords", "Count Words",
+    "CmdMinimizeWindow", "Minimize Window",
+    "CmdShowSelectedText", "Show Selected Text",
+    "CmdToggleMirror", "Mirror Pages",
+    "CmdTrimPagesToSelection", "Trim Pages To Selection",
+    "CmdShowWholePages", "Show Whole Pages",
+    "CmdMeasure", "Measure",
+    "CmdReplaceImage", "Replace Image...",
+    "CmdEditImageExternally", "Edit Image in Another App",
+    "CmdToggleReadColumns", "Read Columns",
+    "CmdToggleColumnsWholePage", "Read Columns: Show Whole Page",
+    "CmdDebugShowDownloadedFonts", "Debug: Show Downloaded Fonts",
+    "CmdTocExpandChapter", "Bookmarks: Expand Chapter",
+    "CmdTocCollapseChapter", "Bookmarks: Collapse Chapter",
+    "CmdEditFavorites", "Edit Favorites...",
+    "CmdCloseMissingTabs", "Close Tabs of Missing Files",
+    "CmdViewAsHex", "View As Hex",
+    "CmdAIChatWithCustomAPI", "Custom AI chat...",
+    "CmdSaveTrimmedPagesAs", "Save Trimmed Pages As...",
+    "CmdCaretUp", "Move Caret Up",
+    "CmdCaretDown", "Move Caret Down",
+    "CmdCaretLeft", "Move Caret Left",
+    "CmdCaretRight", "Move Caret Right",
+    "CmdCaretWordLeft", "Move Caret One Word Left",
+    "CmdCaretWordRight", "Move Caret One Word Right",
+    "CmdCaretLineStart", "Move Caret To Line Start",
+    "CmdCaretLineEnd", "Move Caret To Line End",
+    "CmdCaretPageUp", "Move Caret Page Up",
+    "CmdCaretPageDown", "Move Caret Page Down",
+    "CmdCaretDocStart", "Move Caret To Document Start",
+    "CmdCaretDocEnd", "Move Caret To Document End",
+    "CmdEditAnnotationText", "Edit Annotation Text",
+    "CmdStripGroupNew", "Add Tab to New Group",
+    "CmdStripGroupAddTab", "Add Tab to Group",
+    "CmdStripGroupRemoveTab", "Remove Tab from Group",
+    "CmdStripGroupToggle", "Collapse / Expand Group",
+    "CmdStripGroupRename", "Rename Group...",
+    "CmdStripGroupColor", "Change Group Color",
+    "CmdStripGroupUngroup", "Ungroup Tabs",
+    "CmdStripGroupClose", "Close Group",
+    "CmdToggleLineWeights", "Show Line Weights",
+    "CmdToggleTextSelecting", "Start / Stop Selecting Text",
 ];
 
 // removed slots are dropped: nothing outside the generators should see them
@@ -358,6 +418,42 @@ export const commandAltDescs: [string, string][] = [
     ["CmdNavigateFilesInFolder", "Browse Files In Folder..."],
     ["CmdAdvancedSettings", "Advanced Options..."],
 ];
+
+// Commands that switch something on and off. They take an optional bool
+// `state` argument: [CmdToggleToolbar off] turns it off, and does nothing when
+// it is already off; without it they toggle. Each app's ToggleCmdState() must
+// know their current state.
+const notToggles = new Set([
+  "CmdToggleZoom", // cycles zoom levels
+  "CmdToggleCursorPosition", // cycles units, then off
+  "CmdToggleLightDarkTheme", // picks a theme
+]);
+// prettier-ignore
+const extraToggles = [
+    "CmdFavoriteToggle", "CmdFindToggleMatchCase", "CmdFindToggleMatchWholeWord",
+    "CmdInvertColors", "CmdSelectTextViaKeyboard",
+];
+export const toggleCommands: string[] = [
+  ...commands.filter((c, i) => i % 2 === 0 && c.startsWith("CmdToggle") && !notToggles.has(c)),
+  ...extraToggles,
+];
+
+// [CmdToggleBoolSetting <name>] takes `state` after its name: Commands.cpp lists it by hand
+const toggleOwnArgs = new Set(["CmdToggleBoolSetting"]);
+
+function generateToggleArgs(): string {
+  const lines: string[] = [];
+  for (const c of toggleCommands) {
+    if (!commands.includes(c)) {
+      console.error(`toggleCommands: unknown command '${c}'`);
+      process.exit(1);
+    }
+    if (!toggleOwnArgs.has(c)) {
+      lines.push(`    {${c}, kCmdArgState, CommandArg::Type::Bool}, // default`);
+    }
+  }
+  return lines.join("\n");
+}
 
 function getNames(): string[] {
   const names: string[] = [];
@@ -478,6 +574,12 @@ export function main() {
 
   const arraysCode = generateArrays();
   cppContent = replaceBetweenMarkers(cppContent, "// @gen-start cmd-c", "// @gen-end cmd-c", arraysCode);
+  cppContent = replaceBetweenMarkers(
+    cppContent,
+    "// @gen-start cmd-toggle-args",
+    "// @gen-end cmd-toggle-args",
+    generateToggleArgs(),
+  );
   writeFileSync(cppPath, cppContent, "utf-8");
   console.log("Generated arrays in src/shared/Commands.cpp");
 }

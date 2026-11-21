@@ -40,9 +40,9 @@ struct RefHoverState {
     // WM_SETCURSOR does)
     int popupCursor = 0;
     // ng: orig arms kRefHoverTimerID / kRefHoverHideTimerID on the canvas;
-    // the shell's tick counts these down instead. < 0 means not armed.
-    int showLeftMs = -1;
-    int hideLeftMs = -1;
+    // the shell's tick counts these down instead
+    Countdown showTimer;
+    Countdown hideTimer;
     // `bmp` as something gpui can draw, made on first paint, dropped with it
     void* renderImage = nullptr;
 #else
@@ -74,6 +74,8 @@ struct RefHoverState {
         // (destX, destY) at this zoom — honouring the link author's intent
         // (e.g. "goto top-left at 2x").
         float destZoom = 0.f;
+        // an EPUB footnote link: the region is the note's text
+        bool noteRef = false;
         // Source link location, used to recover a more specific destY when
         // the PDF link is page-level (destY < 0). We extract the source
         // link's text from srcPage at srcRect and search for that text on
@@ -165,6 +167,8 @@ void RefHoverOnCanvasMouseMove(RefHoverState*& s, MainWindow* win, DocController
                                DisplayModel* dm, int x, int y, IPageElement* el, int srcPageNo, int hoverDelayMs);
 void RefHoverOnCanvasMouseLeave(RefHoverState* s, int hoverDelayMs);
 void RefHoverOnCanvasLeftButtonDown(RefHoverState* s);
+bool RefHoverShowNoteRef(RefHoverState*& s, MainWindow* win, DocController* ctrl, ILinkHandler* linkHandler,
+                         DisplayModel* dm, int x, int y, IPageElement* el);
 // ng: what orig's two WM_TIMERs do, driven by the shell's tick
 void RefHoverTick(MainWindow* win, int elapsedMs);
 void RefHoverSchedule(RefHoverState* s, int delayMs, Point screenPt, int destPage, float destX, float destY,
@@ -173,9 +177,6 @@ void RefHoverHide(RefHoverState* s);
 void RefHoverScheduleHide(RefHoverState* s, int delayMs);
 void RefHoverOnHideTimer(RefHoverState* s);
 gpui::El* RefHoverBuild(MainWindow* win, gpui::Ctx* cx);
-bool RefHoverTakePostedWheel(MainWindow* win, bool horizontal, int delta, bool isCtrl, bool isShift, int clientX,
-                             int clientY);
-int RefHoverPopupHwndInt(RefHoverState* s);
 #else
 constexpr UINT_PTR kRefHoverTimerID = 9;
 constexpr UINT_PTR kRefHoverHideTimerID = 10;
@@ -183,6 +184,8 @@ constexpr UINT_PTR kRefHoverHideTimerID = 10;
 RefHoverState* RefHoverCreate(HWND hwndCanvas);
 bool RefHoverScheduleLink(RefHoverState* s, HWND hwndCanvas, DisplayModel* dm, int x, int y, IPageElement* el,
                           int delayMs);
+bool RefHoverShowNoteRef(RefHoverState*& s, HWND hwndCanvas, DocController* ctrl, ILinkHandler* linkHandler,
+                         DisplayModel* dm, int x, int y, IPageElement* el);
 void RefHoverOnCanvasMouseMove(RefHoverState*& s, HWND hwndCanvas, DocController* ctrl, ILinkHandler* linkHandler,
                                DisplayModel* dm, int x, int y, IPageElement* el, int srcPageNo, int hoverDelayMs);
 void RefHoverOnCanvasMouseLeave(RefHoverState* s, HWND hwndCanvas, int hoverDelayMs);
@@ -193,14 +196,22 @@ void RefHoverSchedule(RefHoverState* s, HWND hwndCanvas, int delayMs, Point scre
 void RefHoverHide(RefHoverState* s, HWND hwndCanvas);
 void RefHoverScheduleHide(RefHoverState* s, HWND hwndCanvas, int delayMs);
 void RefHoverOnHideTimer(RefHoverState* s, HWND hwndCanvas);
-void RefHoverOnWheel(RefHoverState* s, EngineBase* engine, UINT msg, WPARAM wp);
+// where a wheel message meant for the popup landed
+enum class RefHoverWheelAt {
+    Link,
+    Popup
+};
+void RefHoverOnWheel(RefHoverState* s, EngineBase* engine, UINT msg, WPARAM wp, LPARAM lp, RefHoverWheelAt at);
 #endif
 
 void RefHoverHandlePopupClick(RefHoverState* s, IPageDestination* dest);
 void RefHoverOnTimer(RefHoverState* s, EngineBase* engine, float pageZoom);
 int RefHoverPopupWidthCap(RefHoverState* s, int minWidth);
-bool RefHoverWheelZoom(RefHoverState* s, EngineBase* engine, int wheelDelta);
+// a RefHoverWheelZoom anchor off the popup: zoom around the content's center
+const Point kRefHoverNoAnchor{-1, -1};
+bool RefHoverWheelZoom(RefHoverState* s, EngineBase* engine, int wheelDelta, Point anchor);
 bool RefHoverWheelScroll(RefHoverState* s, EngineBase* engine, int wheelDelta);
+bool RefHoverWheelScrollX(RefHoverState* s, EngineBase* engine, int wheelDelta);
 
 //--- layout detection (RefHoverDetect.cpp)
 
@@ -217,6 +228,7 @@ void NormalizeGlyphLines(const Rect* coords, Rect* out, int glyphCount);
 int StripWatermarkGlyphs(WStr text, const Rect* coords, WCHAR* outText, Rect* outCoords);
 
 RectF LandscapeBox(RectF mediabox, float destX, float destY, WStr text, const Rect* coords);
+RectF NoteBox(RectF mediabox, float destY, WStr text, const Rect* coords);
 
 RectF DetectEquationBox(WStr text, const Rect* coords, RectF mediabox, float destX, float destY);
 

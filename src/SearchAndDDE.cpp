@@ -26,6 +26,7 @@
 #include "Notifications.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Commands.h"
 #include "AppTools.h"
@@ -37,6 +38,7 @@
 #include "Favorites.h"
 #include "Translations.h"
 #include "Version.h"
+#include "VirtualDesktop.h"
 #include "SearchAndDDE.h"
 #include "SearchAndDDECommon.h"
 
@@ -77,10 +79,8 @@ void FindFirst(MainWindow* win) {
         return;
     }
     // IE backend: fall back to the browser's own find dialog
-    if (win->AsChm()) {
-        win->AsChm()->FindInCurrentPage();
-    } else if (win->AsMarkdown()) {
-        win->AsMarkdown()->FindInCurrentPage();
+    if (win->AsBrowser()) {
+        win->AsBrowser()->FindInCurrentPage();
         return;
     }
 
@@ -118,12 +118,6 @@ void FindFirst(MainWindow* win) {
     HighlightRestoredFindTerm(win);
 }
 
-// debounce delays (ms) for find-as-you-type. Short terms (1-2 chars) match a
-// lot of text and the search is expensive, so wait longer before starting them
-// (issue #4626). Enter bypasses the wait (see FindFlushPendingSearch).
-constexpr UINT kFindDebounceDelayMs = 500;
-constexpr UINT kFindDebounceShortDelayMs = 1000;
-
 TempStr FindPagesEditTextTemp(MainWindow* win) {
     return win->findPagesEdit ? win->findPagesEdit->GetTextTemp() : TempStr{};
 }
@@ -147,7 +141,7 @@ void OnFindBarTextChanged(MainWindow* win) {
         return;
     }
     size_t nChars = CbGetTextLen(win->findEdit);
-    UINT delay = (nChars <= 2) ? kFindDebounceShortDelayMs : kFindDebounceDelayMs;
+    UINT delay = (UINT)FindDebounceDelayMs((int)nChars);
     // SetTimer with the same id replaces the previous timer, so each keystroke
     // restarts the countdown
     SetTimer(win->hwndFrame, kFindDebounceTimerId, delay, nullptr);
@@ -207,7 +201,7 @@ void UpdateFindStatus(UpdateFindStatusData* d) {
     AutoDelete delData(d);
 
     auto* win = d->win;
-    if (!IsMainWindowValidAndNotClosing(win) || win->findCancelled) {
+    if (!IsMainWindowValidAndNotClosing(win) || AtomicBoolGet(&win->findCancelled)) {
         return;
     }
     if (!d->showProgress) {
@@ -215,7 +209,7 @@ void UpdateFindStatus(UpdateFindStatusData* d) {
         // document. The n/m counter and the floating results list are built by
         // the count thread (which does its own full scan), so bail out early and
         // leave the heavy lifting to it.
-        win->findCancelled = true;
+        AtomicBoolSet(&win->findCancelled, true);
     }
     // explicit Find Next/Prev (showProgress): keep going to completion. There's
     // no progress notification now -- the n/m counter is the only feedback.
@@ -259,94 +253,20 @@ Rect FindPaintClipRc(MainWindow* win, DisplayModel*) {
     return win->canvasRc;
 }
 
-void PaintAllFindMatches(MainWindow* win, Gfx* gfx) {
-    if (!win->IsDocLoaded() || !win->AsFixed()) {
-        return;
-    }
-    if (CbGetTextLen(win->findEdit) == 0) {
-        return;
-    }
-
-    DisplayModel* dm = win->AsFixed();
-    // Matches/count cache are tied to the engine they were built for. After a
-    // tab close or reload without InvalidateFindForDocumentChange, refuse to
-    // map stale page/glyph coords onto a different document.
-    void* engine = (void*)dm->GetEngine();
-    if (win->findCountEngine && win->findCountEngine != engine) {
-        ClearFindMatches(win);
-        win->findCountValid = false;
-        win->findCountEngine = nullptr;
-        VecReset(win->findCountPositions);
-        str::FreePtr(&win->findCountText);
-        return;
-    }
-    TextSearch* ts = dm->textSearch;
-    // After the find UI is closed, still highlight the active match so F3 /
-    // FindNext navigation is visible (issue #5802). The full match list was
-    // cleared on hide; only paint the current TextSearch hit.
-    if (!IsFindUIVisible(win)) {
-        PaintCurrentFindMatch(win, dm, ts, gfx);
-        return;
-    }
-    if (!win->findCountValid && len(win->findMatches) == 0) {
-        // count still running: at least highlight the current match
-        PaintCurrentFindMatch(win, dm, ts, gfx);
-        return;
-    }
-    if (len(win->findMatches) == 0) {
-        return;
-    }
-    int firstPage = 0;
-    int lastPage = 0;
-    GetVisiblePageRange(dm, firstPage, lastPage);
-    if (!dm->ValidPageNo(firstPage)) {
-        return;
-    }
-
-    if (gFindMatchPaintCache.countEpoch != win->findCountEpoch || gFindMatchPaintCache.firstPage != firstPage ||
-        gFindMatchPaintCache.lastPage != lastPage) {
-        RebuildFindMatchPaintCache(win, dm, firstPage, lastPage);
-    }
-
-    u64 currentKey = 0;
-    if (ts && len(ts->result) > 0) {
-        currentKey = MatchKey(ts->startPage, ts->startGlyph);
-    }
-
-    ParsedColor* parsedCol = GetPrefsColor(gSettings->fixedPageUI.selectionColor);
-    u8 alpha = GetAlpha(parsedCol->col);
-    if (alpha == 0) {
-        alpha = kSelectionDefaultAlpha;
-    }
-
-    Vec<Rect> otherRects;
-    Vec<Rect> currentRects;
-    Vec<FindMatchPaintPageRect>& positions = gFindMatchPaintCache.positions;
-    for (int i = 0; i < len(gFindMatchPaintCache.entries); i++) {
-        const FindMatchPaintRects& entry = gFindMatchPaintCache.entries[i];
-        Vec<Rect>& out = (entry.key == currentKey) ? currentRects : otherRects;
-        AppendPageRectsToScreen(dm, win->canvasRc, &positions[entry.firstPos], entry.len, out);
-    }
-
-    if (len(otherRects) > 0) {
-        PaintTransparentRectangles(gfx, win->canvasRc, otherRects, kFindOtherMatchColor, alpha);
-    }
-    if (len(currentRects) == 0 && ts && len(ts->result) > 0) {
-        AppendTextSelScreenRects(dm, win->canvasRc, &ts->result, currentRects);
-    }
-    if (len(currentRects) > 0) {
-        PaintTransparentRectangles(gfx, win->canvasRc, currentRects, parsedCol->col, alpha);
-    }
-}
-
 // starts fading the forward search mark after delayMs
 void HideFwdSearchMarkAfter(MainWindow* win, int delayMs) {
     SetTimer(win->hwndCanvas, kHideFwdSearchMarkTimerID, delayMs, nullptr);
 }
 
+void ArmFindFlashTimer(MainWindow* win, int delayMs) {
+    SetTimer(win->hwndCanvas, kFindFlashTimerID, delayMs, nullptr);
+}
+
 void ShowForwardSearchResult(MainWindow* win, Str fileName, int line, int /* col */, int ret, int page,
                              Vec<Rect>& rects) {
-    ReportIf(!win->AsFixed());
+    if (ReportIf(!win->AsFixed())) {
+        return;
+    }
     DisplayModel* dm = win->AsFixed();
     VecReset(win->fwdSearchMark.rects);
     const PageInfo* pi = dm->GetPageInfo(page);
@@ -379,27 +299,12 @@ void ShowForwardSearchResult(MainWindow* win, Str fileName, int line, int /* col
         return;
     }
 
-    TempStr buf;
-    NotificationCreateArgs args{};
-    args.win = win;
-    // several of these embed a file name read from the .synctex / .pdfsync file
-    args.plainText = true;
-    if (ret == PDFSYNCERR_SYNCFILE_NOTFOUND) {
-        args.msg = Tr("No synchronization file found");
-    } else if (ret == PDFSYNCERR_SYNCFILE_CANNOT_BE_OPENED) {
-        args.msg = Tr("Synchronization file cannot be opened");
-    } else if (ret == PDFSYNCERR_INVALID_PAGE_NUMBER) {
-        buf = fmt(Tr("Page %u does not exist").s, page);
-    } else if (ret == PDFSYNCERR_NO_SYNC_AT_LOCATION) {
-        args.msg = Tr("No synchronization info at this position");
-    } else if (ret == PDFSYNCERR_UNKNOWN_SOURCEFILE) {
-        buf = fmt(Tr("Unknown source file (%s)").s, fileName);
-    } else if (ret == PDFSYNCERR_NORECORD_IN_SOURCEFILE) {
-        buf = fmt(Tr("Source file %s has no synchronization point").s, fileName);
-    } else if (ret == PDFSYNCERR_NORECORD_FOR_THATLINE || ret == PDFSYNCERR_NOSYNCPOINT_FOR_LINERECORD) {
-        buf = fmt(Tr("No result found around line %u in file %s").s, line, fileName);
-    }
+    TempStr buf = ForwardSearchFailTextTemp(ret, fileName, line, page);
     if (buf) {
+        NotificationCreateArgs args{};
+        args.win = win;
+        // the text embeds a file name read from the .synctex / .pdfsync file
+        args.plainText = true;
         args.msg = buf;
         ShowNotification(args);
     }
@@ -445,6 +350,48 @@ Go to a page and select the search term, but only if it's found on that page
 [GotoPageWord("<pdffile>",<page>,"<search-term>")]
 */
 
+// An empty window is only a good reuse target when it is on the current virtual
+// desktop: a new-window request exists to avoid a desktop switch (#5630), in every
+// OpenOnOtherDesktop mode. Under move, an empty window elsewhere is pulled here.
+static MainWindow* FindEmptyWinToReuse() {
+    MainWindow* elsewhere = nullptr;
+    for (auto& w : gWindows) {
+        if (w->HasDocsLoaded()) {
+            continue;
+        }
+        if (IsOnCurrentDesktop(w->hwndFrame)) {
+            return w;
+        }
+        elsewhere = w;
+    }
+    if (elsewhere && BringToCurrentDesktop(elsewhere->hwndFrame)) {
+        return elsewhere;
+    }
+    return nullptr;
+}
+
+// Window to load a new document into: the last active one, unless focusing it
+// would switch desktops; then another window here, the last active one pulled
+// here (move), or a new window (copy).
+static MainWindow* FindWinToLoadInto() {
+    MainWindow* last = FindMainWindowByHwnd(gLastActiveFrameHwnd);
+    if (!last && len(gWindows) > 0) {
+        last = gWindows[0];
+    }
+    if (!last || CanFocusWithoutDesktopSwitch(last->hwndFrame)) {
+        return last;
+    }
+    for (auto& w : gWindows) {
+        if (CanFocusWithoutDesktopSwitch(w->hwndFrame)) {
+            return w;
+        }
+    }
+    if (BringToCurrentDesktop(last->hwndFrame)) {
+        return last;
+    }
+    return CreateAndShowMainWindow(nullptr);
+}
+
 /*
 Open file DDE Command
 
@@ -462,22 +409,16 @@ valid formats:
     [Open("c:\file.pdf",1,1,0,1)]
 */
 Str HandleOpenCmd(Str cmd, bool* ack) {
-    TempStr filePath;
-    int newWindow = 0;
-    int setFocus = 0;
-    int forceRefresh = 0;
-    int inCurrentTab = 0;
-    Str next = str::Parse(cmd, "[Open(\"%s\")]", &filePath);
-    if (str::IsNull(next)) {
-        next = str::Parse(cmd, "[Open(\"%s\",%u,%u,%u,%u)]", &filePath, &newWindow, &setFocus, &forceRefresh,
-                          &inCurrentTab);
-    }
-    if (str::IsNull(next)) {
-        next = str::Parse(cmd, "[Open(\"%s\",%u,%u,%u)]", &filePath, &newWindow, &setFocus, &forceRefresh);
-    }
-    if (str::IsNull(next)) {
+    OpenDdeArgs open = ParseOpenDdeCmd(cmd);
+    if (!open.parsed) {
         return {};
     }
+    TempStr filePath = open.filePath;
+    int newWindow = open.newWindow;
+    int setFocus = open.setFocus;
+    int forceRefresh = open.forceRefresh;
+    int inCurrentTab = open.inCurrentTab;
+    Str next = open.next;
     bool isCtrl = IsCtrlPressed();
     logf("HandleOpenCmd: '%s', newWindow: %d, setFocus: %d, forceRefresh: %d, inCurrentTab: %d, isCtrl: %d\n", filePath,
          newWindow, setFocus, forceRefresh, inCurrentTab, isCtrl);
@@ -501,23 +442,16 @@ Str HandleOpenCmd(Str cmd, bool* ack) {
         return next;
     }
 
-    if (newWindow != 0 && inCurrentTab != 0) {
-        inCurrentTab = 0;
-        logf("HandleOpenCmd: setting inCurrentTab to 0 because newWindow != 0\n");
-    }
+    inCurrentTab = ApplyOpenNewWindow(newWindow, inCurrentTab);
 
     bool focusTab = (newWindow == 0);
 
     // intelligently pick a window or create one
     MainWindow* win = nullptr;
-    MainWindow* emptyExistingWin = nullptr;
     auto nWindows = len(gWindows);
-    for (auto& w : gWindows) {
-        if (!w->HasDocsLoaded()) {
-            emptyExistingWin = w;
-            logf("HandleOpenCmd: found empty existing window\n");
-            break;
-        }
+    MainWindow* emptyExistingWin = FindEmptyWinToReuse();
+    if (emptyExistingWin) {
+        logf("HandleOpenCmd: found empty existing window\n");
     }
     if (newWindow > 0) {
         if (emptyExistingWin) {
@@ -729,13 +663,7 @@ Str HandleAppRequestCmd(Str cmd, bool* ack, str::Builder& res) {
 static void OpenManyCopyDataAsyncRun(OpenManyCopyDataAsync* d) {
     MainWindow* win = nullptr;
     if (d->newWindow) {
-        MainWindow* emptyExistingWin = nullptr;
-        for (auto& w : gWindows) {
-            if (!w->HasDocsLoaded()) {
-                emptyExistingWin = w;
-                break;
-            }
-        }
+        MainWindow* emptyExistingWin = FindEmptyWinToReuse();
         win = emptyExistingWin ? emptyExistingWin : CreateAndShowMainWindow(nullptr);
     } else {
         win = FindMainWindowByHwnd(d->hwnd);
@@ -760,16 +688,22 @@ static void OpenCopyDataAsyncRun(OpenCopyDataAsync* d) {
     // had to wait on us in the first place.
     MainWindow* win = nullptr;
     if (d->newWindow) {
-        MainWindow* emptyExistingWin = nullptr;
-        for (auto& w : gWindows) {
-            if (!w->HasDocsLoaded()) {
-                emptyExistingWin = w;
-                break;
+        // Under OpenOnOtherDesktop = move, pull the window already showing the
+        // document here instead of opening it twice (#5630 forces newWindow
+        // when every window is on another desktop).
+        if (GetOtherDesktopOpen() == OtherDesktopOpen::Move) {
+            win = FindMainWindowToActivate(d->path);
+            if (win) {
+                win->Focus();
+                str::Free(d->path);
+                delete d;
+                return;
             }
         }
+        MainWindow* emptyExistingWin = FindEmptyWinToReuse();
         win = emptyExistingWin ? emptyExistingWin : CreateAndShowMainWindow(nullptr);
     } else {
-        win = FindMainWindowByFile(d->path, true);
+        win = FindMainWindowToActivate(d->path);
         if (win) {
             // Already open: just focus (matches activateExisting).
             win->Focus();
@@ -785,10 +719,7 @@ static void OpenCopyDataAsyncRun(OpenCopyDataAsync* d) {
             delete d;
             return;
         }
-        win = FindMainWindowByHwnd(gLastActiveFrameHwnd);
-        if (!win && len(gWindows) > 0) {
-            win = gWindows[0];
-        }
+        win = FindWinToLoadInto();
     }
     LoadArgs args(d->path, win);
     args.activateExisting = d->newWindow == 0;

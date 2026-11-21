@@ -33,6 +33,7 @@
 #include "MainWindow.h"
 #include "ReadingBar.h"
 #include "ReadingAutoScroll.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 #include "Notifications.h"
 #include "Translations.h"
@@ -44,13 +45,20 @@
 #include "SumatraDialogs.h"
 #include "gui/AppShell.h"
 #include "gui/TabsUI.h"
+#include "gui/DocCanvas.h"
+#include "AnnotPlacement.h"
+#include "MeasurementToolbar.h"
+#include "LinkFollow.h"
+#include "SelectTextKeyboard.h"
 
 #include "SessionState.h"
 #include "AIChatCommon.h"
 #include "AIChatPanel.h"
+#include "HomePage.h"
 #include "Tabs.h"
 #include "MenuDefs.h"
 #include "TabsCommon.h"
+#include "StripGroups.h"
 
 #include "SumatraLog.h"
 
@@ -70,20 +78,21 @@ bool TabIsDirty(WindowTab* tab) {
 }
 
 // Hide a lone Home tab. Favorites is a closable tab, so it must remain visible
-// even when it is the only tab left.
+// even when it is the only tab left. On wasm Home has no toolbar, so the strip
+// stays for its menu button.
 bool TabsAreVisible(MainWindow* win) {
-    if (win->isQuickLook) {
+    if (win->isQuickLook || (win->tabsInTitlebar && !gSettings->showCaption && !win->captionOverlayShown)) {
         return false;
     }
     // orig's showTabsBar: fullscreen and presentation hide the strip
-    if (win->isFullScreen || win->InPresentation()) {
+    if (win->IsFullScreenOrPresentation()) {
         return false;
     }
     int nTabs = win->TabCount();
     if (nTabs == 0) {
         return false;
     }
-    bool onlyHomeTab = nTabs == 1 && win->GetTab(0)->IsAboutTab();
+    bool onlyHomeTab = !OS_WASM && nTabs == 1 && win->GetTab(0)->IsAboutTab();
     bool showSingleTab = SettingsUseTabs();
     return !onlyHomeTab && ((nTabs > 1) || (showSingleTab && (nTabs > 0)));
 }
@@ -96,9 +105,9 @@ static NO_INLINE void VerifyWindowTab(MainWindow* win, WindowTab* tdata) {
         return;
     }
     bool expectedTocVisibility = tdata->showToc; // if not in presentation mode
-    if (PM_DISABLED != win->presentation) {
-        expectedTocVisibility = false; // PM_BLACK_SCREEN, PM_WHITE_SCREEN
-        if (PM_ENABLED == win->presentation) {
+    if (win->InPresentation()) {
+        expectedTocVisibility = false; // WindowMode::PresentationBlack, WindowMode::PresentationWhite
+        if (win->windowMode == WindowMode::Presentation) {
             expectedTocVisibility = tdata->showTocPresentation;
         }
     }
@@ -147,8 +156,33 @@ void LoadModelIntoTab(WindowTab* tab) {
         return;
     }
     MainWindow* win = tab->win;
+    StripGroupOnSelected(win, tab);
+    CloseMeasurement(win);
+    // as orig: the modes hold page positions of the outgoing document; end them
+    // while win->ctrl is still that document
+    if (win->currentTabTemp && win->currentTabTemp != tab) {
+        StopKeyboardLinkFollowing(win);
+        StopSelectTextWithKeyboard(win);
+        CancelAnnotationPlacement(win);
+        if (win->mouseAction != MouseAction::None || win->annotationBeingDragged || win->annotationBeingResized) {
+            CanvasCancelDrag(win);
+        }
+        // as orig: the outgoing document leaves F11's display mode
+        DisplayModel* prevDm = win->AsFixed();
+        if (prevDm && win->IsFullScreen()) {
+            prevDm->ApplyFullscreenDisplayMode(false);
+        }
+    }
     win->currentTabTemp = tab;
     win->ctrl = tab->ctrl;
+    // as orig: the incoming document takes the window's presentation / F11 layout
+    if (DisplayModel* dm = tab->AsFixed()) {
+        if (dm->InPresentation() != win->InPresentation()) {
+            dm->SetInPresentation(win->InPresentation());
+        } else if (win->IsFullScreen()) {
+            dm->ApplyFullscreenDisplayMode(true);
+        }
+    }
     // this canvas size was already applied to the previous document
     win->lastViewPortSize = Size{};
     win->showSelection = tab->selectionOnPage != nullptr;
@@ -161,7 +195,7 @@ void LoadModelIntoTab(WindowTab* tab) {
     FindBarReposition(win);
     // orig's LoadModelIntoTab: presentation mode has a sidebar state of its own
     bool showToc = win->InPresentation() ? tab->showTocPresentation : tab->showToc;
-    SetSidebarVisibility(win, showToc, gSettings->showFavorites);
+    SetTocVisibility(win, showToc);
     UpdateWindowTitle(win);
     RebuildMenuBar(win);
     ReadingAutoScrollSyncToTab(tab);
@@ -172,6 +206,11 @@ void LoadModelIntoTab(WindowTab* tab) {
     ShowPageInfoIfWanted(win);
     win->RedrawAll();
     LoadLazyTabIfNeeded(tab);
+    // its file changed while in the background: AutoReloadTick runs only for
+    // the current tab, so arm it now
+    if (tab->reloadOnFocus) {
+        tab->autoReload.Arm(kAutoReloadDelayInMs);
+    }
     StartPendingSearch(win);
 }
 
@@ -197,14 +236,12 @@ WindowTab* AddTabToWindow(MainWindow* win, WindowTab* tab, bool deferUpdate) {
     bool noHomeTab = gSettings->noHomeTab;
     bool createHomeTab = useTabs && !noHomeTab && (idx == 0);
     if (createHomeTab) {
-        auto* homeTab = new WindowTab(win);
-        homeTab->type = WindowTab::Type::About;
-        homeTab->canvasRc = win->canvasRc;
-        VecAppend(win->tabs, homeTab);
+        VecAppend(win->tabs, NewHomeTab(win, HomeTabKind::Pinned));
         idx++;
     }
 
     tab->canvasRc = win->canvasRc;
+    StripGroupOnTabAdded(win, tab);
     VecAppend(win->tabs, tab);
     if (!deferUpdate) {
         win->currentTabTemp = tab;
@@ -237,20 +274,53 @@ void GoToHomeTab(MainWindow* win) {
     if (!win || !SettingsUseTabs()) {
         return;
     }
-    for (int i = 0; i < win->TabCount(); i++) {
-        if (win->GetTab(i)->IsAboutTab()) {
-            TabsSelect(win, i);
-            return;
-        }
+    WindowTab* homeTab = FindHomeTab(win);
+    if (homeTab) {
+        TabsSelect(win, win->GetTabIdx(homeTab));
+        HomePageFocusSearch(win);
+        return;
     }
 
     SaveCurrentWindowTab(win);
-    auto* homeTab = new WindowTab(win);
-    homeTab->type = WindowTab::Type::About;
-    homeTab->canvasRc = win->canvasRc;
+    homeTab = NewHomeTab(win, HomeTabKind::Pinned);
     VecInsertAt(win->tabs, 0, homeTab);
     TabsUIOnTabsChanged(win);
     LoadModelIntoTab(homeTab);
+    HomePageFocusSearch(win);
+}
+
+#if OS_WASM
+// A window has no tabs until its first document; wasm shows Home in the strip
+// from the start.
+void AddStartupHomeTab(MainWindow* win) {
+    if (!SettingsUseTabs() || gSettings->noHomeTab || win->TabCount() > 0) {
+        return;
+    }
+    WindowTab* homeTab = NewHomeTab(win, HomeTabKind::Pinned);
+    VecAppend(win->tabs, homeTab);
+    TabsUIOnTabsChanged(win);
+    LoadModelIntoTab(homeTab);
+}
+#endif
+
+// the "+" button: another Home tab after the last one. It stays out of the
+// session, which only stores documents
+void AddExtraHomeTab(MainWindow* win) {
+    if (!win || !SettingsUseTabs()) {
+        return;
+    }
+    // the first Home tab is pinned, unless NoHomeTab: a file opened from it must
+    // not leave a Home tab behind
+    if (win->TabCount() == 0 && !gSettings->noHomeTab) {
+        GoToHomeTab(win);
+        return;
+    }
+    SaveCurrentWindowTab(win);
+    WindowTab* homeTab = NewHomeTab(win, HomeTabKind::Extra);
+    VecAppend(win->tabs, homeTab);
+    TabsUIOnTabsChanged(win);
+    LoadModelIntoTab(homeTab);
+    HomePageFocusSearch(win);
 }
 
 void RemoveTab(WindowTab* tab) {
@@ -276,6 +346,8 @@ void RemoveTab(WindowTab* tab) {
         win->currentTabTemp = nullptr;
     }
     TabsUIOnTabsChanged(win);
+    // the tab's strip group may have no tabs left
+    StripGroupsFix(win);
 
     int nTabs = win->TabCount();
     if (nTabs < 1 || !closedCurrentTab) {
@@ -283,8 +355,13 @@ void RemoveTab(WindowTab* tab) {
         RebuildMenuBar(win);
         return;
     }
-    // select tab to the right or to the left if nothing to the right
+    // select tab to the right or to the left if nothing to the right, not one
+    // hidden in a collapsed strip group
     int newIdx = std::min(idx, nTabs - 1);
+    int visibleIdx = StripGroupNextVisible(win, newIdx);
+    if (visibleIdx >= 0) {
+        newIdx = visibleIdx;
+    }
     WindowTab* newTab = win->GetTab(newIdx);
     if (newTab && newTab->type != WindowTab::Type::None) {
         LoadModelIntoTab(newTab);
@@ -301,6 +378,11 @@ void MaybeMigrateTab(WindowTab* tab, MainWindow* newWin) {
     if (tab->IsNonDocumentTab()) {
         return;
     }
+    // wasm has one window: there is nowhere for the tab to go, and it must not
+    // be removed below
+    if (OS_WASM && !newWin) {
+        return;
+    }
     // don't migrate a lone document tab unless it is dropped on another window
     int nDocTabs = 0;
     for (WindowTab* t : oldWin->Tabs()) {
@@ -314,10 +396,13 @@ void MaybeMigrateTab(WindowTab* tab, MainWindow* newWin) {
     if (EngineHasUnsavedAnnotations(tab->GetEngine())) {
         return;
     }
-    TempStr path = str::DupTemp(tab->filePath);
-    TempStr displayName = str::DupTemp(tab->displayName);
+    // not temp: creating the window reuses the temp arena
+    Str path = str::Dup(tab->filePath);
+    Str displayName = str::Dup(tab->displayName);
     TabState* state = NewTabStateFromTab(tab);
     RemoveTab(tab);
+    // the new tab takes the file: don't let ~WindowTab delete an open-cache copy
+    str::FreePtr(&tab->filePath);
     delete tab;
 
     if (!newWin) {
@@ -348,9 +433,10 @@ void MaybeMigrateTab(WindowTab* tab, MainWindow* newWin) {
         }
 #endif
     }
+    // the tab is already gone: if no window could be made, reopen the document
+    // where it was rather than lose it
     if (!newWin) {
-        DeleteTabState(state);
-        return;
+        newWin = oldWin;
     }
     logf("MaybeMigrateTab: '%s' -> window 0x%p\n", path, newWin);
     // orig re-opens the document in the new window rather than sliding the
@@ -359,11 +445,14 @@ void MaybeMigrateTab(WindowTab* tab, MainWindow* newWin) {
     WindowTab* newTab = newWin->CurrentTab();
     if (newTab && len(displayName) > 0) {
         newTab->SetDisplayName(displayName);
+        UpdateWindowTitle(newWin);
     }
     if (state) {
         SetTabState(newTab, state);
         DeleteTabState(state);
     }
+    str::Free(path);
+    str::Free(displayName);
     CloseWindowIfNoDocuments(oldWin);
 }
 
@@ -373,14 +462,7 @@ void CloseAllTabs(MainWindow* win) {
     }
     // can't close while iterating over the tabs so collect them first
     Vec<WindowTab*> toClose;
-    int nTabs = win->TabCount();
-    for (int i = 0; i < nTabs; i++) {
-        WindowTab* t = win->GetTab(i);
-        if (t->IsAboutTab()) {
-            continue;
-        }
-        VecAppend(toClose, t);
-    }
+    CollectClosableTabs(win, toClose);
     CloseCollectedTabs(win, toClose);
 }
 
@@ -398,18 +480,22 @@ void TabsOnCloseWindow(MainWindow* win) {
 }
 
 void MoveTab(MainWindow* win, int dir) {
-    if (!win) {
+    if (win) {
+        StripGroupMoveTab(win, dir);
+    }
+}
+
+// the strip shows `order`
+void TabsSetOrder(MainWindow* win, const Vec<WindowTab*>& order) {
+    if (len(order) != win->TabCount()) {
+        ReportIf(true);
         return;
     }
-    int nTabs = win->TabCount();
-    int idx = win->GetTabIdx(win->CurrentTab());
-    int newIdx = idx + dir;
-    if (idx < 0 || newIdx < 0 || newIdx >= nTabs) {
-        return;
-    }
-    WindowTab* tmp = win->tabs[idx];
-    win->tabs[idx] = win->tabs[newIdx];
-    win->tabs[newIdx] = tmp;
+    win->tabs = order;
+    TabsStripGroupsChanged(win);
+}
+
+void TabsStripGroupsChanged(MainWindow* win) {
     TabsUIOnTabsChanged(win);
     win->RedrawAll();
 }
@@ -437,6 +523,53 @@ void TabsMoveTab(MainWindow* win, int from, int to) {
 
 // --- the tab context menu ---------------------------------------------------
 
+// a submenu of `items` right after the item with `afterCmdId`; none if empty
+static void InsertSubmenuAfter(MenuModel* menu, int afterCmdId, Str title, const Vec<StripGroupMenuItem>& items) {
+    if (!menu || len(items) == 0) {
+        return;
+    }
+    int n = len(menu->items);
+    int pos = 0;
+    while (pos < n && menu->items[pos].cmdId != afterCmdId) {
+        pos++;
+    }
+    if (pos == n) {
+        return;
+    }
+    auto* sub = new MenuModel();
+    for (const StripGroupMenuItem& it : items) {
+        MenuAppendString(sub, it.title, it.cmdId);
+        MenuSetChecked(sub, it.cmdId, it.checked);
+    }
+    MenuItemModel row;
+    row.title = str::Dup(title);
+    row.titleOwned = true;
+    row.submenu = sub;
+    VecInsertAt(menu->items, pos + 1, row);
+}
+
+// right-click on a strip group's chip; its commands act on the group's first tab
+MenuModel* BuildStripGroupMenu(MainWindow* win, int groupId) {
+    StripGroup* g = StripGroupFind(win, groupId);
+    WindowTab* tab = StripGroupFirstTab(win, groupId);
+    if (!g || !tab) {
+        return nullptr;
+    }
+    BuildMenuCtx* ctx = NewBuildMenuCtx(tab, Point{0, 0});
+    ctx->tab = tab;
+    ctx->isDocLoaded = true;
+    StripGroupSetFlags(*ctx);
+    MenuModel* menu = BuildMenuFromDef(menuDefStripGroup, ctx);
+    DeleteBuildMenuCtx(ctx);
+    if (g->collapsed) {
+        MenuSetText(menu, CmdStripGroupToggle, Tr("Expand Group"));
+    }
+    Vec<StripGroupMenuItem> items;
+    StripGroupColorItems(win, tab, items);
+    InsertSubmenuAfter(menu, CmdStripGroupToggle, Tr("Group Color"), items);
+    return menu;
+}
+
 MenuModel* BuildTabContextMenu(MainWindow* win, WindowTab* tabUnderMouse) {
     if (!win || !tabUnderMouse || tabUnderMouse->IsAboutTab()) {
         return nullptr;
@@ -462,8 +595,14 @@ MenuModel* BuildTabContextMenu(MainWindow* win, WindowTab* tabUnderMouse) {
     ctx->canCloseOtherTabs = len(toCloseOther) > 0;
     ctx->canCloseTabsToRight = len(toCloseRight) > 0;
     ctx->canCloseTabsToLeft = len(toCloseLeft) > 0;
+    StripGroupSetFlags(*ctx);
 
     MenuModel* menu = BuildMenuFromDef(menuDefContextTab, ctx);
+    if (ctx->tabCanGroup) {
+        Vec<StripGroupMenuItem> items;
+        StripGroupAddToItems(win, tabUnderMouse, items);
+        InsertSubmenuAfter(menu, CmdStripGroupNew, Tr("Add Tab to Group"), items);
+    }
     DeleteBuildMenuCtx(ctx);
 
     if (!tabUnderMouse->ctrl) {
@@ -490,6 +629,9 @@ void TabContextMenuCommand(MainWindow* win, WindowTab* tabUnderMouse, int cmdId)
     Vec<WindowTab*> toCloseLeft;
     CollectTabsToClose(win, tabUnderMouse, toCloseOther, toCloseRight, toCloseLeft);
 
+    if (StripGroupCmd(win, tabUnderMouse, cmdId)) {
+        return;
+    }
     switch (cmdId) {
         case CmdClose:
             CloseTab(tabUnderMouse, false);
@@ -517,6 +659,9 @@ void TabContextMenuCommand(MainWindow* win, WindowTab* tabUnderMouse, int cmdId)
             return;
         case CmdDuplicateInNewWindow:
             DuplicateTabInNewWindow(tabUnderMouse);
+            return;
+        case CmdDuplicateInNewTab:
+            DuplicateTabInNewTab(tabUnderMouse);
             return;
         case CmdSetTabColor:
             ShowSetTabColorDialog(win, tabUnderMouse);

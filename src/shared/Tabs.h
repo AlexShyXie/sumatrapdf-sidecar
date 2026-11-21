@@ -22,6 +22,18 @@ void TabsOnCloseWindow(MainWindow*);
 void TabsOnChangedDoc(MainWindow*);
 void TabsSelect(MainWindow* win, int tabIndex);
 void GoToHomeTab(MainWindow*);
+void AddExtraHomeTab(MainWindow*);
+void AddStartupHomeTab(MainWindow*);
+enum class HomeTabKind {
+    Pinned,
+    Extra,
+};
+WindowTab* NewHomeTab(MainWindow*, HomeTabKind);
+WindowTab* FindHomeTab(MainWindow*);
+WindowTab* HomeTabToReuse(MainWindow*);
+void CollectClosableTabs(MainWindow*, Vec<WindowTab*>&);
+struct AppCommandCtx;
+void SetTabCloseFlags(AppCommandCtx&);
 void TabsOnCtrlTab(MainWindow* win, bool reverse);
 void RemoveTab(WindowTab*);
 TempStr MakeTabTooltipTemp(Str path, bool dirty = false);
@@ -44,6 +56,10 @@ void MaybeMigrateTab(WindowTab* tab, MainWindow* newWin);
 void CollectTabsToClose(MainWindow* win, WindowTab* currTab, Vec<WindowTab*>& toCloseOther,
                         Vec<WindowTab*>& toCloseRight, Vec<WindowTab*>& toCloseLeft);
 void CloseCollectedTabs(MainWindow* win, const Vec<WindowTab*>& toClose);
+WindowTab* NewSessionTab(MainWindow* win, TabState* state);
+WindowTab* NewMissingSessionTab(MainWindow* win, TabState* state);
+void CloseMissingFileTabs(MainWindow* win);
 // the tab's right-click menu; the caller owns the model
 MenuModel* BuildTabContextMenu(MainWindow* win, WindowTab* tabUnderMouse);
+MenuModel* BuildStripGroupMenu(MainWindow* win, int groupId);
 void TabContextMenuCommand(MainWindow* win, WindowTab* tabUnderMouse, int cmdId);

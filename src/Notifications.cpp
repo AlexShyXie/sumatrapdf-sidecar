@@ -21,6 +21,7 @@
 #include "DisplayModel.h"
 #include "SumatraPDF.h"
 #include "MainWindow.h"
+#include "AIChatTypes.h"
 #include "WindowTab.h"
 
 #include "Theme.h"
@@ -314,12 +315,6 @@ static void NotifsRemoveNotification(NotificationWnd* wnd) {
     gNotifs[gNotifsCount] = nullptr;
     RelayoutNotifications(HwndGetParent(wnd->hwnd));
     delete wnd;
-}
-
-__unused static int GetWndX(NotificationWnd* wnd) {
-    Rect rect = HwndWindowRect(wnd->hwnd);
-    rect = HwndMapRectToWindow(rect, HWND_DESKTOP, GetParent(wnd->hwnd));
-    return rect.x;
 }
 
 NotificationWnd::~NotificationWnd() {
@@ -658,8 +653,11 @@ void NotificationWnd::UpdateMessage(Str msg, int timeoutMs, bool highlight) {
     HwndSetRtl(hwnd, IsUIRtl());
     Layout(msg);
     HwndRepaintNow(hwnd);
+    // 0 persists: drop a timeout armed by an earlier message
     if (timeoutMs != 0) {
         SetTimer(hwnd, kNotifTimerTimeoutId, timeoutMs, nullptr);
+    } else {
+        KillTimer(hwnd, kNotifTimerTimeoutId);
     }
 }
 
@@ -674,6 +672,10 @@ bool UpdateNotificationProgress(NotificationWnd* wnd, Str msg, int perc) {
 }
 
 static void NotifRemove(NotificationWnd* wnd) {
+    // already removed (and freed) between ScheduleRemove and now
+    if (NotificationIndexOf(wnd) < 0) {
+        return;
+    }
     if (!wnd->closedCb.IsValid()) {
         NotifsRemoveNotification(wnd);
         return;
@@ -808,16 +810,29 @@ NotificationWnd* ShowNotification(const NotificationCreateArgs& argsIn) {
     return wnd;
 }
 
+enum class NotifFlavor {
+    Normal,
+    Warning,
+    Plain,
+    PlainWarning
+};
+
+static NotificationWnd* ShowMsgNotification(HWND hwnd, Str msg, int timeoutMs, NotifFlavor flavor) {
+    NotificationCreateArgs args;
+    args.hwndParent = hwnd;
+    args.msg = msg;
+    args.warning = flavor == NotifFlavor::Warning || flavor == NotifFlavor::PlainWarning;
+    args.plainText = flavor == NotifFlavor::Plain || flavor == NotifFlavor::PlainWarning;
+    args.timeoutMs = timeoutMs;
+    return ShowNotification(args);
+}
+
 // show a temporary notification that will go away after a timeout
 NotificationWnd* ShowTemporaryNotification(HWND hwnd, Str msg, int timeoutMs) {
     if (timeoutMs <= 0) {
         timeoutMs = kNotifDefaultTimeOut;
     }
-    NotificationCreateArgs args;
-    args.hwndParent = hwnd;
-    args.msg = msg;
-    args.timeoutMs = timeoutMs;
-    return ShowNotification(args);
+    return ShowMsgNotification(hwnd, msg, timeoutMs, NotifFlavor::Normal);
 }
 
 // show a notification whose content is an arbitrary VirtCtrl tree. Ownership of
@@ -837,12 +852,7 @@ NotificationWnd* ShowWarningNotification(HWND hwndParent, Str msg, int timeoutMs
     if (timeoutMs < 0) {
         timeoutMs = kNotifDefaultTimeOut;
     }
-    NotificationCreateArgs args;
-    args.hwndParent = hwndParent;
-    args.msg = msg;
-    args.warning = true;
-    args.timeoutMs = timeoutMs;
-    return ShowNotification(args);
+    return ShowMsgNotification(hwndParent, msg, timeoutMs, NotifFlavor::Warning);
 }
 
 // for a message that embeds text we didn't author (a file path, document
@@ -852,25 +862,14 @@ NotificationWnd* ShowPlainNotification(HWND hwnd, Str msg, int timeoutMs) {
     if (timeoutMs <= 0) {
         timeoutMs = kNotifDefaultTimeOut;
     }
-    NotificationCreateArgs args;
-    args.hwndParent = hwnd;
-    args.msg = msg;
-    args.plainText = true;
-    args.timeoutMs = timeoutMs;
-    return ShowNotification(args);
+    return ShowMsgNotification(hwnd, msg, timeoutMs, NotifFlavor::Plain);
 }
 
 NotificationWnd* ShowPlainWarningNotification(HWND hwndParent, Str msg, int timeoutMs) {
     if (timeoutMs < 0) {
         timeoutMs = kNotifDefaultTimeOut;
     }
-    NotificationCreateArgs args;
-    args.hwndParent = hwndParent;
-    args.msg = msg;
-    args.plainText = true;
-    args.warning = true;
-    args.timeoutMs = timeoutMs;
-    return ShowNotification(args);
+    return ShowMsgNotification(hwndParent, msg, timeoutMs, NotifFlavor::PlainWarning);
 }
 
 void NotificationUpdateMessage(NotificationWnd* wnd, Str msg, int timeoutInMS, bool highlight) {
@@ -887,15 +886,24 @@ TempStr NotificationGetMessageTemp(NotificationWnd* wnd) {
     return HwndGetTextTemp(wnd->hwnd);
 }
 
+// paints it now, without running the message loop: the UI thread is busy, e.g.
+// downloading a font mupdf asked for
+void RepaintNotificationNow(NotificationWnd* wnd) {
+    if (NotificationIndexOf(wnd) < 0 || !wnd->hwnd) {
+        return;
+    }
+    RedrawWindow(wnd->hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+}
+
 void RemoveNotification(NotificationWnd* wnd) {
     NotifsRemoveNotification(wnd);
 }
 
-void CloseNotification(NotificationWnd* wnd) {
+void CloseNotification(NotificationWnd* wnd, NotifCloseReason reason) {
     if (!wnd) {
         return;
     }
-    wnd->ScheduleRemove(NotifCloseReason::Program);
+    wnd->ScheduleRemove(reason);
 }
 
 // Turning them off also takes down the ones already on screen, so a test can
